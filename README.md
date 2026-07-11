@@ -4,7 +4,9 @@ Accessibility testing MCP server for Cursor, VS Code Copilot, Claude Code, and a
 
 ## What is WebAbility?
 
-[WebAbility.io](https://webability.io) is an AI-powered web accessibility platform — widget, scanner, and agents for **WCAG 2.2 / ADA / Section 508 / EAA** compliance. This MCP exposes the same scanning engine that powers the WebAbility widget and dashboard, so you can audit and fix accessibility issues from your IDE while you build.
+[WebAbility.io](https://webability.io) is an AI-powered web accessibility platform — accessibility widget, automated scanner, and AI agents for [WCAG 2.1 / 2.2 AA](https://www.webability.io/compliance/wcag), [ADA](https://www.webability.io/compliance/ada), [Section 508](https://www.webability.io/compliance/section-508), [EAA (European Accessibility Act)](https://www.webability.io/compliance/eaa) and [AODA](https://www.webability.io/compliance/aoda) compliance. This MCP exposes the same accessibility-testing engine that powers the [WebAbility widget](https://www.webability.io/accessibility-enhancer) and dashboard, so you can scan, audit and fix web accessibility issues (color contrast, ARIA, alt text, keyboard navigation, focus visibility, target size, and more) from your IDE while you build.
+
+New to accessibility compliance? Start with the [free WCAG & ADA accessibility checker](https://www.webability.io/website-accessibility-checker), or read the [WebAbility MCP docs](https://www.webability.io/docs/mcp) and the [getting-started guide](https://www.webability.io/docs).
 
 The server registers an `instructions` block on initialize, so any MCP-compatible client picks up business context (what tool to call when, the three-tier output convention, etc.) automatically — no setup required beyond the install below.
 
@@ -108,12 +110,34 @@ The server also reports one small **telemetry event** per tool call (every tool,
 
 Two tools — `generate_ai_fix` and `visual_audit` — additionally send page content (an HTML snippet or a screenshot) to WebAbility's API so it can call a third-party LLM on your behalf; WebAbility doesn't store that content, but the LLM provider sees it in transit. See [PRIVACY.md](./PRIVACY.md) for the full per-tool breakdown and WebAbility's [privacy policy](https://www.webability.io/privacy-policy).
 
-## Links
+## Learn more
 
-- [WebAbility](https://webability.io) — platform, widget, dashboard
-- [Documentation](https://webability.io/docs)
-- [GitHub](https://github.com/snayyar00/webability-mcp)
+**WebAbility platform & docs**
+- [WebAbility.io](https://www.webability.io) — the accessibility platform (widget, scanner, AI agents, dashboard)
+- [MCP server documentation](https://www.webability.io/docs/mcp) · [all docs](https://www.webability.io/docs)
+- [Accessibility widget](https://www.webability.io/accessibility-enhancer) — one-line install, WCAG-compliant remediation for live sites
+- [Professional accessibility audit](https://www.webability.io/audit) · [managed accessibility](https://www.webability.io/managed-accessibility)
+- [Free WCAG & ADA accessibility checker](https://www.webability.io/website-accessibility-checker) — scan any URL in seconds
+- [Pricing](https://www.webability.io/pricing) · [lifetime deal](https://www.webability.io/lifetime)
+
+**Accessibility compliance guides**
+- [WCAG 2.1 / 2.2 AA](https://www.webability.io/compliance/wcag) — Web Content Accessibility Guidelines
+- [ADA compliance](https://www.webability.io/compliance/ada) — Americans with Disabilities Act
+- [Section 508](https://www.webability.io/compliance/section-508) — U.S. federal accessibility requirements
+- [EAA — European Accessibility Act](https://www.webability.io/compliance/eaa) · [AODA](https://www.webability.io/compliance/aoda) — Ontario (Canada)
+
+**Accessibility by industry**
+- [Government](https://www.webability.io/industries/government) · [Education](https://www.webability.io/industries/education) · [Healthcare](https://www.webability.io/industries/health) · [Finance](https://www.webability.io/industries/finance)
+- [E-commerce / retail](https://www.webability.io/industries/retail) · [Legal](https://www.webability.io/industries/law-enforcement) · [Media](https://www.webability.io/industries/media) · [Non-profit](https://www.webability.io/industries/ngo)
+
+**Install the widget on your stack**
+- [WordPress](https://www.webability.io/installation/how-to-install-webability-wordpress) · [Shopify](https://www.webability.io/installation/how-to-install-webability-on-a-shopify-website) · [Webflow](https://www.webability.io/installation/how-to-install-webability-on-a-webflow-website) · [Squarespace](https://www.webability.io/installation/how-to-install-webability-on-a-squarespace-website) · [BigCommerce](https://www.webability.io/installation/how-to-install-webability-on-a-bigcommerce-website) · [HubSpot](https://www.webability.io/installation/how-to-install-webability-on-a-hubspot-website) · [any site (embed)](https://www.webability.io/installation/how-to-install-webability-embed-code)
+
+**Package**
+- npm: [`@webability/mcp`](https://www.npmjs.com/package/@webability/mcp) · Source: [github.com/snayyar00/webability-mcp](https://github.com/snayyar00/webability-mcp)
+
+Keywords: web accessibility, accessibility testing, WCAG 2.2 AA, ADA compliance, Section 508, EAA, AODA, a11y, accessibility scanner, color contrast checker, ARIA validation, alt text, keyboard navigation, screen reader, MCP server, accessibility for AI coding agents.
 
 ## License
 
-MIT
+[MIT](./LICENSE) © WebAbility.io
