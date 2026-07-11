@@ -1,0 +1,27 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+#
+# WebAbility MCP — find and fix web accessibility (WCAG) issues from your coding agent.
+# Runs locally over stdio from the published npm package @webability/mcp (bin: webability-mcp).
+# DOM scan/fix tools work with no account; visual_audit + start_audit/get_audit use an
+# optional WEBABILITY_API_KEY. Docs: https://webability.io/docs/mcp
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    required: []
+    properties:
+      webabilityApiKey:
+        type: string
+        description: >-
+          Optional WebAbility API key (WEBABILITY_API_KEY). The DOM scan/fix tools
+          (scan_page, scan_html, flow_scan, detect_framework, generate_ai_fix,
+          verify_fix, check_color_contrast, check_aria, get_rules, find_source,
+          scan_history) run locally and need no account. Only visual_audit and
+          start_audit / get_audit require a key.
+  commandFunction:
+    # A function that produces the CLI command to start the MCP on stdio.
+    |-
+    (config) => ({ command: 'npx', args: ['-y', '-p', '@webability/mcp', 'webability-mcp'], env: config.webabilityApiKey ? { WEBABILITY_API_KEY: config.webabilityApiKey } : {} })
+  exampleConfig: {}
