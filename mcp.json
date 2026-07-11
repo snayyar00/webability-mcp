@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "webability": {
+      "command": "npx",
+      "args": ["-y", "-p", "@webability/mcp", "webability-mcp"],
+      "description": "Find and fix web accessibility (WCAG / ADA / Section 508) issues from your coding agent — scan, framework-aware fixes, vision audit, and fix verification. DOM scan/fix tools run free and local; visual_audit and start_audit/get_audit use a WebAbility account (WEBABILITY_API_KEY)."
+    }
+  }
+}
