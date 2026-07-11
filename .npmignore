@@ -1,0 +1,8 @@
+src/
+*.map
+tsconfig.json
+tsup.config.ts
+.turbo/
+node_modules/
+*.test.ts
+*.spec.ts
