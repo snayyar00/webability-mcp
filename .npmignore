@@ -1,4 +1,5 @@
 src/
+test/
 *.map
 tsconfig.json
 tsup.config.ts

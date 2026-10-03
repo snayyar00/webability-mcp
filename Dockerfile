@@ -4,7 +4,7 @@
 # so this MUST be a Playwright base image (Chromium + system deps baked in), not plain node.
 # Keep the Playwright tag in lockstep with the `playwright` version in mcp/package.json.
 #
-# BUILD CONTEXT = the abilyo repo root (the pnpm workspace root that contains
+# BUILD CONTEXT = the monorepo root (the pnpm workspace root that contains
 # pnpm-workspace.yaml, core/, mcp/ ...). In Coolify set Base Directory to that root
 # and Dockerfile to `mcp/Dockerfile`.
 FROM mcr.microsoft.com/playwright:v1.59.1-jammy

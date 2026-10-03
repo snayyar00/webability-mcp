@@ -6,12 +6,15 @@ This document covers, per feature, what stays on your machine and what leaves it
 
 - **Scanning itself is 100% local.** All scan tools launch a headless browser on your machine and never send page content anywhere by default.
 - **A small telemetry event** (tool name, a short target label, pass/fail, duration, issue counts, and a persistent anonymous install ID) is sent to WebAbility's API per tool call — every tool, not just scans. Opt out of all of it with `WEBABILITY_SCAN_TELEMETRY=off`.
+- **PostHog MCP Analytics is opt-in.** It only runs when `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` is configured. WebAbility removes PostHog's tool parameter and response payload fields before sending events.
 - **Two tools** — `generate_ai_fix` and `visual_audit` — send additional content (an HTML snippet, or a screenshot) to WebAbility's API so it can call a third-party LLM on your behalf. WebAbility does not store that content; the LLM provider sees it in transit under its own retention policy.
 - **Scan history is written only to your disk** (`~/.webability/scans/`) — never uploaded.
 
 ## Tools that run locally
 
-`scan_page`, `flow_scan`, `detect_framework`, `scan_html`, `check_aria`, `check_color_contrast`, `get_rules`, `find_source`, `scan_history` all run entirely in a local headless browser process (or pure computation, for the non-browser ones). Scanning a URL means *your machine* fetches that URL directly — no data about the target page goes to WebAbility. `check_color_contrast`'s optional brand-palette extraction from a live URL also runs locally. The only thing these tools send to WebAbility is the per-call telemetry event described below (which carries no page content) — disable it with `WEBABILITY_SCAN_TELEMETRY=off` and they make no WebAbility call at all.
+`scan_page`, `flow_scan`, `diff_scan`, `detect_framework`, `scan_html`, `check_aria`, `check_color_contrast`, `get_rules`, `find_source`, `scan_history` all run entirely in a local headless browser process (or pure computation, for the non-browser ones — since 1.6.0 `scan_html` runs in-process in jsdom by default and launches no browser at all). Scanning a URL means *your machine* fetches that URL directly — no data about the target page goes to WebAbility. `check_color_contrast`'s optional brand-palette extraction from a live URL also runs locally. The only thing these tools send to WebAbility is the per-call telemetry event described below (which carries no page content) — disable it with `WEBABILITY_SCAN_TELEMETRY=off` and they make no WebAbility call at all.
+
+Since 1.6.0, `scan_page`, `flow_scan` and `diff_scan` also read source pointers (`file`, `line`, `component`) from a React or Vue **dev build's** own component tree and return them with each finding. Those paths come from the page you scanned and go only to your MCP client (and the local `scan_history` archive); production builds carry none. `sourceRoot` greps a directory you name, on your machine, and sends nothing.
 
 ## Scan logging (local disk only)
 
@@ -36,6 +39,14 @@ The event also includes a **persistent anonymous client ID** — a random identi
 
 This is used for WebAbility's own product usage visibility (an internal admin dashboard), not sold or shared with third parties. Disable with `WEBABILITY_SCAN_TELEMETRY=off`.
 
+## PostHog MCP Analytics (optional)
+
+When `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` is set, the server instruments MCP protocol usage with `@posthog/mcp`. It sends usage metadata to PostHog, including initialize events, tools/list events, tool-call events, tool name, duration, client name/version, protocol version, and whether the call errored. For hosted HTTP mode, the caller is identified by a one-way SHA-256 hash of the WebAbility token; the token itself is never sent.
+
+WebAbility applies a `beforeSend` redaction layer that deletes PostHog's `$mcp_parameters` and `$mcp_response` fields. This prevents raw tool arguments and responses from being sent to PostHog, including HTML snippets, issue HTML, screenshots, full scan results, generated code, local file paths, and `scan_history` responses.
+
+Configure `POSTHOG_HOST` to change the ingestion host from the default `https://us.i.posthog.com`. Set `WEBABILITY_POSTHOG_MCP_ANALYTICS=off` to force-disable this integration even when a PostHog key is present.
+
 ## `generate_ai_fix` and `visual_audit` (the two tools that call an LLM)
 
 These need a server-side AI model, so they're the only tools that send page *content* (not just a URL) to WebAbility:
@@ -52,7 +63,7 @@ Verified against the backend implementation: neither payload is logged (access l
 ## Authentication
 
 - **Local (stdio) mode** — the default when installed into your IDE — requires no authentication; it's a local child process of your editor, same trust boundary as any other local tool.
-- **Remote (HTTP) mode** — for hosting this server centrally — requires a bearer token (`MCP_AUTH_TOKEN`) and includes SSRF guards on outbound requests; `find_source` (filesystem access) is disabled in this mode.
+- **Remote (HTTP) mode** — for hosting this server centrally — requires a caller WebAbility bearer token (`Authorization: Bearer <token>` or `x-webability-token`) or a shared operator `MCP_AUTH_TOKEN`, and includes SSRF guards on outbound requests; `find_source` (filesystem access) is disabled in this mode.
 
 ## Links
 

@@ -87,7 +87,35 @@ export function describeTelemetryTarget(tool: string, args: Record<string, unkno
         return describeScanTarget(tool, args)
     }
   })()
-  return label.slice(0, 300)
+  return scrubTelemetryTarget(label).slice(0, 300)
+}
+
+/**
+ * The target column is the most identifying telemetry field we hold: raw URLs
+ * carry query strings (tokens, emails, session ids) and hash fragments into
+ * the mcp_scan_events row. Reduce URL-shaped labels to origin + path.
+ * Non-URL labels (selectors, tags, color pairs, list/id markers) pass through
+ * untouched. The LOCAL scan log keeps the full URL — this scrub applies only
+ * to the payload that leaves the machine.
+ */
+export function scrubTelemetryTarget(label: string): string {
+  if (!label.includes('://')) return label
+  // Leading URL with flow_scan's known " (+N pages)" suffix: scrub the URL
+  // part, preserve the suffix. Only this exact suffix shape splits — a URL
+  // containing literal whitespace elsewhere is scrubbed whole, never leaked
+  // through a "tail" carve-out.
+  const suffixMatch = label.match(/^(.*?)(\s*\(\+\d+ pages\))$/)
+  const head = suffixMatch ? suffixMatch[1] : label
+  const tail = suffixMatch ? suffixMatch[2] : ''
+  try {
+    const u = new URL(head)
+    return `${u.origin}${u.pathname}` + tail
+  } catch {
+    // Unparseable but URL-shaped: cut at the first query/hash marker rather
+    // than shipping it whole.
+    const cut = head.search(/[?#]/)
+    return (cut === -1 ? head : head.slice(0, cut)) + tail
+  }
 }
 
 /** Pull summary counts out of a tool response (the ```json block). Best-effort. */

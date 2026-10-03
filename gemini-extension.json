@@ -1,0 +1,11 @@
+{
+  "name": "webability-accessibility",
+  "version": "1.6.3",
+  "description": "Scan pages and HTML for WCAG 2.2 / ADA / Section 508 issues, get framework-aware fixes, and verify them. Free hosted MCP from WebAbility.",
+  "mcpServers": {
+    "webability": {
+      "httpUrl": "https://mcp.webability.io/mcp"
+    }
+  },
+  "contextFileName": "GEMINI.md"
+}
