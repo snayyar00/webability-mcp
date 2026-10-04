@@ -20,9 +20,9 @@ const SRC = readFileSync(fileURLToPath(new URL('../src/server.ts', import.meta.u
 const PALETTE = SRC.slice(SRC.indexOf('async function extractBrandPaletteFromUrl'), SRC.indexOf('/** Server-side Full tools'))
 
 test('the palette fetch installs the SSRF guard whenever remote', () => {
-  assert.match(PALETTE, /if \(remote \|\| tunnel\) await installSsrfRoute\(context, tunnel\)/)
+  assert.match(PALETTE, /remote \|\| tunnel \? installSsrfRoute\(context, tunnel\)/)
   // The bug, named: gating on the tunnel alone leaves hosted unguarded.
-  assert.doesNotMatch(PALETTE, /if \(tunnel\) await installSsrfRoute/)
+  assert.doesNotMatch(PALETTE, /\(tunnel \? installSsrfRoute/)
 })
 
 test('every caller passes the remote flag through', () => {
@@ -37,6 +37,6 @@ test('every caller passes the remote flag through', () => {
 test('no browser context in this file is gated on tunnel instead of remote', () => {
   // The general form of the defect. A future context added with `if (tunnel)`
   // would be unguarded on hosted in exactly the same silent way.
-  const bad = SRC.match(/if \(tunnel\)\s*await installSsrfRoute/g) ?? []
+  const bad = SRC.match(/\(tunnel \? installSsrfRoute|if \(tunnel\)\s*await installSsrfRoute/g) ?? []
   assert.deepEqual(bad, [], 'installSsrfRoute must be gated on remote (optionally || tunnel), never on tunnel alone')
 })

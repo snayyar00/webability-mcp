@@ -16,10 +16,13 @@ import { fileURLToPath } from 'node:url'
 
 const SRC = readFileSync(fileURLToPath(new URL('../src/server.ts', import.meta.url)), 'utf8')
 
-test('the tunnel target is read from startUrl as well as url', () => {
+test('the tunnel target is read from startUrl and the verify_fix url aliases as well as url', () => {
   // flow_scan supplies startUrl. Reading only `url` made every tunnelled flow
   // scan fail with a null target and no explanation.
-  assert.match(SRC, /parseTunnelTarget\(String\(\(args as any\)\?\.url \?\? \(args as any\)\?\.startUrl \?\? ''\)/)
+  // verify_fix resolves url/page/pageUrl with the same non-empty rule as resolveVerifyFixArgs.
+  // Behaviour is pinned in verify-fix-alias-target.test.ts; this pins the call site.
+  assert.match(SRC, /const tunnel: TunnelTarget \| null = tunnelTargetForCall\(name, args\)/)
+  assert.match(SRC, /const raw = name !== 'verify_fix' \? a\.url \?\? a\.startUrl \?\? '' : verifyFixTargetUrl\(args\) \?\? ''/)
 })
 
 test('scan_page and verify_fix scan a page WE opened when tunnelling', () => {
@@ -40,7 +43,7 @@ test('withTunnelPage installs the route before navigating', () => {
   // Installing after goto would miss the main document — the one request that
   // must carry the secret.
   const fn = SRC.slice(SRC.indexOf('async function withTunnelPage'), SRC.indexOf('async function extractBrandPaletteFromUrl'))
-  assert.ok(fn.indexOf('installSsrfRoute') < fn.indexOf('page.goto'), 'route must be installed before the first navigation')
+  assert.ok(fn.indexOf('installSsrfRoute') < fn.indexOf('session.goto'), 'route must be installed before the first navigation')
 })
 
 test('the brand-palette fetch carries the tunnel too', () => {

@@ -19,6 +19,7 @@
  * never break a scan. In remote/hosted mode the server may handle untrusted
  * multi-tenant traffic — callers decide whether to enable it there.
  */
+import { verifyFixTargetUrl } from './verifyFixArgs.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -132,6 +133,7 @@ function pruneOldResults(dir: string): void {
 /** Human-readable label for what a scan tool was pointed at. */
 export function describeScanTarget(tool: string, args: Record<string, unknown> | undefined): string {
   if (!args) return tool
+  if (tool === 'verify_fix') return verifyFixTargetUrl(args) ?? tool
   if (typeof args.url === 'string') return args.url
   if (typeof args.startUrl === 'string') {
     const extra = Array.isArray(args.autoNavigate) ? ` (+${args.autoNavigate.length} pages)` : ''

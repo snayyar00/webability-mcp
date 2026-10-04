@@ -50,6 +50,12 @@ export interface IssueRow {
   fix?: { op?: string; attribute?: string; value?: string }
   source?: { file?: string; line?: number; column?: number; component?: string }
   foundOn?: string[]
+  /** Every rule id merged into this finding (see scanShaping.mergeSameElement). */
+  rules?: string[]
+  /** Set on a collapsed entry: how many elements it stands for. */
+  count?: number
+  examples?: string[]
+  expand?: string
 }
 
 const matchesWcag = (criteria: string | undefined, wanted: Set<string>) => {
@@ -69,7 +75,7 @@ const matchesWcag = (criteria: string | undefined, wanted: Set<string>) => {
 export function filterIssues<T extends IssueRow>(list: readonly T[], c: OutputControls): T[] {
   return list.filter((i) => {
     if (c.minImpact && (RANK[i.impact ?? ''] ?? 0) < RANK[c.minImpact]) return false
-    if (c.rules && !c.rules.has(String(i.type ?? ''))) return false
+    if (c.rules && !c.rules.has(String(i.type ?? '')) && !(i.rules ?? []).some((r) => c.rules!.has(r))) return false
     if (c.wcag && !matchesWcag(i.wcag, c.wcag)) return false
     return true
   })
@@ -109,10 +115,16 @@ export function compactText(list: readonly IssueRow[]): string {
   for (const [rule, items] of ordered) {
     const h = items[0]!
     const meta = [h.wcag, h.impact, h.fixability, formatOp(h)].filter(Boolean).join(' · ')
-    out.push(`${rule} ×${items.length} — ${meta}${h.message ? ` — ${h.message}` : ''}`)
+    const instances = items.reduce((n, i) => n + (i.count ?? 1), 0)
+    out.push(`${rule} ×${instances} — ${meta}${h.message ? ` — ${h.message}` : ''}`)
     for (const i of items) {
       const src = i.source && typeof i.source === 'object' ? ` → ${formatSourceInline(i.source)}` : ''
       const pages = i.foundOn?.length ? ` @ ${i.foundOn.join(', ')}` : ''
+      if (i.count && i.examples) {
+        for (const sel of i.examples) out.push(`  ${sel}${pages}`)
+        if (i.count > i.examples.length) out.push(`  … +${i.count - i.examples.length} more — ${i.expand ?? `pass rules: ["${rule}"] to list every one`}`)
+        continue
+      }
       out.push(`  ${i.selector ?? '?'}${src}${pages}`)
     }
   }

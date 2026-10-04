@@ -90,6 +90,19 @@ const READ_POINTERS_SOURCE = String.raw`
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
 const readPointersInPage = new Function('selectors', READ_POINTERS_SOURCE) as (selectors: string[]) => Record<string, SourcePointer>
 
+/**
+ * True for component names that tell an agent nothing: minifier output
+ * ("c", "Kt", "eB" — any 1-2 char name) and framework
+ * internals ("__next_root_layout_boundary__"). Production React builds name
+ * every owner like this (demo.vercel.store, 2026-10-03).
+ */
+export function looksMinified(name: string): boolean {
+  if (name.startsWith('__')) return true
+  // Terser mangles to mixed case too ("Kt", "eB", "A"); no real component
+  // name is two characters or fewer often enough to be worth the noise.
+  return name.length <= 2
+}
+
 /** Read framework source pointers for the given selectors. Never throws. */
 export async function collectSourcePointers(page: EvaluatePage, selectors: string[]): Promise<Record<string, SourcePointer>> {
   const unique = [...new Set(selectors.filter((s) => typeof s === 'string' && s.length > 0))]
@@ -102,7 +115,9 @@ export async function collectSourcePointers(page: EvaluatePage, selectors: strin
       if (p.file) clean.file = p.file
       if (typeof p.line === 'number') clean.line = p.line
       if (typeof p.column === 'number') clean.column = p.column
-      if (p.component) clean.component = p.component
+      if (p.component && !looksMinified(String(p.component))) clean.component = String(p.component)
+      // A pointer with neither a file nor a usable component name is noise.
+      if (!clean.file && !clean.component) continue
       if (p.framework) clean.framework = p.framework
       out[sel] = clean
     }

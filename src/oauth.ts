@@ -9,8 +9,8 @@
  * starts a device session against the API, sends the user to the same
  * verification page `webability login` uses, and turns the resulting WebAbility
  * token into the OAuth access token. /mcp then validates it exactly as before
- * (per-user token → paid tools bill the caller), so nothing about the
- * transport or billing model changes — this is purely a front door.
+ * (per-user token, so account tools run as that caller), so nothing about the
+ * transport or account model changes — this is purely a front door.
  *
  * State model, sized for a single container:
  * - client_id is a self-contained HMAC-signed blob (no client store, so

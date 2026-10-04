@@ -10,22 +10,24 @@
  * Stateless mode: a fresh server + transport per request, so concurrent clients
  * never share request state.
  *
- * AUTH IS PER-USER. The hosted endpoint runs on our infra and launches browsers,
- * so it never runs anonymously — but instead of one shared secret, each caller
- * sends THEIR OWN WebAbility token as `Authorization: Bearer <token>` (or, when
+ * AUTH IS PER-USER. Everything is free. Anonymous callers get the scan/check
+ * tools under per-IP fair-use limits; signing in with a free WebAbility account
+ * unlocks visual_audit / start_audit / get_audit. Each caller sends THEIR OWN
+ * WebAbility token as `Authorization: Bearer <token>` (or, when
  * fronted by a gateway that reserves Authorization, as `x-webability-token`). It
- * is validated against the API and then used for that caller's paid-tool calls,
- * so an audit bills to the caller's account. This is what lets a directory like
+ * is validated against the API and then used for that caller's account-tool calls,
+ * so an audit belongs to the caller's account. This is what lets a directory like
  * Smithery pass each user's key straight through (no shared secret to leak).
  *
  * Backward-compat: a shared MCP_AUTH_TOKEN, when set, is still accepted
- * (operator mode → paid tools fall back to the deploy's WEBABILITY_API_KEY).
+ * (operator mode → account tools fall back to the deploy's WEBABILITY_API_KEY).
  */
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
-import { timingSafeEqual, createHmac } from 'crypto'
+import { timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
 import { handleOAuth, wwwAuthenticate } from './oauth.js'
+import { anonLimitClass, calledTools, clientIp } from './anonGate.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const MCP_PATH = '/mcp'
@@ -81,57 +83,20 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 
 // ---------------------------------------------------------------------------
 // Partial auth: the server starts AUTHLESS so anyone can list and call the
-// free tools. The paid tools (start_audit/get_audit/visual_audit) get a
-// TRIAL instead of an immediate 401 — MCP_TRIAL_LIMIT calls (default 50) per
-// anonymous IP, tracked durably by the platform API (see cli.routes.ts
-// /cli/mcp-trial/*) so it survives a container restart. Once the trial is
-// spent, those tools 401 + WWW-Authenticate, which spec clients answer by
-// running the OAuth flow in oauth.ts on demand. Anonymous traffic launches
-// OUR browsers and calls OUR AI endpoint, so the free (non-trial) tools are
-// separately rate-limited per client IP — never per-request writes to paid
-// storage, just in-memory counters (single-container deploy).
+// scan/check tools anonymously. Everything is free; fair-use limits apply.
+// The account tools (start_audit/get_audit/visual_audit) need a free
+// WebAbility account: an anonymous call gets 401 + WWW-Authenticate, which
+// spec clients answer by running the OAuth flow in oauth.ts on demand.
+// Anonymous traffic launches OUR browsers and calls OUR AI endpoint, so the
+// scan/check tools are rate-limited per client IP — in-memory counters only
+// (single-container deploy), never per-request writes to paid storage.
 // ---------------------------------------------------------------------------
-// Server-to-server secret shared with the platform API's /cli/mcp-trial/*
-// routes — never sent to, or derivable by, an end client.
-const MCP_TRIAL_INTERNAL_SECRET = process.env.MCP_TRIAL_INTERNAL_SECRET || ''
-// HMAC key for turning a caller's IP into an opaque trial-bucket id before it
-// ever leaves this process. Held only here; the API just stores the digest.
-const MCP_TRIAL_IP_SECRET = process.env.MCP_TRIAL_IP_SECRET || ''
-function trialIpKeyFor(ip: string): string {
-  if (!MCP_TRIAL_INTERNAL_SECRET || !MCP_TRIAL_IP_SECRET) return ''
-  return createHmac('sha256', MCP_TRIAL_IP_SECRET).update(ip).digest('hex')
-}
-// The three tools trial credits gate. Checked BEFORE dispatch (not inside
-// the tool handler) for two reasons: (1) only a pre-dispatch check can
-// return a real HTTP 401 + WWW-Authenticate — once we're inside the MCP
-// JSON-RPC tool call, any outcome is a 200 "tool result", so a spec client
-// can never auto-trigger its OAuth flow on exhaustion; (2) visual_audit
-// launches a real headless browser as its first action — checking only
-// inside that handler (as the actual credit debit still does, server-side)
-// would let an already-exhausted anonymous caller keep paying for browser
-// launches indefinitely, since every one of those calls was always going to
-// 429 anyway.
-const PAID_TOOLS = new Set(['start_audit', 'get_audit', 'visual_audit'])
-/** Read-only: how many trial calls remain, WITHOUT spending one (the actual
- *  debit happens later, inside the real start_audit/get_audit/visual_audit
- *  backend call in server.ts). Never throws — a network hiccup here just
- *  means we fail closed (treat as exhausted) rather than crash the request. */
-async function peekTrialRemaining(trialIpKey: string): Promise<number> {
-  if (!trialIpKey) return 0
-  try {
-    const res = await fetch(`${API_URL}/cli/mcp-trial/status`, {
-      headers: { 'x-mcp-internal': MCP_TRIAL_INTERNAL_SECRET, 'x-mcp-trial-ip': trialIpKey },
-    })
-    if (!res.ok) return 0
-    const data = (await res.json()) as { remaining?: number }
-    return typeof data.remaining === 'number' ? data.remaining : 0
-  } catch {
-    return 0
-  }
-}
-// Browser-launching tools: each call is a headless page on this box.
-const HEAVY_TOOLS = new Set(['scan_page', 'flow_scan', 'diff_scan', 'verify_fix', 'detect_framework', 'scan_html', 'check_aria'])
-const AI_TOOLS = new Set(['generate_ai_fix'])
+// Checked BEFORE dispatch (not inside the tool handler): only a pre-dispatch
+// check can return a real HTTP 401 + WWW-Authenticate — inside the MCP
+// JSON-RPC tool call any outcome is a 200 "tool result", so a spec client
+// could never auto-trigger its OAuth flow. It also means visual_audit never
+// launches a headless browser for a call that was always going to be refused.
+const ACCOUNT_TOOLS = new Set(['start_audit', 'get_audit', 'visual_audit'])
 const ANON_HEAVY_PER_HOUR = Number(process.env.ANON_HEAVY_PER_HOUR || 30)
 const ANON_AI_PER_HOUR = Number(process.env.ANON_AI_PER_HOUR || 10)
 
@@ -148,35 +113,6 @@ function allowAnon(key: string, limit: number): { ok: boolean; retryAfterS: numb
   }
   b.n += 1
   return { ok: b.n <= limit, retryAfterS: Math.ceil((b.resetAt - now) / 1000) }
-}
-
-// Only trust CF-Connecting-IP when the operator declares the origin sits behind
-// Cloudflare (TRUST_CF_CONNECTING_IP=true). On a Cloudflare-fronted deployment
-// that header is set by Cloudflare to the real visitor and overwrites any client
-// copy, so it is trustworthy AND unspoofable — provided the origin only accepts
-// Cloudflare traffic. Defaulting this OFF keeps non-Cloudflare deployments (a
-// bare `node dist/http.js`, or a proxy that overwrites X-Forwarded-For) on their
-// existing, trustworthy XFF/socket chain: trusting CF-Connecting-IP there would
-// let a client forge a header the old code never read, reintroducing the bypass.
-const TRUST_CF_CONNECTING_IP =
-  (process.env.TRUST_CF_CONNECTING_IP || '').trim().toLowerCase() === 'true'
-
-function clientIp(req: IncomingMessage): string {
-  // The leftmost X-Forwarded-For entry is client-controlled: a caller can send
-  // `X-Forwarded-For: <random>` on every request to mint a fresh rate-limit
-  // bucket and bypass allowAnon. Prefer the Cloudflare-set header when the
-  // operator has opted in; otherwise fall back to the XFF/socket chain.
-  if (TRUST_CF_CONNECTING_IP) {
-    const cf = (req.headers['cf-connecting-ip'] as string) || ''
-    if (cf.trim()) return cf.trim()
-  }
-  const fwd = (req.headers['x-forwarded-for'] as string) || ''
-  return (fwd.split(',')[0] || req.socket.remoteAddress || 'unknown').trim()
-}
-
-function calledTool(body: unknown): string {
-  const b = body as any
-  return b && b.method === 'tools/call' && b.params && typeof b.params.name === 'string' ? b.params.name : ''
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -215,6 +151,19 @@ const httpServer = createHttpServer(async (req, res) => {
     return
   }
 
+  // OpenAI apps directory domain verification. Public token from the portal;
+  // 404 when unset. Never logged.
+  if (url.pathname === '/.well-known/openai-apps-challenge' && req.method === 'GET') {
+    const challenge = process.env.OPENAI_APPS_CHALLENGE_TOKEN?.trim()
+    if (!challenge) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(challenge)
+    return
+  }
+
   // Humans who open the bare domain (e.g. from the dashboard card) get sent to
   // the setup docs — only /mcp (machines) and /health live here.
   if (url.pathname === '/' && req.method === 'GET') {
@@ -230,7 +179,7 @@ const httpServer = createHttpServer(async (req, res) => {
 
   // Auth is PARTIAL. Anyone can initialize, list tools, and call the free
   // (DOM/scanner) tools anonymously — rate-limited per IP. A valid per-user
-  // token lifts the limits and unlocks the paid tools, which bill to that
+  // token lifts the limits and unlocks the account tools, which run on that
   // caller's account. A GARBAGE token is still a hard 401 (a caller who tried
   // to authenticate should learn their token is bad, not be silently
   // downgraded to anonymous). The shared operator token is accepted too.
@@ -240,9 +189,9 @@ const httpServer = createHttpServer(async (req, res) => {
   if (!token) {
     anonymous = true
   } else if (matchesShared(token)) {
-    authToken = undefined // operator mode: paid tools use the deploy's WEBABILITY_API_KEY
+    authToken = undefined // operator mode: account tools use the deploy's WEBABILITY_API_KEY
   } else if (await isValidUserToken(token)) {
-    authToken = token // per-user mode: paid tools use the caller's key
+    authToken = token // per-user mode: account tools use the caller's key
   } else {
     res.setHeader('WWW-Authenticate', wwwAuthenticate())
     sendJson(res, 401, {
@@ -262,39 +211,31 @@ const httpServer = createHttpServer(async (req, res) => {
   try {
     const body = req.method === 'POST' ? await readJsonBody(req) : undefined
 
-    const trialIpKey = anonymous ? trialIpKeyFor(clientIp(req)) : ''
+    const ip = clientIp(req.headers, req.socket.remoteAddress)
 
     if (anonymous) {
-      const tool = calledTool(body)
-      if (PAID_TOOLS.has(tool)) {
-        // Pre-dispatch trial gate: a PEEK (never spends a credit — the real
-        // debit happens inside server.ts's start_audit/get_audit/visual_audit
-        // handler, as part of the actual paid call). Checked here, before the
-        // tool ever runs, so an exhausted caller gets a real 401 +
-        // WWW-Authenticate (spec clients auto-run OAuth on that) instead of a
-        // 200 JSON-RPC "tool result" saying no — and so visual_audit's
-        // headless-browser launch never happens for a call that was always
-        // going to be refused.
-        const remaining = await peekTrialRemaining(trialIpKey)
-        if (remaining <= 0) {
-          res.setHeader('WWW-Authenticate', wwwAuthenticate())
-          sendJson(res, 401, {
-            jsonrpc: '2.0',
-            error: {
-              code: -32001,
-              message:
-                `${tool} runs paid server-side work. The free trial is used up (or not available right now). ` +
-                'Authorize this connector when your client prompts you to sign in (free account works), or run `webability login`. ' +
-                'The scanning tools keep working without an account.',
-            },
-            id: null,
-          })
-          return
-        }
+      // Every tool the body calls — a JSON-RPC batch must not slip past the
+      // gate by hiding its calls in an array (see anonGate.ts).
+      const tools = calledTools(body)
+      const needsAccount = tools.map((t) => t.name).find((n) => ACCOUNT_TOOLS.has(n))
+      if (needsAccount) {
+        res.setHeader('WWW-Authenticate', wwwAuthenticate())
+        sendJson(res, 401, {
+          jsonrpc: '2.0',
+          error: {
+            code: -32001,
+            message:
+              `${needsAccount} needs a free WebAbility account. Sign in when your client prompts you (OAuth), or run \`webability login\`. ` +
+              'The scanning tools work without an account.',
+          },
+          id: null,
+        })
+        return
       }
-      const limit = AI_TOOLS.has(tool) ? ANON_AI_PER_HOUR : HEAVY_TOOLS.has(tool) ? ANON_HEAVY_PER_HOUR : 0
-      if (limit > 0) {
-        const gate = allowAnon(`${clientIp(req)}:${AI_TOOLS.has(tool) ? 'ai' : 'heavy'}`, limit)
+      for (const tool of tools) {
+        const cls = anonLimitClass(tool)
+        if (!cls) continue
+        const gate = allowAnon(`${ip}:${cls}`, cls === 'ai' ? ANON_AI_PER_HOUR : ANON_HEAVY_PER_HOUR)
         if (!gate.ok) {
           res.setHeader('Retry-After', String(gate.retryAfterS))
           sendJson(res, 429, {
@@ -310,7 +251,7 @@ const httpServer = createHttpServer(async (req, res) => {
       }
     }
 
-    const server = createServer({ remote: true, authToken, anonymous, trialIpKey })
+    const server = createServer({ remote: true, authToken, anonymous })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     res.on('close', () => {
       transport.close().catch(() => {})

@@ -52,9 +52,9 @@ test('get_rules rejects a bogus engine instead of returning everything', async (
 })
 
 test('get_rules rejects unknown args instead of swallowing them', async () => {
-  const res: any = await (await connect()).callTool({ name: 'get_rules', arguments: { tag: ['wcag21aa'] } as any })
-  assert.match(firstText(res), /^Error: unknown argument 'tag'/)
-  assert.match(firstText(res), /tags, fixability, engine/)
+  const res: any = await (await connect()).callTool({ name: 'get_rules', arguments: { bogus: ['wcag21aa'] } as any })
+  assert.match(firstText(res), /^Error: unknown argument 'bogus'/)
+  assert.match(firstText(res), /tags, rule, fixability, engine/)
 })
 
 test('get_rules rejects non-array tags', async () => {

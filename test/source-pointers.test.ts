@@ -10,18 +10,27 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { collectSourcePointers, findSourceCandidates, formatSource } from '../src/sourcePointers.ts'
+import { collectSourcePointers, findSourceCandidates, formatSource, looksMinified } from '../src/sourcePointers.ts'
 
 const FIXTURE = `<!doctype html><html><body>
 <img id="hero" src="x.png">
 <button id="vbtn"></button>
 <a id="plain" href="#"></a>
+<input id="minified">
+<a id="internal" href="#">x</a>
+<span id="named">x</span>
 <script>
   // React 16-18 dev build shape: fiber on the DOM node, _debugSource from the
   // jsx dev transform, owner chain for the component name.
   const owner = { type: { name: 'Hero' }, _debugSource: null, return: null }
   document.getElementById('hero')['__reactFiber$abc'] = { _debugSource: { fileName: '/app/src/Hero.tsx', lineNumber: 12, columnNumber: 5 }, _debugOwner: owner, return: owner, type: 'img' }
   // Vue 3 dev build shape.
+  // Production React build (demo.vercel.store, live 2026-10-03): the owner
+  // chain only names minified components — "c", "u", "j" — or framework
+  // internals like __next_root_layout_boundary__. Neither helps an agent.
+  document.getElementById('minified')['__reactFiber$abc'] = { type: 'input', return: { type: function c() {}, return: null } }
+  document.getElementById('internal')['__reactFiber$abc'] = { type: 'a', return: { type: { displayName: '__next_root_layout_boundary__' }, return: null } }
+  document.getElementById('named')['__reactFiber$abc'] = { type: 'span', return: { type: function Nav() {}, return: null } }
   document.getElementById('vbtn').__vueParentComponent = { type: { __file: '/app/src/components/Toolbar.vue', name: 'Toolbar' } }
 </script></body></html>`
 
@@ -55,4 +64,24 @@ test('findSourceCandidates greps the project for selector tokens', async () => {
   const files = await findSourceCandidates('img.hero-image', root)
   assert.deepEqual(files.map((f) => f.replace(root + '/', '')), ['src/Hero.tsx'])
   assert.deepEqual(await findSourceCandidates('div', root), [])
+})
+
+test('minified or framework-internal component names are omitted; a pointer with nothing left is dropped', async () => {
+  const pw = await import('playwright')
+  const browser = await pw.chromium.launch({ headless: true })
+  try {
+    const page = await browser.newPage()
+    await page.setContent(FIXTURE)
+    const out = await collectSourcePointers(page, ['#minified', '#internal', '#named'])
+    assert.equal(out['#minified'], undefined, '"c" is a minifier artifact, not a component name')
+    assert.equal(out['#internal'], undefined, '__next_root_layout_boundary__ is a framework internal')
+    assert.deepEqual(out['#named'], { component: 'Nav', framework: 'react' }, 'a real 3-letter capitalised name stays')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('looksMinified: 1-2 char lowercase names are minified; short capitalised names are not', () => {
+  for (const n of ['c', 'u', 'j', 'v', 'ab', 'a1', '_', '$', 'Kt', 'eB', 'Ae', 'A']) assert.equal(looksMinified(n), true, n)
+  for (const n of ['Nav', 'Hero', 'App', 'main']) assert.equal(looksMinified(n), false, n)
 })

@@ -82,3 +82,26 @@ test('the scan/fix/verify loop is on BOTH transports', async () => {
     assert.ok(full.includes(core), `Full must offer ${core}`)
   }
 })
+
+test('hosted check_aria does not point at scan_history (the hosted server keeps none); local still does', async () => {
+  const full = (await (await connect(true)).listTools()).tools.find((t) => t.name === 'check_aria')!
+  const lite = (await (await connect(false)).listTools()).tools.find((t) => t.name === 'check_aria')!
+  assert.doesNotMatch(full.description!, /scan_history/)
+  assert.match(full.description!, /nodeLimit/)
+  assert.match(lite.description!, /scan_history/)
+})
+
+test('hosted instructions: scan/check tools need no token, key or account; a free account (client sign-in) unlocks the three Full tools', async () => {
+  const text = (await connect(true)).getInstructions() ?? ''
+  // "tokens" also appears as LLM output size (format: "compact"); only an
+  // auth-token requirement is wrong.
+  assert.doesNotMatch(text, /(webability|your|that|auth|api|access)\s+token|token\s+(is\s+)?required|need[s]?\s+(a\s+)?token/i, 'the hosted model is free: no token is required for any scan tool')
+  assert.match(text, /no account or key/i)
+  assert.match(text, /fair-use limits per IP/i)
+  assert.match(text, /sign-in prompted by your client/i)
+  for (const t of ['visual_audit', 'start_audit', 'get_audit']) assert.ok(text.includes(t), t)
+  assert.doesNotMatch(text, /abilyo/i)
+  const lite = (await connect(false)).getInstructions() ?? ''
+  assert.match(lite, /webability login/)
+  assert.match(lite, /@webability\/cli/)
+})

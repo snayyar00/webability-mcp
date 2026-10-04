@@ -1,10 +1,11 @@
 {
   "name": "@webability/mcp",
   "mcpName": "io.github.snayyar00/webability",
-  "version": "1.6.3",
-  "description": "WebAbility MCP server \u2014 WCAG 2.2 / ADA / EAA accessibility scanning with three-tier confidence output (issues + incomplete + summary), framework-aware AI fix suggestions, and brand-palette contrast checks. For Cursor, Claude Code, and other IDEs.",
+  "version": "1.6.4",
+  "description": "WebAbility MCP server — WCAG 2.2 / ADA / EAA accessibility scanning with three-tier confidence output (issues + incomplete + summary), framework-aware AI fix suggestions, and brand-palette contrast checks. For Cursor, Claude Code, and other IDEs.",
   "type": "module",
   "bin": {
+    "mcp": "./dist/index.js",
     "abilyo-mcp": "./dist/index.js",
     "webability-mcp": "./dist/index.js",
     "webability-mcp-http": "./dist/http.js",

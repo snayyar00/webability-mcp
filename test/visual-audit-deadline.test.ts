@@ -68,12 +68,12 @@ test('a deadline that fires during browser launch stops the capture', () => {
 })
 
 test('visual_audit closes the browser on every path', () => {
-  assert.match(HANDLER, /finally\s*\{[^}]*browser[^}]*close\(\)/, 'browser.close() must sit in a finally block')
+  assert.match(HANDLER, /finally\s*\{[^}]*session\.close\(\)/, 'session.close() must sit in a finally block')
 })
 
 test('visual_audit reports an HTTP error page instead of auditing it', () => {
   // A closed tunnel or a missing secret serves the relay's 401/404 page; the
   // vision pass then "finds no issues" on a page that was never the target.
-  assert.match(HANDLER, /const response = await page\.goto\(/, 'keep the navigation response')
+  assert.match(HANDLER, /const response = await session\.goto\(/, 'keep the navigation response')
   assert.match(HANDLER, /response\.status\(\) >= 400/, 'an HTTP error status must stop the audit')
 })

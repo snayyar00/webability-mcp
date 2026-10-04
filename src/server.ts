@@ -2,7 +2,11 @@
 // Both entry points (index.ts = stdio, http.ts = Streamable HTTP) import createServer from here.
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js'
+import { detectSiteFramework } from './siteFramework.js'
+import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
+import { resolveGetRulesArgs, normRuleId } from './getRulesArgs.js'
 import { scan, detectFramework, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES } from '@webability/core'
+import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
 import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelHeadersFor } from './tunnelAuth'
 import { DeadlineError, withDeadline } from './deadline'
@@ -24,14 +28,15 @@ import { generateReportPdf, type PdfIssue } from './reportPdf.js'
 import { axeRuleFixMeta, enrichIssue, webabilityRuleFixMeta, FIXABILITY_TIERS, type Fixability } from './fixOps.js'
 import { OUTPUT_CONTROL_PROPERTIES, compactText, describeControls, filterIssues, isFiltered, parseOutputControls, type OutputControls } from './outputControls.js'
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
+import { collapseRepeats, mergeSameElement, nameFamilyKey, recountSummary, truncationNote } from './scanShaping.js'
 import { fastScanHtml } from './fastScan.js'
+import { openSession } from './browser.js'
+
+/** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
+export const HOSTED_URL_ARG_KEYS: string[] = [...new Set(['url', 'startUrl', 'baselineUrl', ...VERIFY_FIX_URL_KEYS])]
 
 const execFileAsync = promisify(execFile)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
-// Server-to-server secret for the /cli/mcp-trial/* routes — see http.ts,
-// which computes the matching MCP_TRIAL_IP_SECRET-based trialIpKey.
-const MCP_TRIAL_INTERNAL_SECRET = process.env.MCP_TRIAL_INTERNAL_SECRET || ''
-const TRIAL_EXHAUSTED_HINT = 'Log in with `webability login` (or set WEBABILITY_API_KEY) for unlimited use.'
 
 /**
  * Severity ordering for the axe-style impact taxonomy (`critical > serious >
@@ -103,20 +108,15 @@ export interface ServerOptions {
    *  URL allowlist and disables local-filesystem tools (find_source). Off for local stdio. */
   remote?: boolean
   /** Per-request WebAbility token for Full tools (visual_audit / start_audit). On the hosted
-   *  HTTP endpoint this is the CALLER's own key (from their Authorization header). Free for
-   *  the customer with a WebAbility account; token identifies whose free quota to use.
+   *  HTTP endpoint this is the CALLER's own key (from their Authorization header). Free
+   *  with a WebAbility account; the token identifies the account.
    *  When unset, tools fall back to resolveAuthToken() (stdio env/CLI). */
   authToken?: string
-  /** Hosted request with NO credentials (partial-auth mode). Paid tools must refuse —
-   *  never fall back to resolveAuthToken(), which on the hosted deploy is the
-   *  operator's own key and would bill anonymous traffic to the operator. */
+  /** Hosted request with NO credentials (partial-auth mode). The account tools
+   *  (visual_audit / start_audit / get_audit) must refuse — never fall back to
+   *  resolveAuthToken(), which on the hosted deploy is the operator's own key
+   *  and would run anonymous traffic on the operator's account. */
   anonymous?: boolean
-  /** Opaque HMAC of the caller's IP (computed in http.ts, never a raw IP), present
-   *  only when `anonymous` is true. Lets the paid tools spend from that caller's
-   *  MCP_TRIAL_LIMIT-call trial (tracked durably by the API's /cli/mcp-trial/*
-   *  routes) instead of refusing outright. Empty string if trial plumbing isn't
-   *  configured — the tools then refuse closed, same as before the trial existed. */
-  trialIpKey?: string
 }
 
 /** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT. */
@@ -215,17 +215,19 @@ function VIEWPORT_FOR_TUNNEL(preset: unknown): { width: number; height: number }
   return { width: 1280, height: 800 }
 }
 
-async function withTunnelPage<T>(url: string, tunnel: TunnelTarget, viewport: { width: number; height: number }, fn: (page: any) => Promise<T>): Promise<T> {
-  const pw = await import('playwright')
-  const browser = await pw.chromium.launch({ headless: true })
+async function withTunnelPage<T>(url: string, tunnel: TunnelTarget | null, viewport: { width: number; height: number }, fn: (page: any, status?: number) => Promise<T>, remote: boolean): Promise<T> {
+  const session = await openSession({
+    remote,
+    contextOptions: { viewport },
+    // A tunnel always installs the relay guard; with no tunnel the guard is
+    // the hosted SSRF block, so a local run must not install it (localhost).
+    setupContext: (context) => (tunnel || remote ? installSsrfRoute(context, tunnel) : undefined),
+  })
   try {
-    const context = await browser.newContext({ viewport })
-    await installSsrfRoute(context, tunnel)
-    const page = await context.newPage()
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-    return await fn(page)
+    const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    return await fn(session.page, typeof response?.status === 'function' ? response.status() : undefined)
   } finally {
-    await browser.close().catch(() => {})
+    await session.close()
   }
 }
 
@@ -243,30 +245,39 @@ async function scanWithSourcePointers(
   viewportPreset: unknown,
   scanOptions: Record<string, unknown>,
   remote: boolean,
-): Promise<{ result: Awaited<ReturnType<typeof scan>>; pointers: Record<string, SourcePointer> }> {
+): Promise<{ result: Awaited<ReturnType<typeof scan>>; pointers: Record<string, SourcePointer>; framework?: { framework: string; cssFramework?: string; builder?: string } }> {
   const url = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`
   const scanOpenPage = async (page: any, mainStatus?: number) => {
     const result = await scan(page, { ...scanOptions, mainStatus } as any)
-    const pointers = result.blocked
-      ? {}
-      : await collectSourcePointers(page, [...result.issues, ...result.incomplete].map((i) => i.selector))
-    return { result, pointers }
+    if (result.blocked) return { result, pointers: {} }
+    const pointers = await collectSourcePointers(page, [...result.issues, ...result.incomplete].map((i) => i.selector))
+    // Same detection detect_framework runs, read from the page the scan just
+    // used. The scan payload used to print a constant "plain-css".
+    let framework: { framework: string; cssFramework?: string; builder?: string } | undefined
+    try {
+      const css = (await detectFramework(page)).framework
+      const site = await detectSiteFramework(page, css)
+      framework = { framework: site.label, cssFramework: css, ...(site.builder ? { builder: site.builder } : {}) }
+    } catch {
+      framework = undefined
+    }
+    return { result, pointers, framework }
   }
   // Tunnelled: the existing driver already installs the relay route before
   // the first navigation — reuse it rather than duplicate that invariant.
-  if (tunnel) return withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(viewportPreset), (page) => scanOpenPage(page))
+  if (tunnel) return withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(viewportPreset), (page) => scanOpenPage(page), remote)
 
   const viewport = (VIEWPORT_SIZES as Record<string, { width: number; height: number }>)[String(viewportPreset || 'desktop')] ?? VIEWPORT_SIZES.desktop
-  const pw = await import('playwright')
-  const browser = await pw.chromium.launch({ headless: true })
+  const session = await openSession({
+    remote,
+    contextOptions: { viewport },
+    setupContext: (context) => (remote ? installSsrfRoute(context, null) : undefined),
+  })
   try {
-    const context = await browser.newContext({ viewport })
-    if (remote) await installSsrfRoute(context, null)
-    const page = await context.newPage()
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-    return await scanOpenPage(page, typeof response?.status === 'function' ? response.status() : undefined)
+    const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    return await scanOpenPage(session.page, typeof response?.status === 'function' ? response.status() : undefined)
   } finally {
-    await browser.close().catch(() => {})
+    await session.close()
   }
 }
 
@@ -298,13 +309,25 @@ function renderFindings(controls: OutputControls, payload: Record<string, unknow
   return { type: 'text', text: sections.join('\n\n') }
 }
 
+/** The tunnel a tool call targets, paired with its secret. verify_fix reads the
+ *  same resolved URL its handler loads (empty `url` falls through to `page` /
+ *  `pageUrl`), so an aliased tunnel URL still carries its secret header. */
+export function tunnelTargetForCall(name: string, args: Record<string, unknown> | undefined): TunnelTarget | null {
+  const a = (args ?? {}) as any
+  const raw = name !== 'verify_fix' ? a.url ?? a.startUrl ?? '' : verifyFixTargetUrl(args) ?? ''
+  return parseTunnelTarget(String(raw), String(a.tunnel_secret ?? ''))
+}
+
 /** Exported for palette-ssrf.e2e.ts: the guard's BEHAVIOUR needs a real
  *  browser and a real loopback listener, not a regex over this file. */
 export async function extractBrandPaletteFromUrl(url: string, remote: boolean, tunnel: TunnelTarget | null = null): Promise<string[]> {
-  const pw = await import('playwright')
-  const browser = await pw.chromium.launch({ headless: true })
+  // SSRF guard rationale below. The guard is installed by setupContext so the
+  // HTTP/2 fallback context gets it too.
+  const session = await openSession({
+    remote,
+    setupContext: (context) => (remote || tunnel ? installSsrfRoute(context, tunnel) : undefined),
+  })
   try {
-    const context = await browser.newContext()
     // `remote`, exactly like every other browser context in this file — NOT
     // `tunnel`. Gating on the tunnel left the ordinary hosted palette fetch
     // with no SSRF guard at all, so a caller could point generate_ai_fix or
@@ -312,10 +335,8 @@ export async function extractBrandPaletteFromUrl(url: string, remote: boolean, t
     // That is what DEV-1050 was fixing; a tunnel-only condition silently
     // undid it. The tunnel target still rides along so a tunnelled URL keeps
     // working, but it is not what decides whether the guard is installed.
-    if (remote || tunnel) await installSsrfRoute(context, tunnel)
-    const page = await context.newPage()
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-    const theme = await extractSiteTheme(page)
+    await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    const theme = await extractSiteTheme(session.page)
     const raw = [
       ...Object.values(theme.cssVars),
       ...theme.topBgColors.map((c) => c.color),
@@ -324,7 +345,7 @@ export async function extractBrandPaletteFromUrl(url: string, remote: boolean, t
     const hexes = raw.map(rgbStringToHex).filter((h): h is string => !!h)
     return Array.from(new Set(hexes))
   } finally {
-    await browser.close().catch(() => {})
+    await session.close()
   }
 }
 
@@ -353,7 +374,7 @@ function fullToolLiteStubPrefix(toolName: string): string {
 function liteFullUpgradeMessage(toolName: string): string {
   return (
     `\`${toolName}\` runs on **WebAbility MCP Full** (hosted) — free with a WebAbility account. ` +
-    `Connect ${HOSTED_MCP_URL} (dashboard or Smithery: ${SMITHERY_INSTALL}) with your token, then retry. ` +
+    `Connect ${HOSTED_MCP_URL} (dashboard or Smithery: ${SMITHERY_INSTALL}) and sign in when your client prompts you, then retry. ` +
     `Lite keeps scan / fix / verify free with no account.`
   )
 }
@@ -361,8 +382,8 @@ function liteFullUpgradeMessage(toolName: string): string {
 function buildInstructions(isLite: boolean): string {
   const edition = isLite
     ? `This is **WebAbility MCP Lite** (local, free, no account). Scan / fix / verify / report-PDF run on this machine.
-\`visual_audit\`, \`start_audit\`, and \`get_audit\` are listed so you know they exist — they are **free with a WebAbility account** on hosted Full at ${HOSTED_MCP_URL} (dashboard / Smithery: ${SMITHERY_INSTALL}). When the user needs vision or a compliance report, tell them to connect Full (still free; account + token only).`
-    : `This is **WebAbility MCP** (hosted Full). Free with a WebAbility token. \`visual_audit\` and \`start_audit\` need that token; DOM scan tools work here too.`
+\`visual_audit\`, \`start_audit\`, and \`get_audit\` are listed so you know they exist — they are **free with a WebAbility account** on hosted Full at ${HOSTED_MCP_URL} (dashboard / Smithery: ${SMITHERY_INSTALL}). When the user needs vision or a compliance report, tell them to connect Full (still free; a free account is all it needs). To sign in from this machine, run \`webability login\` (from \`@webability/cli\`).`
+    : `This is **WebAbility MCP** (hosted Full). Free for everyone. Scan and check tools work with no account or key, under fair-use limits per IP. A free WebAbility account (sign-in prompted by your client) unlocks \`visual_audit\`, \`start_audit\` and \`get_audit\`.`
 
   const routingExtra = isLite
     ? `- Vision / compliance report → \`visual_audit\` / \`start_audit\` (listed as Full stubs here; free with account on hosted Full at ${HOSTED_MCP_URL})
@@ -455,7 +476,7 @@ const ALL_TOOLS = [
       inputSchema: {
         type: 'object' as const,
         properties: {
-          url: { type: 'string', description: 'URL now serving the fix (deployed, staging, or http://localhost:3000)' },
+          url: { type: 'string', description: 'URL now serving the fix (deployed, staging, or http://localhost:3000). Also accepted as `page` or `pageUrl`.' },
           selector: { type: 'string', description: 'CSS selector of the element you fixed — use the `selector` from the original scan_page issue' },
           wcag: { type: 'string', description: 'Optional: WCAG criterion (e.g. "1.1.1", "1.4.3") or axe rule id (e.g. "color-contrast") to verify specifically. Omit to require the element be free of ALL violations.' },
           viewport: { type: 'string', enum: ['desktop', 'tablet', 'mobile'], description: 'Viewport size (default: desktop). Use the same viewport the issue was found at.' },
@@ -481,7 +502,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'start_audit',
-      description: 'Kick off a FULL accessibility audit deliverable for a URL — a persistent, timestamped artifact, not an inline scan. Runs the server-side pipeline (axe + advanced checks + mobile viewports + annotated screenshots + optional agent spot-check) and produces a downloadable report and a formatted Excel workbook (Cover / Status / Barriers / ADA context sheets) stored durably. Returns immediately with an audit `id`; poll `get_audit` for progress and, when complete, download URLs. Use this when someone needs a durable artifact to attach as evidence of testing effort for a compliance officer or legal response — for iterating on code, use scan_page + verify_fix instead. Free without an account for a limited trial (a shared pool of calls across start_audit/get_audit/visual_audit, hosted deploy only) — the response says how many are left and includes a claimToken to pass to get_audit. Past the trial, or on the local/stdio server: authenticate via `webability login` or set WEBABILITY_API_KEY. Set includeAgent:true to add the (slower, paid) agentic manual-audit pass. To audit a local dev server, open a tunnel (`webability-tunnel --port 3000`) and pass its URL as `url` with the printed secret as `tunnel_secret`; keep the tunnel open until get_audit reports complete (about 5 minutes) — the pipeline loads the page several times.',
+      description: 'Kick off a FULL accessibility audit deliverable for a URL — a persistent, timestamped artifact, not an inline scan. Runs the server-side pipeline (axe + advanced checks + mobile viewports + annotated screenshots + optional agent spot-check) and produces a downloadable report and a formatted Excel workbook (Cover / Status / Barriers / ADA context sheets) stored durably. Returns immediately with an audit `id`; poll `get_audit` for progress and, when complete, download URLs. Use this when someone needs a durable artifact to attach as evidence of testing effort for a compliance officer or legal response — for iterating on code, use scan_page + verify_fix instead. Free for everyone; needs a free WebAbility account (sign in when your client prompts you, or run `webability login`). Set includeAgent:true to add the slower agentic manual-audit pass. To audit a local dev server, open a tunnel (`webability-tunnel --port 3000`) and pass its URL as `url` with the printed secret as `tunnel_secret`; keep the tunnel open until get_audit reports complete (about 5 minutes) — the pipeline loads the page several times.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -497,12 +518,11 @@ const ALL_TOOLS = [
     },
     {
       name: 'get_audit',
-      description: 'Check an audit started with start_audit: returns overall status, per-step progress (scan → viewports → screenshots → agent → excel → publish), and — once complete — a severity summary plus short-lived download URLs for the report (JSON) and the Excel workbook. Poll every ~15s while status is pending/running. Only the account that started an audit can read it — or, for a trial (no-account) run, only the caller holding the claimToken start_audit returned. Each poll also spends one trial call, so avoid polling faster than ~15s on a trial run.',
+      description: 'Check an audit started with start_audit: returns overall status, per-step progress (scan → viewports → screenshots → agent → excel → publish), and — once complete — a severity summary plus short-lived download URLs for the report (JSON) and the Excel workbook. Poll every ~15s while status is pending/running. Only the account that started an audit can read it. Free with a WebAbility account.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           id: { type: 'number', description: 'The audit id returned by start_audit' },
-          claimToken: { type: 'string', description: 'Trial (no-account) runs only — the claimToken start_audit returned. Omit if you are logged in.' },
         },
         required: ['id'],
       },
@@ -551,7 +571,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'visual_audit',
-      description: 'Pixel-level accessibility audit using Claude vision. Catches issues that DOM scanners miss: icon contrast (1.4.11), focus visibility (2.4.7), "looks like a button but isn\'t" (4.1.2), text rendered as images (1.4.5), visual hierarchy mismatches. Takes a URL, opens it in a headless browser, screenshots, and runs vision-based detection. Complements scan_page — run both for full coverage. Free without an account for a limited trial (shared call pool with start_audit/get_audit, hosted deploy only) — the response says how many are left. Past the trial, or on the local/stdio server, this and start_audit are the paid, server-side tools: authenticate via `webability login` or set WEBABILITY_API_KEY in your MCP server env before calling.',
+      description: 'Pixel-level accessibility audit using Claude vision. Catches issues that DOM scanners miss: icon contrast (1.4.11), focus visibility (2.4.7), "looks like a button but isn\'t" (4.1.2), text rendered as images (1.4.5), visual hierarchy mismatches. Takes a URL, opens it in a headless browser, screenshots, and runs vision-based detection. Complements scan_page — run both for full coverage. Free for everyone; sign in with a free WebAbility account for vision and full audits (sign in when your client prompts you, or run `webability login`). Fair-use rate limits apply.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -598,6 +618,7 @@ const ALL_TOOLS = [
         type: 'object' as const,
         properties: {
           tags: { type: 'array', items: { type: 'string' }, description: 'axe tag filter (e.g. ["wcag21aa"], ["best-practice"], ["cat.aria"]). WebAbility rules match on their WCAG criterion tag (e.g. "wcag143").' },
+          rule: { type: 'string', description: 'Only rules whose id contains this text (e.g. "color-contrast", "label"; case and -/_ insensitive). Also accepted: ruleId, id, query.' },
           fixability: { type: 'string', enum: ['mechanical', 'contextual', 'visual'], description: 'Only rules of this fixability tier' },
           engine: { type: 'string', enum: ['all', 'axe', 'webability'], description: 'Which engine\'s rules to list (default all)' },
         },
@@ -674,6 +695,46 @@ const ALL_TOOLS = [
   ]
 
 
+/**
+ * Behaviour hints every directory review checks (Claude connectors directory,
+ * ChatGPT plugin directory): a human title plus EXPLICIT readOnly /
+ * destructive / idempotent / openWorld booleans. "Read-only" means the tool
+ * changes nothing in the user's environment; it may still fetch a page.
+ * openWorld = it reaches a URL or a third-party service.
+ */
+type Hints = { title: string; readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean }
+const read = (title: string, openWorldHint: boolean): Hints => ({ title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint })
+const TOOL_ANNOTATIONS: Record<string, Hints> = {
+  scan_page: read('Scan a page for accessibility issues', true),
+  verify_fix: read('Verify an accessibility fix', true),
+  diff_scan: read('Compare two accessibility scans', true),
+  start_audit: { title: 'Start a full accessibility audit', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  get_audit: read('Get audit status and report', true),
+  flow_scan: read('Scan a multi-page user flow', true),
+  detect_framework: read('Detect the site framework', true),
+  // Not read-only: both send page content (an HTML snippet / a screenshot) to
+  // the WebAbility API and a third-party model, and visual_audit runs a
+  // server-side vision pass. Clients must not auto-approve them as harmless reads. Not
+  // idempotent either: model output varies between calls.
+  generate_ai_fix: { title: 'Suggest a framework-aware fix', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  visual_audit: { title: 'Visual accessibility audit', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  find_source: read('Find the source file for a selector', false),
+  scan_html: read('Scan an HTML snippet', false),
+  get_rules: read('List accessibility rules', false),
+  check_color_contrast: read('Check color contrast', true),
+  check_aria: read('Validate ARIA in HTML', false),
+  scan_history: read('List past scans', false),
+  generate_report_pdf: { title: 'Create an accessibility report PDF', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+}
+
+function withAnnotations<T extends { name: string }>(tool: T): T & { title?: string; annotations?: Hints } {
+  const annotations = TOOL_ANNOTATIONS[tool.name]
+  return annotations ? { ...tool, title: annotations.title, annotations } : tool
+}
+
+/** Local-only recovery hint inside a tool description; stripped on hosted. */
+const SCAN_HISTORY_HINT = ' or use scan_history(id) for the full set'
+
 function handleListTools(opts: ServerOptions = {}) {
   const isLite = !opts.remote
   const tools = ALL_TOOLS
@@ -709,8 +770,14 @@ function handleListTools(opts: ServerOptions = {}) {
           },
         }
       }
+      // Hosted keeps no scan history, so no description may point there
+      // (check_aria's node-cap hint did).
+      if (!isLite && tool.description.includes(SCAN_HISTORY_HINT)) {
+        return { ...tool, description: tool.description.replace(SCAN_HISTORY_HINT, '') }
+      }
       return tool
     })
+    .map(withAnnotations)
   return { tools }
 }
 
@@ -798,7 +865,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
   // — and null means no header is ever attached to anything.
   // `url` for most tools, `startUrl` for flow_scan. Reading only `url` made
   // every tunnelled flow scan fail with a null target and no explanation.
-  const tunnel: TunnelTarget | null = parseTunnelTarget(String((args as any)?.url ?? (args as any)?.startUrl ?? ''), String((args as any)?.tunnel_secret ?? ''))
+  const tunnel: TunnelTarget | null = tunnelTargetForCall(name, args)
 
   // Lite (local stdio): Full tools are advertised as free stubs but not runnable here.
   if (!opts.remote && FULL_ONLY_TOOLS.has(name)) {
@@ -850,8 +917,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       return toolError('find_source is disabled on the hosted MCP server — it searches a local project, which does not exist server-side.')
     }
     const candidateUrls = [
-      args?.url,
-      args?.startUrl,
+      ...HOSTED_URL_ARG_KEYS.map((k) => (args as Record<string, unknown> | undefined)?.[k]),
       ...(Array.isArray(args?.autoNavigate) ? (args!.autoNavigate as unknown[]) : []),
     ].filter((v): v is string => typeof v === 'string' && v.length > 0)
     for (const candidate of candidateUrls) {
@@ -882,7 +948,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
       }
-      const { result, pointers } = await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, Boolean(opts.remote))
+      const { result, pointers, framework } = await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, Boolean(opts.remote))
 
       // Blocked / bot-challenge guard — the target served a Cloudflare/Akamai/
       // PerimeterX interstitial or an HTTP error instead of the real page, so
@@ -947,15 +1013,29 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // Output controls narrow BEFORE the cap, so `minImpact: "serious"` on a
       // 300-issue page returns every serious issue, not the serious subset of
       // the first 50. The archived scan_history copy stays unfiltered.
-      const projectedIssues: ProjectedIssue[] = bySeverityDesc(result.issues).map(projectIssue)
-      const projectedIncomplete: ProjectedIssue[] = bySeverityDesc(result.incomplete).map(projectIssue)
+      //
+      // Same-element findings that are one problem across engines are merged
+      // first (scanShaping.mergeSameElement); the summary is recounted from
+      // the merged lists, and the archive keeps them merged but not collapsed.
+      const projectedIssues: ProjectedIssue[] = bySeverityDesc(mergeSameElement(result.issues.map(projectIssue)))
+      const projectedIncomplete: ProjectedIssue[] = bySeverityDesc(mergeSameElement(result.incomplete.map(projectIssue)))
+      const mergedSummary = recountSummary(projectedIssues, projectedIncomplete)
       await attachSourceCandidates(projectedIssues, args?.sourceRoot as string | undefined, Boolean(opts.remote))
-      const sortedIssues = filterIssues(projectedIssues, controls)
-      const sortedIncomplete = filterIssues(projectedIncomplete, controls)
-      const issuesTotal = sortedIssues.length
-      const incompleteTotal = sortedIncomplete.length
-      const issuesTruncated = issuesTotal > RESULT_CAP
-      const incompleteTruncated = incompleteTotal > RESULT_CAP
+      const filteredIssues = filterIssues(projectedIssues, controls)
+      const filteredIncomplete = filterIssues(projectedIncomplete, controls)
+      // Repeats of one rule with one fix → one entry with `count` (after the
+      // filters, so a caller who names the rule in rules[] sees every one).
+      const collapsedIssues = collapseRepeats(filteredIssues, controls)
+      const collapsedIncomplete = collapseRepeats(filteredIncomplete, controls)
+      const sortedIssues = collapsedIssues.list
+      const sortedIncomplete = collapsedIncomplete.list
+      // Instance counts (every element) vs entry counts (after collapsing).
+      const issuesTotal = filteredIssues.length
+      const incompleteTotal = filteredIncomplete.length
+      const issueEntries = sortedIssues.length
+      const incompleteEntries = sortedIncomplete.length
+      const issuesTruncated = issueEntries > RESULT_CAP
+      const incompleteTruncated = incompleteEntries > RESULT_CAP
       // Stratify the cap: one representative per issue TYPE first, then fill by
       // severity. Without this, a majority type (e.g. 25 contrast_insufficient
       // moderates) can fill the entire moderate band and hide a whole type —
@@ -965,33 +1045,46 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       const [capIncomplete, incompleteTypesRescued] = stratifiedCap(sortedIncomplete, RESULT_CAP)
       const typeStratified = typesRescued || incompleteTypesRescued
 
+      const collapsedGroups = collapsedIssues.collapsedGroups + collapsedIncomplete.collapsedGroups
       const payload = {
         url,
-        summary: result.summary,
-        framework: (result as any).framework || 'plain-css',
+        summary: mergedSummary,
+        // App framework (nextjs, vitepress, wordpress…); cssFramework is the
+        // value generate_ai_fix takes.
+        framework: framework?.framework ?? 'plain-css',
+        ...(framework?.cssFramework ? { cssFramework: framework.cssFramework } : {}),
+        ...(framework?.builder ? { builder: framework.builder } : {}),
         truncated: issuesTruncated || incompleteTruncated,
         issues: capIssues,
-        issuesReturned: Math.min(issuesTotal, capIssues.length),
+        issuesReturned: capIssues.length,
+        issueEntries,
         issuesTotal,
         incomplete: capIncomplete,
-        incompleteReturned: Math.min(incompleteTotal, capIncomplete.length),
+        incompleteReturned: capIncomplete.length,
+        incompleteEntries,
         incompleteTotal,
+        ...(collapsedGroups > 0
+          ? { counts: 'summary.* and issuesTotal / incompleteTotal count every element. issues[] / incomplete[] hold issueEntries / incompleteEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`). issuesReturned / incompleteReturned count entries.' }
+          : {}),
       }
 
-      const incompleteCount = result.summary.incomplete ?? 0
-      const truncationNote =
-        issuesTruncated || incompleteTruncated
-          ? ` NOTE: results truncated to the ${RESULT_CAP} highest-severity of each list (sorted critical→minor, so criticals are never dropped${typeStratified ? '; every issue type keeps at least one representative' : ''}) — showing ${payload.issuesReturned}/${issuesTotal} issue(s) and ${payload.incompleteReturned}/${incompleteTotal} incomplete finding(s). Retrieve the FULL untruncated set via \`scan_history\` (pass this scan's id), or narrow \`rootSelector\` to shrink the page.`
-          : ''
+      const incompleteCount = mergedSummary.incomplete
+      const note = issuesTruncated || incompleteTruncated
+        ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: payload.issuesReturned, total: issueEntries, incompleteReturned: payload.incompleteReturned, incompleteTotal: incompleteEntries, stratified: typeStratified })
+        : ''
+      const collapseNote = collapsedGroups > 0
+        ? ` ${collapsedGroups} rule(s) repeat with the same fix and are listed once each with \`count\` — issues[] has ${issueEntries} entries for ${issuesTotal} issue(s), incomplete[] has ${incompleteEntries} entries for ${incompleteTotal} finding(s). Pass rules: ["<rule id>"] to list every element of a rule.`
+        : ''
       const summary =
-        `Found ${result.summary.total} high-confidence issue(s) on ${url}: ` +
-        `${result.summary.critical} critical, ${result.summary.serious} serious, ` +
-        `${result.summary.moderate} moderate, ${result.summary.minor} minor.` +
+        `Found ${mergedSummary.total} high-confidence issue(s) on ${url}: ` +
+        `${mergedSummary.critical} critical, ${mergedSummary.serious} serious, ` +
+        `${mergedSummary.moderate} moderate, ${mergedSummary.minor} minor.` +
         (incompleteCount > 0
           ? ` ${incompleteCount} additional finding(s) need human review (gradient backgrounds, marketing imagery, etc.) — see \`incomplete[]\`. Do NOT auto-fix these.`
           : '') +
         (isFiltered(controls) ? ` Returning ${issuesTotal} issue(s) / ${incompleteTotal} incomplete after filters${describeControls(controls)}.` : '') +
-        truncationNote
+        collapseNote +
+        note
 
       const response = {
         content: [
@@ -1016,11 +1109,14 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
                   {
                     ...payload,
                     truncated: false,
+                    counts: undefined,
                     issues: projectedIssues,
                     issuesReturned: projectedIssues.length,
+                    issueEntries: projectedIssues.length,
                     issuesTotal: projectedIssues.length,
                     incomplete: projectedIncomplete,
                     incompleteReturned: projectedIncomplete.length,
+                    incompleteEntries: projectedIncomplete.length,
                     incompleteTotal: projectedIncomplete.length,
                   },
                   null,
@@ -1039,9 +1135,11 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
   }
 
   if (name === 'verify_fix') {
-    const url = args?.url as string
-    const selector = args?.selector as string
-    const wcag = (args?.wcag as string | undefined)?.trim() || undefined
+    const resolvedVf = resolveVerifyFixArgs(args as Record<string, unknown> | undefined)
+    if (resolvedVf.error) return toolError(resolvedVf.error)
+    const url = resolvedVf.url as string
+    const selector = resolvedVf.selector as string
+    const wcag = resolvedVf.wcag
     if (!url || !selector) return toolError('Error: url and selector are required')
 
     // An unrecognized rule id matches NOTHING, so the old filter returned an
@@ -1088,8 +1186,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         browser: { headless: true, timeout: 30000 },
       }
       const result = tunnel
-        ? await withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(args?.viewport as any), (page) => scan(page, verifyOptions))
-        : await scan(url, verifyOptions)
+        ? await withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(args?.viewport as any), (page) => scan(page, verifyOptions), !!opts.remote)
+        : await withTunnelPage(url, null, VIEWPORT_SIZES[(args?.viewport as keyof typeof VIEWPORT_SIZES) || 'desktop'] ?? VIEWPORT_SIZES.desktop, (page, status) => scan(page, { ...verifyOptions, mainStatus: status } as any), !!opts.remote)
 
       // A blocked page was NOT scanned — reporting it as "fixed" would be a lie
       // that ships a regression to production. Verification must fail closed.
@@ -1185,7 +1283,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote))
       if (result.blocked) return { issues: [], incomplete: [], blocked: result.blocked }
       const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}), ...(i.confidence ? { confidence: i.confidence } : {}), ...(i.reviewReason ? { reviewReason: i.reviewReason } : {}) })
-      return { issues: result.issues.map(project), incomplete: result.incomplete.map(project) }
+      return { issues: mergeSameElement(result.issues.map(project)), incomplete: mergeSameElement(result.incomplete.map(project)) }
     }
     const stored = (id: string): { issues: Projected[]; incomplete: Projected[] } => {
       const rec = readScanResult(id) as any
@@ -1197,7 +1295,10 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       if (payload.blocked) throw new Error(`stored scan "${id}" was BLOCKED (${payload.reason}) — nothing real was scanned, so it cannot be a baseline`)
       if (!Array.isArray(payload.issues)) throw new Error(`stored scan "${id}" is not a page scan (tool: ${rec.tool}) — pass a scan_page id`)
       const project = (i: any): Projected => enrichIssue(i)
-      return { issues: payload.issues.map(project), incomplete: (payload.incomplete ?? []).map(project) }
+      // Merge here too: archives written before same-element merging still
+      // hold both engine findings, and diffing them against a merged live
+      // scan would report the folded one as fixed.
+      return { issues: mergeSameElement(payload.issues.map(project)), incomplete: mergeSameElement((payload.incomplete ?? []).map(project)) }
     }
 
     try {
@@ -1220,7 +1321,12 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // lands in remaining[] instead of fixed[] + new[].
       const GENERATED_ID = /(#|\bid=["']?)(?:gsi|radix|headlessui|mui|react-aria|rc|chakra|mantine|downshift|floating-ui)[_-][^\s.>#\[\]:"']*|#[^\s.>#\[]*\d{3,}[^\s.>#\[]*|:r[0-9a-z]+:/g
       const stableSelector = (sel: string) => sel.replace(GENERATED_ID, '#*')
-      const keyOf = (i: Projected & { type?: string; wcag?: string; selector?: string }) => {
+      const keyOf = (i: Projected & { type?: string; wcag?: string; selector?: string; rules?: string[] }) => {
+        // Accessible-name findings are merged across engines; the merged id is
+        // whichever engine had the richest fix, so it can change between two
+        // scans of one element. Key them by element instead.
+        const nameKey = nameFamilyKey(i)
+        if (nameKey) return `${nameKey.replace(GENERATED_ID, '#*')}`
         const sel = String(i.selector ?? '')
         const unstable = /^(htmlcs|deep)-\d+-/.test(i.id) || GENERATED_ID.test(sel)
         GENERATED_ID.lastIndex = 0
@@ -1286,24 +1392,19 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       return toolError('start_audit: this is a webability-tunnel URL but no `tunnel_secret` was passed. Pass the secret `webability-tunnel` printed — without it the relay refuses every request and there is nothing to audit.')
     }
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
-    const useTrial = opts.anonymous && !!opts.trialIpKey && !!MCP_TRIAL_INTERNAL_SECRET
-    if (!token && !useTrial) {
-      return toolError('start_audit requires a WebAbility account (it runs paid server-side browser/AI work). Log in with `webability login` or set WEBABILITY_API_KEY in your MCP server config, then retry. (scan_page and the other DOM-based tools need no account.)')
+    if (!token) {
+      return toolError('start_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
-      const res = await fetch(`${API_URL}/${useTrial ? 'cli/mcp-trial/audit' : 'cli/audit'}`, {
+      const res = await fetch(`${API_URL}/cli/audit`, {
         method: 'POST',
-        headers: useTrial
-          ? { 'Content-Type': 'application/json', 'x-mcp-internal': MCP_TRIAL_INTERNAL_SECRET, 'x-mcp-trial-ip': opts.trialIpKey! }
-          : { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         // `tunnel` is non-null only for a URL on the pinned relay origin, so the
         // secret can never ride along to any other host.
         body: JSON.stringify({ url, includeAgent: Boolean(args?.includeAgent), ...(tunnel ? { tunnelSecret: tunnel.secret } : {}) }),
       })
       if (res.status === 429) {
-        const body = await res.json().catch(() => null) as { error?: string; message?: string } | null
-        if (body?.error === 'trial_exhausted') return toolError(`${body.message} ${TRIAL_EXHAUSTED_HINT}`)
         return toolError('start_audit is rate-limited (too many audits queued). Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
@@ -1312,13 +1413,12 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       if (!res.ok) {
         return toolError(`start_audit failed (${res.status}): ${await res.text()}`)
       }
-      const data = (await res.json()) as { id: number; status: string; includeAgent?: boolean; claimToken?: string; trialRemaining?: number }
-      const claimNote = useTrial ? ` This is a trial run (no account) — pass claimToken "${data.claimToken}" to get_audit to poll it. ${data.trialRemaining} free call(s) left.` : ''
+      const data = (await res.json()) as { id: number; status: string; includeAgent?: boolean }
       return {
         content: [
           {
             type: 'text',
-            text: `Audit #${data.id} queued for ${url}${data.includeAgent ? ' (with agent pass)' : ''}. The pipeline runs server-side — poll \`get_audit\` with id ${data.id} every ~15s for progress and download URLs.${claimNote}`,
+            text: `Audit #${data.id} queued for ${url}${data.includeAgent ? ' (with agent pass)' : ''}. The pipeline runs server-side — poll \`get_audit\` with id ${data.id} every ~15s for progress and download URLs.`,
           },
           { type: 'text', text: '```json\n' + JSON.stringify(data, null, 2) + '\n```' },
         ],
@@ -1331,34 +1431,23 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
   if (name === 'get_audit') {
     const id = args?.id as number
     if (!id && id !== 0) return toolError('Error: id is required (from start_audit)')
-    const claimToken = args?.claimToken as string | undefined
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
-    const useTrial = opts.anonymous && !!opts.trialIpKey && !!MCP_TRIAL_INTERNAL_SECRET
-    if (!token && !useTrial) {
-      return toolError('get_audit requires the same WebAbility account that started the audit. Log in with `webability login` or set WEBABILITY_API_KEY, then retry.')
-    }
-    if (useTrial && !claimToken) {
-      return toolError('get_audit needs the claimToken start_audit returned for this trial run (no account is set). Pass it back exactly as given.')
+    if (!token) {
+      return toolError('get_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
-      const res = useTrial
-        ? await fetch(`${API_URL}/cli/mcp-trial/audit/${encodeURIComponent(String(id))}`, {
-            headers: { 'x-mcp-internal': MCP_TRIAL_INTERNAL_SECRET, 'x-mcp-trial-ip': opts.trialIpKey!, 'x-mcp-claim-token': claimToken! },
-          })
-        : await fetch(`${API_URL}/cli/audit/${encodeURIComponent(String(id))}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          })
+      const res = await fetch(`${API_URL}/cli/audit/${encodeURIComponent(String(id))}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
       if (res.status === 429) {
-        const body = await res.json().catch(() => null) as { error?: string; message?: string } | null
-        if (body?.error === 'trial_exhausted') return toolError(`${body.message} ${TRIAL_EXHAUSTED_HINT}`)
         return toolError('get_audit is rate-limited. Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
         return toolError(`get_audit could not authenticate (${res.status}). Re-run \`webability login\` (or refresh WEBABILITY_API_KEY) and retry.`)
       }
       if (res.status === 404) {
-        return toolError(useTrial ? `No trial audit #${id} for that claimToken. Check both are exactly what start_audit returned.` : `No audit #${id} for this account. Check the id, and that you are the account that started it.`)
+        return toolError(`No audit #${id} for this account. Check the id, and that you are the account that started it.`)
       }
       if (!res.ok) {
         return toolError(`get_audit failed (${res.status}): ${await res.text()}`)
@@ -1428,11 +1517,13 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     const outcomes: PageOutcome[] = []
 
     try {
-      const pw = await import('playwright')
-      const browser = await pw.chromium.launch({ headless: true })
-      const context = await browser.newContext({ viewport: { width: 1280, height: 720 } })
-      if (opts.remote) await installSsrfRoute(context, tunnel)
-      const page = await context.newPage()
+      const session = await openSession({
+        remote: opts.remote,
+        contextOptions: { viewport: { width: 1280, height: 720 } },
+        setupContext: (context) => (opts.remote ? installSsrfRoute(context, tunnel) : undefined),
+      })
+      // goto() may swap in a fresh page (HTTP/2 fallback), so re-read after it.
+      let page = session.page
 
       const requestedSeen = new Set<string>()
       const scannedFinalUrls = new Set<string>()
@@ -1455,7 +1546,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           // settle before any engine runs.
           let mainStatus: number | undefined
           try {
-            const response = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 })
+            const response = await session.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 })
+            page = session.page
             // Capture the main-document HTTP status. scan_page's URL path reads
             // this from its own goto; here the caller navigates, so we thread it
             // into scan() below — otherwise a plain 4xx/5xx error page with no
@@ -1493,7 +1585,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           }
         }
       } finally {
-        await browser.close().catch(() => {})
+        await session.close()
       }
 
       // Same per-issue projection scan_page returns, so a finding in a
@@ -1539,19 +1631,25 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // Sort by severity (critical → minor) before capping — same guarantee as
       // scan_page: the RESULT_CAP must never drop a critical finding in favour of
       // a lower-severity one that happened to be deduped first.
-      const allUnique = bySeverityDesc(dedupAcrossPages('issues'))
-      const allUniqueIncomplete = bySeverityDesc(dedupAcrossPages('incomplete'))
+      // Same-element findings that are one problem across engines merge
+      // first (foundOn is unioned), as in scan_page.
+      const allUnique = bySeverityDesc(mergeSameElement(dedupAcrossPages('issues')))
+      const allUniqueIncomplete = bySeverityDesc(mergeSameElement(dedupAcrossPages('incomplete')))
       await attachSourceCandidates(allUnique as any[], args?.sourceRoot as string | undefined, Boolean(opts.remote))
       const unique = filterIssues(allUnique as any[], flowControls)
       const uniqueIncomplete = filterIssues(allUniqueIncomplete as any[], flowControls)
+      // Repeats of one rule with one fix → one entry with `count`.
+      const collapsedIssues = collapseRepeats(unique, flowControls)
+      const collapsedIncomplete = collapseRepeats(uniqueIncomplete, flowControls)
+      const collapsedGroups = collapsedIssues.collapsedGroups + collapsedIncomplete.collapsedGroups
 
       const RESULT_CAP = 50
       // Stratified cap — same rationale as scan_page: a majority type must not
       // fill the list and hide other types across a multi-page journey.
-      const [capIssues] = stratifiedCap(unique, RESULT_CAP)
-      const [capIncomplete] = stratifiedCap(uniqueIncomplete, RESULT_CAP)
-      const issuesTruncated = unique.length > RESULT_CAP
-      const incompleteTruncated = uniqueIncomplete.length > RESULT_CAP
+      const [capIssues, typesRescued] = stratifiedCap(collapsedIssues.list, RESULT_CAP)
+      const [capIncomplete, incompleteTypesRescued] = stratifiedCap(collapsedIncomplete.list, RESULT_CAP)
+      const issuesTruncated = collapsedIssues.list.length > RESULT_CAP
+      const incompleteTruncated = collapsedIncomplete.list.length > RESULT_CAP
 
       const payload = {
         startUrl,
@@ -1563,7 +1661,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           ...(o.finalUrl ? { finalUrl: o.finalUrl } : {}),
           ...(o.reason ? { reason: o.reason } : {}),
           ...(o.status === 'scanned'
-            ? { issueCount: o.issues?.length ?? 0, incompleteCount: o.incomplete?.length ?? 0 }
+            ? { issueCount: mergeSameElement((o.issues ?? []).map(projectIssue)).length, incompleteCount: mergeSameElement((o.incomplete ?? []).map(projectIssue)).length }
             : {}),
         })),
         summary: {
@@ -1573,10 +1671,20 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         },
         truncated: issuesTruncated || incompleteTruncated,
         issues: capIssues,
+        issueEntries: collapsedIssues.list.length,
         issuesTotal: unique.length,
         incomplete: capIncomplete,
+        incompleteEntries: collapsedIncomplete.list.length,
         incompleteTotal: uniqueIncomplete.length,
+        ...(collapsedGroups > 0
+          ? { counts: 'summary.uniqueIssues / needsReview and issuesTotal / incompleteTotal count every element. issues[] / incomplete[] hold issueEntries / incompleteEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`).' }
+          : {}),
       }
+      const flowNote =
+        (collapsedGroups > 0 ? `${collapsedGroups} rule(s) repeat with the same fix and are listed once each with \`count\` — pass rules: ["<rule id>"] to list every element of a rule.\n` : '') +
+        (issuesTruncated || incompleteTruncated
+          ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: capIssues.length, total: collapsedIssues.list.length, incompleteReturned: capIncomplete.length, incompleteTotal: collapsedIncomplete.list.length, stratified: typesRescued || incompleteTypesRescued }).trim() + '\n'
+          : '')
 
       // Human-readable summary. Surface dropped pages EXPLICITLY — never
       // return fewer pages than requested without saying why.
@@ -1586,12 +1694,15 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         : ''
 
       const renderLine = (i: any) =>
-        `[${i.impact}] WCAG ${i.wcag} — ${i.message}\n  Selector: ${i.selector}\n  Found on: ${i.foundOn.join(', ')}` +
+        (i.count
+          ? `[${i.impact}] WCAG ${i.wcag} — ${i.message} (×${i.count} elements)\n  Examples: ${(i.examples ?? []).join(' | ')}\n  ${i.expand ?? ''}`
+          : `[${i.impact}] WCAG ${i.wcag} — ${i.message}\n  Selector: ${i.selector}`) +
+        `\n  Found on: ${(i.foundOn ?? []).join(', ')}` +
         (i.reviewReason ? `\n  ⚠ Review: ${i.reviewReason}` : '')
 
       const incompleteSection = uniqueIncomplete.length > 0
         ? `\n\n## Needs Review (${uniqueIncomplete.length}) — do NOT auto-fix\n\n` +
-          uniqueIncomplete.slice(0, 20).map(renderLine).join('\n\n')
+          collapsedIncomplete.list.slice(0, 20).map(renderLine).join('\n\n')
         : ''
 
       const response = {
@@ -1605,7 +1716,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
               (droppedPages.length > 0 ? `Pages dropped: ${droppedPages.length} (see below)\n` : '') +
               `Unique high-confidence issues: ${unique.length}${isFiltered(flowControls) ? describeControls(flowControls) : ''}\n` +
               `Needs review: ${uniqueIncomplete.length}\n\n` +
-              (flowControls.format === 'compact' ? '' : unique.slice(0, 30).map(renderLine).join('\n\n') + incompleteSection) +
+              flowNote +
+              (flowControls.format === 'compact' ? '' : collapsedIssues.list.slice(0, 30).map(renderLine).join('\n\n') + incompleteSection) +
               droppedNote,
           },
           renderFindings(flowControls, payload, [{ title: 'Issues', items: payload.issues }, { title: 'Needs review — do NOT auto-fix', items: payload.incomplete }]),
@@ -1623,7 +1735,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
               text:
                 '```json\n' +
                 JSON.stringify(
-                  { ...payload, truncated: false, issues: allUnique, incomplete: allUniqueIncomplete },
+                  { ...payload, truncated: false, counts: undefined, issues: allUnique, issueEntries: allUnique.length, issuesTotal: allUnique.length, incomplete: allUniqueIncomplete, incompleteEntries: allUniqueIncomplete.length, incompleteTotal: allUniqueIncomplete.length },
                   null,
                   2,
                 ) +
@@ -1644,15 +1756,23 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     if (!url) return toolError('Error: url is required')
 
     try {
-      const pw = await import('playwright')
-      const browser = await pw.chromium.launch({ headless: true })
-      const context = await browser.newContext()
-      if (opts.remote) await installSsrfRoute(context, tunnel)
-      const page = await context.newPage()
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-      const fw = await detectFramework(page)
-      await browser.close()
-      return { content: [{ type: 'text', text: `Framework: ${fw.framework}` }] }
+      const session = await openSession({
+        remote: opts.remote,
+        setupContext: (context) => (opts.remote ? installSsrfRoute(context, tunnel) : undefined),
+      })
+      let fw: Awaited<ReturnType<typeof detectFramework>>
+      let site: Awaited<ReturnType<typeof detectSiteFramework>>
+      try {
+        await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+        fw = await detectFramework(session.page)
+        site = await detectSiteFramework(session.page as any, fw.framework)
+      } finally {
+        await session.close()
+      }
+      const lines = [`Framework: ${site.label}`]
+      if (site.builder) lines.push(`Page builder: ${site.builder}`)
+      if (site.label !== fw.framework) lines.push(`CSS framework: ${fw.framework} (use this value for generate_ai_fix \`framework\`)`)
+      return { content: [{ type: 'text', text: lines.join('\n') }] }
     } catch (err) {
       return toolError(`Detection failed: ${(err as Error).message}`)
     }
@@ -1772,22 +1892,23 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       let screenshot: string
       try {
         screenshot = await withDeadline(async (signal) => {
-          const pw = await import('playwright')
-          const browser = await pw.chromium.launch({ headless: true })
+          const sizes = { desktop: { width: 1280, height: 720 }, tablet: { width: 768, height: 1024 }, mobile: { width: 375, height: 667 } }
+          const session = await openSession({
+            remote: opts.remote,
+            contextOptions: { viewport: sizes[viewport] },
+            setupContext: (context) => (opts.remote ? installSsrfRoute(context, tunnel) : undefined),
+          })
           // The race has already rejected if the deadline fired during launch;
           // stop here rather than load a page nobody is waiting for.
           if (signal.aborted) {
-            await browser.close().catch(() => {})
+            await session.close()
             return ''
           }
-          signal.addEventListener('abort', () => void browser.close().catch(() => {}))
+          signal.addEventListener('abort', () => void session.close())
           try {
-            const sizes = { desktop: { width: 1280, height: 720 }, tablet: { width: 768, height: 1024 }, mobile: { width: 375, height: 667 } }
-            const context = await browser.newContext({ viewport: sizes[viewport] })
-            if (opts.remote) await installSsrfRoute(context, tunnel)
-            const page = await context.newPage()
             phase = 'page load'
-            const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: VISUAL_AUDIT_CAPTURE_MS })
+            const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: VISUAL_AUDIT_CAPTURE_MS })
+            const page = session.page
             // An error page is not the target: a closed tunnel serves the
             // relay's 404, a missing secret its 401. Auditing it would report
             // "no issues" on a page the caller never asked about.
@@ -1800,7 +1921,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
             const buf = await page.screenshot({ fullPage, type: 'png' })
             return buf.toString('base64')
           } finally {
-            await browser.close().catch(() => {})
+            await session.close()
           }
         }, VISUAL_AUDIT_CAPTURE_MS, 'capture')
       } catch (err) {
@@ -1813,21 +1934,18 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         return toolError(`Visual audit error: ${url} returned HTTP ${httpStatus}, so there is no page to audit.${tunnel ? ' The tunnel may have closed — open a new one with `webability-tunnel` and retry with its new URL and secret.' : ''}`)
       }
 
-      // visual_audit needs a JWT (or a spent trial credit) so the backend can
-      // run vision on the caller's free account / trial pool (#124).
+      // visual_audit needs a (free) account token so the backend can run
+      // vision on the caller's account (#124).
       const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
-      const useTrial = opts.anonymous && !!opts.trialIpKey && !!MCP_TRIAL_INTERNAL_SECRET
-      if (!token && !useTrial) {
-        return toolError('visual_audit requires a WebAbility account. It runs a paid Claude-vision pass, so the backend is authenticated. Log in with the CLI (`webability login`) or set the WEBABILITY_API_KEY environment variable in your MCP server config, then retry. (scan_page, check_color_contrast and the other DOM-based tools need no account.)')
+      if (!token) {
+        return toolError('visual_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
       }
 
       let res: Response
       try {
-        res = await fetch(`${API_URL}/${useTrial ? 'cli/mcp-trial/visual-audit' : 'cli/visual-audit'}`, {
+        res = await fetch(`${API_URL}/cli/visual-audit`, {
           method: 'POST',
-          headers: useTrial
-            ? { 'Content-Type': 'application/json', 'x-mcp-internal': MCP_TRIAL_INTERNAL_SECRET, 'x-mcp-trial-ip': opts.trialIpKey! }
-            : { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
             screenshot, platform: 'web',
             screenName: url,
@@ -1842,8 +1960,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         throw err
       }
       if (res.status === 429) {
-        const body = await res.json().catch(() => null) as { error?: string; message?: string } | null
-        if (body?.error === 'trial_exhausted') return toolError(`${body.message} ${TRIAL_EXHAUSTED_HINT}`)
         return toolError('visual_audit is rate-limited. Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
@@ -1852,14 +1968,13 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       if (!res.ok) {
         return toolError(`Visual audit failed (${res.status}): ${await res.text()}`)
       }
-      const data = await res.json() as { issues: any[]; count: number; trialRemaining?: number }
+      const data = await res.json() as { issues: any[]; count: number }
       const lines = data.issues.map((i, idx) =>
         `${idx + 1}. [${(i.severity as string).toUpperCase()}] WCAG ${i.wcag} — ${i.message}` +
         (i.region ? `\n   region: ${i.region.x},${i.region.y} ${i.region.width}x${i.region.height}px` : '') +
         (i.fix?.suggestedValue ? `\n   fix: ${i.fix.attribute} = ${i.fix.suggestedValue}` : '')
       ).join('\n\n')
-      const trialNote = useTrial ? `\n\n(Trial run, no account — ${data.trialRemaining} free call(s) left.)` : ''
-      return { content: [{ type: 'text', text: `# Visual Audit: ${url}\n\nFound ${data.count} pixel-level issues.\n\n${lines || 'No visual issues detected.'}${trialNote}` }] }
+      return { content: [{ type: 'text', text: `# Visual Audit: ${url}\n\nFound ${data.count} pixel-level issues.\n\n${lines || 'No visual issues detected.'}` }] }
     } catch (err) {
       return toolError(`Visual audit error: ${(err as Error).message}`)
     }
@@ -1919,15 +2034,19 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     }
 
     try {
-      const pw = await import('playwright')
-      const browser = await pw.chromium.launch({ headless: true })
-      const context = await browser.newContext({ viewport: { width, height } })
-      if (opts.remote) await installSsrfRoute(context, tunnel)
-      const page = await context.newPage()
-      await page.setContent(html, { waitUntil: 'domcontentloaded' })
-      const { runAxe } = await import('@webability/core')
-      const result = await runAxe(page, tags)
-      await browser.close()
+      const session = await openSession({
+        remote: opts.remote,
+        contextOptions: { viewport: { width, height } },
+        setupContext: (context) => (opts.remote ? installSsrfRoute(context, tunnel) : undefined),
+      })
+      let result: Awaited<ReturnType<typeof import('@webability/core').runAxe>>
+      try {
+        await session.page.setContent(html, { waitUntil: 'domcontentloaded' })
+        const { runAxe } = await import('@webability/core')
+        result = await runAxe(session.page, tags)
+      } finally {
+        await session.close()
+      }
 
       const violations = result.violations.filter((v) => filterIssues([{ type: v.id, impact: v.impact ?? undefined, wcag: v.tags.filter((t) => /^wcag\d{3,4}$/.test(t)).map((t) => t.replace(/^wcag(\d)(\d)(\d+)$/, '$1.$2.$3')).join(',') }], htmlControls).length > 0).map((v) => ({
         id: v.id,
@@ -1961,17 +2080,16 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     // Systematic arg validation: every key checked, before any engine runs.
     // A bogus engine used to silently return ALL rules (neither `!==` guard
     // matched), and unknown keys (e.g. `tag` for `tags`) were swallowed.
-    const unknownGetRules = Object.keys(args ?? {}).filter((k) => k !== 'tags' && k !== 'fixability' && k !== 'engine')
-    if (unknownGetRules.length > 0) {
-      return toolError(`Error: unknown argument '${unknownGetRules[0]}' — valid keys: tags, fixability, engine`)
-    }
-    const tags = args?.tags as string[] | undefined
+    const resolved = resolveGetRulesArgs(args as Record<string, unknown> | undefined)
+    if (resolved.error) return toolError(resolved.error)
+    const tags = resolved.tags
+    const ruleQuery = resolved.rule
     const fixability = args?.fixability as Fixability | undefined
     const engine = (args?.engine as string | undefined) || 'all'
     if (engine !== 'all' && engine !== 'axe' && engine !== 'webability') {
       return toolError('Error: engine must be one of all | axe | webability')
     }
-    if (tags !== undefined && (!Array.isArray(tags) || !tags.every((t) => typeof t === 'string'))) {
+    if (args?.tags !== undefined && (!Array.isArray(args.tags) || !(args.tags as unknown[]).every((t) => typeof t === 'string'))) {
       return toolError('Error: tags must be an array of strings')
     }
     if (fixability && !FIXABILITY_TIERS.has(fixability)) {
@@ -2006,8 +2124,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           })
         }
       }
-      const filtered = fixability ? rules.filter((r) => r.fixability === fixability) : rules
-      const filters = [tags?.length ? `tags [${tags.join(', ')}]` : '', fixability ? `fixability ${fixability}` : '', engine !== 'all' ? `engine ${engine}` : ''].filter(Boolean)
+      const byFix = fixability ? rules.filter((r) => r.fixability === fixability) : rules
+      const filtered = ruleQuery ? byFix.filter((r) => normRuleId(String(r.ruleId)).includes(ruleQuery)) : byFix
+      const filters = [ruleQuery ? `rule "${ruleQuery}"` : '', tags?.length ? `tags [${tags.join(', ')}]` : '', fixability ? `fixability ${fixability}` : '', engine !== 'all' ? `engine ${engine}` : ''].filter(Boolean)
       return {
         content: [
           { type: 'text', text: `${filtered.length} rule${filtered.length === 1 ? '' : 's'}${filters.length ? ` matching ${filters.join(', ')}` : ''}.` },
@@ -2044,11 +2163,12 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     ]
 
     if (!aaPass) {
-      let palette = (args?.brandColors as string[] | undefined) || []
+      let palette = contrastPalette(args?.brandColors)
       let paletteSource = 'arg'
       const url = args?.url as string | undefined
 
-      if (palette.length === 0 && url) {
+      // Same test the hosted anonymous gate uses to count this call as heavy.
+      if (contrastLaunchesBrowser(args) && url) {
         try {
           palette = await extractBrandPaletteFromUrl(url, !!opts.remote, tunnel)
           paletteSource = `scanner: ${url}`
@@ -2100,21 +2220,24 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     const nodeLimit = nodeLimitRaw ?? 5
 
     try {
-      const pw = await import('playwright')
-      const browser = await pw.chromium.launch({ headless: true })
-      const context = await browser.newContext()
-      if (opts.remote) await installSsrfRoute(context, tunnel)
-      const page = await context.newPage()
-      await page.setContent(html, { waitUntil: 'domcontentloaded' })
-      const { runAxe } = await import('@webability/core')
+      const session = await openSession({
+        remote: opts.remote,
+        setupContext: (context) => (opts.remote ? installSsrfRoute(context, tunnel) : undefined),
+      })
+      let result: Awaited<ReturnType<typeof import('@webability/core').runAxe>>
+      try {
+        await session.page.setContent(html, { waitUntil: 'domcontentloaded' })
+        const { runAxe } = await import('@webability/core')
       // `cat.aria` alone MISSES `aria-hidden-focus` — axe tags that rule
       // `cat.name-role-value` (WCAG 4.1.2), not `cat.aria`. Without it a
       // focusable-yet-`aria-hidden` control (a serious, common real bug) slips
       // through as "no violations". Adding the name-role-value category also
       // pulls in the sibling accessible-name rules (button-name, link-name,
       // input-button-name, …) — all squarely ARIA/name-role-value concerns.
-      const result = await runAxe(page, ['cat.aria', 'cat.name-role-value'])
-      await browser.close()
+      result = await runAxe(session.page, ['cat.aria', 'cat.name-role-value'])
+      } finally {
+        await session.close()
+      }
 
       // Shared projection so `violations` and `incomplete` have identical shape.
       // Nodes cap at nodeLimit per rule (default 5) — every rule discloses
