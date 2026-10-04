@@ -1,18 +1,70 @@
-# @webability/mcp
+# WebAbility MCP
 
-Accessibility testing MCP server for Cursor, VS Code Copilot, Claude Code, and any other MCP-compatible IDE.
+Accessibility checks your coding agent can act on: scan a page with three engines, get a structured fix for each issue, then re-check that the fix landed.
 
-## What is WebAbility?
+Free. Hosted at `https://mcp.webability.io/mcp`. No API key for scans. MIT.
 
-[WebAbility.io](https://webability.io) is an AI-powered web accessibility platform — widget, scanner, and agents for **WCAG 2.2 / ADA / Section 508 / EAA** compliance. This MCP exposes the same scanning engine that powers the WebAbility widget and dashboard, so you can audit and fix accessibility issues from your IDE while you build.
+## Install
 
-The server registers an `instructions` block on initialize, so any MCP-compatible client picks up business context (what tool to call when, the three-tier output convention, etc.) automatically — no setup required beyond the install below.
+**Claude Code** (plugin)
 
-## Lite (local) vs Full (hosted)
+```text
+/plugin marketplace add snayyar00/webability-mcp
+/plugin install webability-accessibility@webability
+```
+
+or `claude mcp add --transport http webability https://mcp.webability.io/mcp`
+
+**Cursor**: [Add to Cursor](https://cursor.com/install-mcp?name=webability&config=eyJ1cmwiOiJodHRwczovL21jcC53ZWJhYmlsaXR5LmlvL21jcCJ9)
+
+**VS Code**: [Install in VS Code](https://vscode.dev/redirect/mcp/install?name=webability&config=%7B%22type%22%3A%22http%22%2C%22url%22%3A%22https%3A%2F%2Fmcp.webability.io%2Fmcp%22%7D) · or run
+`code --add-mcp '{"name":"webability","type":"http","url":"https://mcp.webability.io/mcp"}'`
+
+**Claude.ai / ChatGPT / any MCP client**: add a custom connector with the URL `https://mcp.webability.io/mcp`.
+
+**Local** (the browser runs on your machine, so it scans `localhost` directly): `npx -y -p @webability/mcp webability-mcp`
+
+## What you get back
+
+Real output, `scan_page` on https://demo.vercel.store (trimmed):
+
+```text
+Found 16 high-confidence issue(s): 0 critical, 4 serious, 8 moderate, 4 minor.
+20 additional finding(s) need human review — see incomplete[]. Do NOT auto-fix these.
+
+missing_label · serious · WCAG 1.3.1 · input.text-md.w-full.rounded-lg
+  fix: { op: "add-attribute", attribute: "aria-label" }   fixability: contextual
+missing_table_scope · moderate · WCAG 1.3.1 · thead > tr > th:nth-of-type(1)   (vite.dev/guide)
+  fix: { op: "add-attribute", attribute: "scope", value: "col" }   fixability: mechanical
+
+verify_fix input.text-md.w-full.rounded-lg wcag=4.1.2
+  NOT RESOLVED: 1 violation still present → "verified": false
+```
+
+- **`fix.op`** is one of `add-attribute`, `set-attribute`, `remove-attribute`, `add-element`, `remove-element`, `add-text-content`, `suggest`.
+- **`fixability`**: `mechanical` = apply as given. `contextual` = the op is known, the value (alt text, a label) needs judgment. `visual` = needs rendered output; propose, do not auto-apply.
+- **`incomplete[]`** holds findings that need a person (contrast over images, marketing alt text). Agents are told not to fix them.
+- **`source`**: on React ≤18 and Vue dev builds, each issue carries `{file, line, column, component}` from the live component tree.
+- **`verify_fix`** re-scans one element and fails closed. **`diff_scan`** reports `fixed[]`, `new[]`, `remaining[]` for a page.
+
+## Free
+
+| | What you get |
+|---|---|
+| No account | Scan and check tools on the hosted server. Fair-use limits per IP: 30 browser scans/h, 10 AI fixes/h |
+| Free account (OAuth prompt in your client, or `npx -y @webability/cli login` locally) | Adds `visual_audit` (vision pass), `start_audit` / `get_audit` (full report), and `webability-tunnel` (lets the hosted server scan your localhost) |
+
+No trial, no credits, no paid tier on the MCP.
+
+## What it does not do
+
+It cannot judge if alt text is meaningful or if a custom widget makes sense with a screen reader. Use it to clear the automated layer in source, then test with assistive technology.
+
+## Local vs hosted
 
 | | **Lite** — local stdio (`npx` / `webability-mcp`) | **Full** — hosted (`https://mcp.webability.io/mcp`) |
 |---|---|---|
-| Account | None | Free WebAbility account + token |
+| Account | None | None for scan tools; free account (OAuth sign-in) for visual and full audits |
 | Scan / fix / verify | Yes (on your machine) | Yes |
 | `find_source` | Yes | No |
 | `scan_history` / `generate_report_pdf` | Yes | No |
@@ -20,21 +72,19 @@ The server registers an `instructions` block on initialize, so any MCP-compatibl
 | PostHog / dashboard analytics | Optional env only | On by default on hosted |
 | **`localhost` / private addresses** | **Yes** — the browser runs on your machine | **Via a tunnel** — see below |
 
-Lite is the no-account wedge: DOM scanners and the find → fix → verify loop. Full adds vision audit and compliance reports — **free with a WebAbility account** (dashboard / Smithery). Lite lists those Full tools as stubs so agents know to upgrade.
-
-## Scanning a local dev server
+### Scanning a local dev server
 
 **Use Lite (stdio).** It runs the browser on your machine, so `http://localhost:3000` is just localhost:
 
 ```bash
-claude mcp add webability-local -- npx -y @webability/mcp
+claude mcp add webability-local -- npx -y -p @webability/mcp webability-mcp
 ```
 
-Other clients: add `npx -y @webability/mcp` as a stdio server. The `-y` matters — without it `npx` can fail with `could not determine executable to run`.
+Other clients: add `npx -y -p @webability/mcp webability-mcp` as a stdio server.
 
-**Full (hosted) cannot reach your machine directly, by design.** It runs in our cloud, so `localhost` there means *our* localhost. Every URL is checked before any fetch and loopback / private / link-local addresses are refused: without that check, anyone with a token could point the server at internal services or a cloud metadata endpoint. That check is not relaxed for anyone.
+**Full (hosted) cannot reach your machine directly, by design.** It runs in our cloud, so `localhost` there means *our* localhost. Every URL is checked before any fetch and loopback / private / link-local addresses are refused: without that check, anyone could point the server at internal services or a cloud metadata endpoint. That check is not relaxed for anyone.
 
-### When you need hosted: `webability-tunnel`
+#### When you need hosted: `webability-tunnel`
 
 CI, a remote agent, or a dashboard-triggered scan cannot run Lite, because there is no laptop in the loop. For those, open a tunnel:
 
@@ -58,37 +108,7 @@ Third-party tunnels (ngrok, cloudflared) also work — the hosted scanner treats
 
 `start_audit` is the exception on both transports — its pipeline runs on our servers even under Lite, so it can never reach a localhost URL.
 
-## Why this over other accessibility MCPs
-
-Most accessibility MCP servers stop at *find* and *suggest*. WebAbility closes the whole loop in your editor, and starts free:
-
-- **Free Lite scan — no account, no Docker.** `scan_page` runs entirely on your machine. (Deque's axe MCP needs a paid subscription, an API key, and a Docker install just to analyze a page.)
-- **Fixes that fit your stack.** `generate_ai_fix` returns ready-to-paste code for the framework you actually use — Tailwind, MUI, Bootstrap, WordPress, Next.js — not generic guidance.
-- **A vision pass on Full (free with account).** Hosted `visual_audit` catches focus visibility, icon contrast, and "looks like a button but isn't" — issues axe-core structurally cannot see.
-- **Verification, not just detection.** `verify_fix` re-checks that your fix actually landed and returns `verified: true/false`. Every 2026 comparison of accessibility MCPs names this the biggest gap in the category — most tools never close it.
-- **Evidence for compliance on Full (free with account).** `start_audit` produces a persistent, timestamped report and Excel workbook you can hand to an auditor — not a result that vanishes with your session.
-
-The Lite cycle: `scan_page` → `generate_ai_fix` → `verify_fix` — and `generate_report_pdf` when the findings need to become a shareable deliverable. On Full (free account), add `start_audit` when you need the paper trail.
-
-## Install
-
-```bash
-npm install -g @webability/mcp
-```
-
-## Setup
-
-Add to your IDE's MCP config:
-
-```json
-{
-  "mcpServers": {
-    "webability": {
-      "command": "webability-mcp"
-    }
-  }
-}
-```
+### Local options
 
 Optional env:
 
