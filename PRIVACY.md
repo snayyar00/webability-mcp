@@ -28,7 +28,7 @@ This never leaves your machine. Browse it with the `scan_history` tool or `jq`/`
 
 After each tool call — every tool, not just scans — the server reports one small event to `api.webability.io/mcp/scan-events`: the tool name, a short target label, pass/fail, duration, summary counts, and for a few tools one tiny metadata string. Never the full scan result, HTML, screenshots, or generated fix code — those stay local per above. What the target label is, per tool:
 
-- **scan/audit tools** (`scan_page`, `flow_scan`, `visual_audit`, `detect_framework`, `check_color_contrast` with a `url`): the URL you pointed the tool at. `scan_html` / `check_aria`: a synthetic size label like `inline-html (1.2 KB)` — the HTML itself is never sent.
+- **scan/audit tools** (`scan_page`, `flow_scan`, `visual_audit`, `detect_framework`, `check_color_contrast` and `check_aria` with a `url`): the URL you pointed the tool at, reduced to origin + path. `scan_html` / `check_aria` with `html`: a synthetic size label like `inline-html (1.2 KB)` — the HTML itself is never sent.
 - **`generate_ai_fix`**: the issue's type and WCAG criterion (e.g. `img-alt wcag:1.1.1`), plus whether a fix was returned (`fix:yes`/`fix:no`) and how many alternatives — never the HTML or the generated code.
 - **`detect_framework`**: also the detected framework name (e.g. `framework:tailwind`).
 - **`check_color_contrast`** without a `url`: the two color values (e.g. `#777777 on #ffffff`), plus AA pass/fail.

@@ -65,7 +65,7 @@ test('calling a Full tool on Lite explains the upgrade instead of failing', asyn
   const client = await connect(false)
   const res: any = await client.callTool({
     name: 'visual_audit',
-    arguments: { url: 'https://example.com', context: 'Verifying that Lite refuses a Full tool with an actionable upgrade message rather than a runtime failure.' },
+    arguments: { url: 'https://webability.io', context: 'Verifying that Lite refuses a Full tool with an actionable upgrade message rather than a runtime failure.' },
   })
   const text = res.content.map((c: any) => c.text).join('\n')
   assert.match(text, /WebAbility MCP Full/)
@@ -91,14 +91,14 @@ test('hosted check_aria does not point at scan_history (the hosted server keeps 
   assert.match(lite.description!, /scan_history/)
 })
 
-test('hosted instructions: scan/check tools need no token, key or account; a free account (client sign-in) unlocks the three Full tools', async () => {
+test('hosted instructions: scan/check tools need no token, key or account; a free account unlocks the three Full tools, and an anonymous call returns the sign-in steps', async () => {
   const text = (await connect(true)).getInstructions() ?? ''
   // "tokens" also appears as LLM output size (format: "compact"); only an
   // auth-token requirement is wrong.
   assert.doesNotMatch(text, /(webability|your|that|auth|api|access)\s+token|token\s+(is\s+)?required|need[s]?\s+(a\s+)?token/i, 'the hosted model is free: no token is required for any scan tool')
   assert.match(text, /no account or key/i)
   assert.match(text, /fair-use limits per IP/i)
-  assert.match(text, /sign-in prompted by your client/i)
+  assert.match(text, /return the sign-in steps/i)
   for (const t of ['visual_audit', 'start_audit', 'get_audit']) assert.ok(text.includes(t), t)
   assert.doesNotMatch(text, /abilyo/i)
   const lite = (await connect(false)).getInstructions() ?? ''

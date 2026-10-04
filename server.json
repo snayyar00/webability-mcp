@@ -6,13 +6,13 @@
     "url": "https://github.com/snayyar00/webability-mcp",
     "source": "github"
   },
-  "version": "1.6.4",
+  "version": "1.7.0",
   "websiteUrl": "https://webability.io",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@webability/mcp",
-      "version": "1.6.4",
+      "version": "1.7.0",
       "transport": {
         "type": "stdio"
       }

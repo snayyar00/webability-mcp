@@ -18,6 +18,8 @@ export interface OutputControls {
   rules?: Set<string>
   wcag?: Set<string>
   format: 'json' | 'compact'
+  /** True when the caller passed `format`; false when 'json' is the default. */
+  formatExplicit?: boolean
 }
 
 /** JSON-schema fragment every scan tool spreads into its `properties`. */
@@ -25,17 +27,18 @@ export const OUTPUT_CONTROL_PROPERTIES = {
   minImpact: { type: 'string', enum: IMPACTS, description: 'Only findings at this severity or above (critical > serious > moderate > minor)' },
   rules: { type: 'array', items: { type: 'string' }, description: 'Only these rule ids (WebAbility type such as "missing_alt" or axe rule id such as "image-alt"). See get_rules.' },
   wcag: { type: 'array', items: { type: 'string' }, description: 'Only these WCAG criteria. A prefix selects the whole guideline ("1.4") or principle ("2").' },
-  format: { type: 'string', enum: ['json', 'compact'], description: '"compact" prints one line per element with rule metadata once — far fewer tokens than the default JSON. Default json.' },
+  format: { type: 'string', enum: ['json', 'compact'], description: '"compact" prints one line per element with rule metadata once. "json" returns every field (html, fix values, source). Default: JSON when it fits inline (under ~24k chars), otherwise compact plus a JSON summary of every count.' },
 } as const
 
 export function parseOutputControls(args: Record<string, unknown> | undefined): OutputControls {
   const a = args ?? {}
   const minImpact = a.minImpact as string | undefined
   if (minImpact !== undefined && !(minImpact in RANK)) throw new Error(`minImpact must be one of ${IMPACTS.join(' | ')}`)
+  const formatExplicit = a.format !== undefined && a.format !== null
   const format = (a.format as string | undefined) ?? 'json'
   if (format !== 'json' && format !== 'compact') throw new Error('format must be "json" or "compact"')
   const list = (v: unknown) => (Array.isArray(v) && v.length ? new Set(v.map((x) => String(x).trim()).filter(Boolean)) : undefined)
-  return { ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format }
+  return { ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format, formatExplicit }
 }
 
 export interface IssueRow {
@@ -84,9 +87,14 @@ export function filterIssues<T extends IssueRow>(list: readonly T[], c: OutputCo
 /** True when any control narrows the list — used to label filtered totals. */
 export const isFiltered = (c: OutputControls) => Boolean(c.minImpact || c.rules || c.wcag)
 
+/** The active filters as "minImpact=serious rules=[a,b]" ('' when none). */
+export function controlsList(c: OutputControls): string {
+  return [c.minImpact ? `minImpact=${c.minImpact}` : '', c.rules ? `rules=[${[...c.rules].join(',')}]` : '', c.wcag ? `wcag=[${[...c.wcag].join(',')}]` : ''].filter(Boolean).join(' ')
+}
+
 export function describeControls(c: OutputControls): string {
-  const parts = [c.minImpact ? `minImpact=${c.minImpact}` : '', c.rules ? `rules=[${[...c.rules].join(',')}]` : '', c.wcag ? `wcag=[${[...c.wcag].join(',')}]` : ''].filter(Boolean)
-  return parts.length ? ` (filtered: ${parts.join(' ')})` : ''
+  const list = controlsList(c)
+  return list ? ` (filtered: ${list})` : ''
 }
 
 function formatOp(i: IssueRow): string {
@@ -135,4 +143,82 @@ function formatSourceInline(s: NonNullable<IssueRow['source']>): string {
   const loc = s.file ? `${s.file}${s.line !== undefined ? `:${s.line}` : ''}${s.line !== undefined && s.column !== undefined ? `:${s.column}` : ''}` : ''
   const comp = s.component ? `(${s.component})` : ''
   return [loc, comp].filter(Boolean).join(' ')
+}
+
+/**
+ * Inline budget for a scan response. MCP clients spill larger tool results to
+ * a file (allbirds.com: 107,921 chars, MCP dogfood 2026-10-03), which loses
+ * the answer for the very first "is my page accessible?" call.
+ */
+export const INLINE_BUDGET = 24_000
+
+const LIST_KEYS = new Set(['issues', 'incomplete', 'new', 'fixed', 'remaining'])
+
+/** Elements per rule id over a list (a collapsed entry counts its `count`). */
+export function countByRule(list: readonly IssueRow[]): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const i of list) {
+    const k = String(i.type ?? i.id ?? '?')
+    out[k] = (out[k] ?? 0) + (i.count ?? 1)
+  }
+  return out
+}
+
+/**
+ * The findings block of a scan response.
+ *  - format "json" (explicit) → the full JSON payload, any size.
+ *  - format "compact" (explicit) → the compact listing.
+ *  - no format → the JSON payload when it fits INLINE_BUDGET; otherwise the
+ *    compact listing plus a JSON summary block (every count, per-rule counts
+ *    over the full filtered lists) and one line saying how to get the JSON.
+ */
+/**
+ * A compact-listing section with its counts. `total` (elements) leads, so the
+ * heading never shows an entry count where a reader expects the issue count
+ * (persona round 4: "## Issues (34)" under "Found 67 issues").
+ */
+export type CompactList = { title: string; items: readonly IssueRow[]; total?: number; entries?: number; noun?: [string, string] }
+
+export function compactHeading(l: CompactList): string {
+  const shown = l.items.length
+  if (l.total === undefined) return `## ${l.title} (${shown})`
+  const entries = l.entries ?? shown
+  const [one, many] = l.noun ?? ['issue', 'issues']
+  const parts: string[] = []
+  if (entries < l.total) parts.push(`grouped into ${entries} entries`)
+  if (shown < entries) parts.push(`${shown} shown`)
+  if (parts.length === 0) return `## ${l.title} (${l.total})`
+  return `## ${l.title} (${l.total} ${l.total === 1 ? one : many}, ${parts.join('; ')})`
+}
+
+export function renderFindingsBlock(
+  controls: OutputControls,
+  payload: Record<string, unknown>,
+  compactLists: CompactList[],
+  fullLists?: { issues: readonly IssueRow[]; incomplete?: readonly IssueRow[] },
+): { type: 'text'; text: string } {
+  const sections = () => compactLists.map((l) => `${compactHeading(l)}\n${compactText(l.items)}`).join('\n\n')
+  if (controls.format === 'compact') return { type: 'text', text: sections() }
+  const json = '```json\n' + JSON.stringify(payload, null, 2) + '\n```'
+  if (controls.formatExplicit || json.length <= INLINE_BUDGET) return { type: 'text', text: json }
+
+  const summary: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(payload)) if (!LIST_KEYS.has(k)) summary[k] = v
+  if (fullLists) {
+    summary.byRule = countByRule(fullLists.issues)
+    if (fullLists.incomplete) summary.incompleteByRule = countByRule(fullLists.incomplete)
+  }
+  const head =
+    `Output: compact — the full JSON is ${json.length.toLocaleString('en-US')} chars, over the inline budget of ${INLINE_BUDGET.toLocaleString('en-US')}. ` +
+    'Pass format: "json" for every field (html, fix values, source pointers), or narrow with rules / wcag / minImpact / rootSelector. Counts below cover every finding.'
+  const summaryBlock = '```json\n' + JSON.stringify(summary, null, 2) + '\n```'
+  let body = sections()
+  // Hard ceiling: never let the compact listing itself overflow the budget.
+  const room = INLINE_BUDGET - head.length - summaryBlock.length - 200
+  if (body.length > room) {
+    const cut = body.lastIndexOf('\n', Math.max(0, room))
+    const dropped = body.slice(cut).split('\n').filter(Boolean).length
+    body = body.slice(0, Math.max(0, cut)) + `\n… ${dropped} more line(s) not shown — every finding is counted in the summary block; pass format: "json" or narrow the scan to list them.`
+  }
+  return { type: 'text', text: `${head}\n\n${body}\n\n${summaryBlock}` }
 }

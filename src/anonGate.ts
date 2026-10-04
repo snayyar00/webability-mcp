@@ -1,5 +1,6 @@
 import type { IncomingHttpHeaders } from 'node:http'
 import { contrastLaunchesBrowser } from './contrastPalette.js'
+import { signInSteps } from './signIn.js'
 
 /**
  * The address the hosted anonymous rate limit keys on. It must be one
@@ -74,4 +75,52 @@ export function anonLimitClass(call: ToolCall): 'heavy' | 'ai' | null {
   // the browser when the pair passes AA; counting that case is the safe side.)
   if (call.name === 'check_color_contrast' && contrastLaunchesBrowser(call.args)) return 'heavy'
   return null
+}
+
+const WINDOW_MS = 60 * 60 * 1000
+
+export type AnonGateResult = { ok: boolean; retryAfterS: number; resetAt: number }
+
+/**
+ * Per-key fixed-window counters (one hour, opened by the key's first call).
+ * In-memory only — single-container deploy, never per-request writes to
+ * paid storage. `resetAt` is the window's own end, so the 429 can say when
+ * it resets.
+ */
+export function createAnonLimiter(now: () => number = Date.now) {
+  const buckets = new Map<string, { n: number; resetAt: number }>()
+  return {
+    allow(key: string, limit: number): AnonGateResult {
+      const t = now()
+      let b = buckets.get(key)
+      if (!b || b.resetAt <= t) {
+        b = { n: 0, resetAt: t + WINDOW_MS }
+        buckets.set(key, b)
+        if (buckets.size > 50_000) {
+          for (const [k, v] of buckets) if (v.resetAt <= t) buckets.delete(k)
+        }
+      }
+      b.n += 1
+      return { ok: b.n <= limit, retryAfterS: Math.max(0, Math.ceil((b.resetAt - t) / 1000)), resetAt: b.resetAt }
+    },
+  }
+}
+
+/**
+ * The anonymous-cap answer. Persona round 4: the old text ("… or retry
+ * later") gave no limit and no reset time. States the limit, when this
+ * caller's window resets, and how to remove the limit.
+ */
+export function anonLimitMessage(o: { cls: 'heavy' | 'ai'; limit: number; retryAfterS: number; resetAt: number }): string {
+  const what = o.cls === 'ai' ? (o.limit === 1 ? 'AI fix call' : 'AI fix calls') : o.limit === 1 ? 'page-loading call' : 'page-loading calls'
+  const examples = o.cls === 'ai' ? ` (${[...AI_TOOLS].join(', ')})` : ` (${[...HEAVY_TOOLS].join(', ')}, check_color_contrast with a url + selector or with a url and no brandColors)`
+  const wait = o.retryAfterS < 60 ? `${o.retryAfterS} s` : `${Math.ceil(o.retryAfterS / 60)} min`
+  const at = new Date(o.resetAt).toISOString().slice(11, 16)
+  return (
+    `Anonymous fair-use limit reached: ${o.limit} ${what}${examples} per hour from this IP address. ` +
+    `It resets in ${wait} (at ${at} UTC). ` +
+    'Sign in with a free WebAbility account to remove the limit:\n' +
+    signInSteps().join('\n') +
+    '\nDocs: https://www.webability.io/docs/mcp'
+  )
 }

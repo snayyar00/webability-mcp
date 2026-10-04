@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * E2E for partial auth: the hosted server starts AUTHLESS for the free tools,
- * and the paid tools (start_audit / get_audit / visual_audit) answer HTTP 401
- * + WWW-Authenticate so a spec client runs the OAuth flow on demand.
+ * E2E for partial auth: the hosted /mcp starts AUTHLESS for the free tools,
+ * and an anonymous call to an account tool (start_audit / get_audit /
+ * visual_audit) gets an isError tool result with the sign-in steps — not an
+ * HTTP 401, which makes Claude Code drop every tool. /mcp/auth is the path
+ * that answers 401 + WWW-Authenticate so a client signs in on connect.
  * Anonymous callers are rate-limited per IP; authenticated callers are not.
  *
  * Fully offline. Run: node test/partial-auth.e2e.mjs
@@ -82,11 +84,11 @@ try {
   const rules = await post(rpc('tools/call', { name: 'get_rules', arguments: { tags: ['wcag2aa'] } }))
   check('anonymous free tool (get_rules) → 200', rules.status === 200, rules.status)
 
-  // 3. anonymous paid tool → HTTP 401 with WWW-Authenticate (OAuth on demand)
+  // 3. anonymous account tool → 200 isError tool result, no 401 / WWW-Authenticate
   for (const name of ['start_audit', 'get_audit', 'visual_audit']) {
-    const r = await post(rpc('tools/call', { name, arguments: { url: 'https://example.com', id: 1 } }))
-    const www = r.headers.get('www-authenticate') || ''
-    check(`anonymous ${name} → 401 + WWW-Authenticate`, r.status === 401 && www.includes('resource_metadata'), `${r.status} ${www}`)
+    const r = await post(rpc('tools/call', { name, arguments: { url: 'https://webability.io', id: 1 } }))
+    const j = await r.json().catch(() => ({}))
+    check(`anonymous ${name} → 200 isError, no WWW-Authenticate`, r.status === 200 && j?.result?.isError === true && !r.headers.get('www-authenticate'), `${r.status} ${JSON.stringify(j).slice(0, 160)}`)
   }
 
   // 4. anonymous AI tool is rate limited (cap 2/hour in this test)
@@ -100,10 +102,10 @@ try {
   const authed = await post(rpc('tools/call', { name: 'generate_ai_fix', arguments: { issue: { message: 'x' }, html: '<p>x</p>', framework: 'plain-css' } }), { authorization: `Bearer ${USER_TOKEN}` })
   check('authenticated generate_ai_fix bypasses anon cap', authed.status === 200, authed.status)
 
-  // 6. the 401 body tells a human what to do
-  const paid = await post(rpc('tools/call', { name: 'start_audit', arguments: { url: 'https://example.com' } }))
+  // 6. the refusal tells a human how to sign in from their client
+  const paid = await post(rpc('tools/call', { name: 'start_audit', arguments: { url: 'https://webability.io' } }))
   const body = await paid.text()
-  check('paid-tool 401 body mentions signing in', /sign|connect|authoriz|account/i.test(body), body.slice(0, 160))
+  check('account-tool refusal names the sign-in paths', /claude mcp login/.test(body) && /\/mcp\/auth/.test(body), body.slice(0, 160))
 } finally {
   child.kill()
   mockApi.close()

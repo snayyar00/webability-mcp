@@ -92,17 +92,18 @@ function b64url(buf) {
 }
 
 try {
-  // 1. auth challenges advertise the resource metadata. The server is
-  // partial-auth (anonymous free tools are allowed), so the 401s are: a paid
-  // tool called anonymously, and any request with a bad token.
-  const paidAnon = await fetch(`${BASE}/mcp`, {
+  // 1. auth challenges advertise the resource metadata. /mcp is partial-auth
+  // (anonymous free tools are allowed, and an anonymous account tool gets an
+  // isError tool result, not a 401), so the 401s are: any request to the
+  // sign-in path /mcp/auth without a token, and any request with a bad token.
+  const signInAnon = await fetch(`${BASE}/mcp/auth`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', id: 1, params: { name: 'start_audit', arguments: { url: 'https://example.com' } } }),
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1, params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '0' } } }),
   })
-  check('anonymous paid tool → 401', paidAnon.status === 401, paidAnon.status)
-  const www = paidAnon.headers.get('www-authenticate') || ''
-  check('401 carries WWW-Authenticate with resource_metadata', www.includes('resource_metadata="') && www.includes('/.well-known/oauth-protected-resource'), www)
+  check('anonymous request to /mcp/auth → 401', signInAnon.status === 401, signInAnon.status)
+  const www = signInAnon.headers.get('www-authenticate') || ''
+  check('401 carries WWW-Authenticate with resource_metadata', www.includes('resource_metadata="') && www.includes('/.well-known/oauth-protected-resource/mcp/auth'), www)
   const badTok = await fetch(`${BASE}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer bogus' }, body: '{}' })
   check('garbage token → 401 (not silent anonymous downgrade)', badTok.status === 401, badTok.status)
 
@@ -139,7 +140,7 @@ try {
   const regBad = await fetch(as.registration_endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: ['http://evil.example.com/cb'] }),
+    body: JSON.stringify({ redirect_uris: ['http://attacker.invalid/cb'] }),
   })
   check('DCR rejects non-https non-localhost redirect', regBad.status === 400, regBad.status)
 
@@ -154,7 +155,7 @@ try {
 
   const badClient = await fetch(authUrl.replace(encodeURIComponent(reg.client_id), 'forged-client-id'))
   check('authorize rejects unknown client_id', badClient.status === 400, badClient.status)
-  const badRedirect = await fetch(`${as.authorization_endpoint}?response_type=code&client_id=${encodeURIComponent(reg.client_id)}&redirect_uri=${encodeURIComponent('https://evil.example.com/cb')}&state=s&code_challenge=${challenge}&code_challenge_method=S256`)
+  const badRedirect = await fetch(`${as.authorization_endpoint}?response_type=code&client_id=${encodeURIComponent(reg.client_id)}&redirect_uri=${encodeURIComponent('https://attacker.invalid/cb')}&state=s&code_challenge=${challenge}&code_challenge_method=S256`)
   check('authorize rejects unregistered redirect_uri', badRedirect.status === 400, badRedirect.status)
 
   // 6. device-flow session under the hood

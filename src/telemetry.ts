@@ -128,6 +128,9 @@ export function extractSummary(response: unknown): ScanEventSummary | null {
       const m = c.text.match(/```json\n([\s\S]*?)\n```/)
       if (!m) continue
       const parsed = JSON.parse(m[1])
+      // pageSummary (present only when output filters narrowed the result) is
+      // the whole page — the number telemetry has always recorded.
+      if (parsed && typeof parsed.pageSummary === 'object' && parsed.pageSummary !== null) return parsed.pageSummary
       if (parsed && typeof parsed.summary === 'object' && parsed.summary !== null) return parsed.summary
       if (Array.isArray(parsed)) return { total: parsed.length } // check_aria / scan_html violation arrays
       if (Array.isArray(parsed.violations)) return { total: parsed.violations.length }

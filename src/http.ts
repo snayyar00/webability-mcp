@@ -27,10 +27,10 @@ import { timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
 import { handleOAuth, wwwAuthenticate } from './oauth.js'
-import { anonLimitClass, calledTools, clientIp } from './anonGate.js'
+import { anonLimitClass, anonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
+import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH } from './signIn.js'
 
 const PORT = Number(process.env.PORT || 8080)
-const MCP_PATH = '/mcp'
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
 
 // Optional shared operator token (backward-compat). A per-user token is the
@@ -59,21 +59,42 @@ function matchesShared(token: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
-/** Validate a caller's WebAbility token against the API (cached). */
-async function isValidUserToken(token: string): Promise<boolean> {
-  if (!token) return false
+/**
+ * Validate a caller's WebAbility token against the API (cached).
+ * Only 401/403 from the API are a verdict on the token ('invalid').
+ * 'unavailable' = no verdict: network error, 5xx, throttling (429) or another
+ * transient status (408, 425, ...). That is not a
+ * verdict on the token: answering it with 401 would make Claude Code mark the
+ * server needs-auth (zero tools in later sessions) and claude.ai invalidate
+ * the connector, for every signed-in user, during an API outage.
+ */
+type TokenCheck = { state: 'valid' | 'invalid' } | { state: 'unavailable'; retryAfter: string }
+const DEFAULT_RETRY_AFTER_S = '30'
+
+/** Upstream Retry-After when it is delta-seconds or an HTTP date; otherwise our default. */
+function retryAfterFrom(res: Response): string {
+  const raw = (res.headers.get('retry-after') || '').trim()
+  if (/^\d{1,6}$/.test(raw)) return raw
+  const when = Date.parse(raw)
+  if (!Number.isNaN(when)) return String(Math.max(1, Math.ceil((when - Date.now()) / 1000)))
+  return DEFAULT_RETRY_AFTER_S
+}
+
+async function checkUserToken(token: string): Promise<TokenCheck> {
+  if (!token) return { state: 'invalid' }
   const cached = tokenCache.get(token)
-  if (cached && cached > Date.now()) return true
+  if (cached && cached > Date.now()) return { state: 'valid' }
   try {
     const res = await fetch(`${API_URL}/cli/whoami`, { headers: { Authorization: `Bearer ${token}` } })
     if (res.ok) {
       tokenCache.set(token, Date.now() + TOKEN_TTL_MS)
-      return true
+      return { state: 'valid' }
     }
+    if (res.status === 401 || res.status === 403) return { state: 'invalid' }
+    return { state: 'unavailable', retryAfter: retryAfterFrom(res) }
   } catch {
-    // network error reaching the API — treat as unauthorized for this request
+    return { state: 'unavailable', retryAfter: DEFAULT_RETRY_AFTER_S }
   }
-  return false
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown) {
@@ -82,38 +103,22 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// Partial auth: the server starts AUTHLESS so anyone can list and call the
-// scan/check tools anonymously. Everything is free; fair-use limits apply.
-// The account tools (start_audit/get_audit/visual_audit) need a free
-// WebAbility account: an anonymous call gets 401 + WWW-Authenticate, which
-// spec clients answer by running the OAuth flow in oauth.ts on demand.
+// Partial auth on /mcp: anyone can list and call the scan/check tools
+// anonymously. Everything is free; fair-use limits apply. The account tools
+// (start_audit/get_audit/visual_audit) need a free WebAbility account. An
+// anonymous call to one gets a normal tool result with isError and the
+// sign-in steps (server.ts, signIn.ts) — NOT an HTTP 401: a 401 on a tool call
+// makes Claude Code cache the server as needs-auth, and every later session
+// then lists zero tools. Clients that start OAuth only on a 401 use
+// /mcp/auth, which challenges every request without a valid token.
 // Anonymous traffic launches OUR browsers and calls OUR AI endpoint, so the
 // scan/check tools are rate-limited per client IP — in-memory counters only
 // (single-container deploy), never per-request writes to paid storage.
 // ---------------------------------------------------------------------------
-// Checked BEFORE dispatch (not inside the tool handler): only a pre-dispatch
-// check can return a real HTTP 401 + WWW-Authenticate — inside the MCP
-// JSON-RPC tool call any outcome is a 200 "tool result", so a spec client
-// could never auto-trigger its OAuth flow. It also means visual_audit never
-// launches a headless browser for a call that was always going to be refused.
-const ACCOUNT_TOOLS = new Set(['start_audit', 'get_audit', 'visual_audit'])
 const ANON_HEAVY_PER_HOUR = Number(process.env.ANON_HEAVY_PER_HOUR || 30)
 const ANON_AI_PER_HOUR = Number(process.env.ANON_AI_PER_HOUR || 10)
 
-const anonBuckets = new Map<string, { n: number; resetAt: number }>()
-function allowAnon(key: string, limit: number): { ok: boolean; retryAfterS: number } {
-  const now = Date.now()
-  let b = anonBuckets.get(key)
-  if (!b || b.resetAt < now) {
-    b = { n: 0, resetAt: now + 60 * 60 * 1000 }
-    anonBuckets.set(key, b)
-    if (anonBuckets.size > 50_000) {
-      for (const [k, v] of anonBuckets) if (v.resetAt < now) anonBuckets.delete(k)
-    }
-  }
-  b.n += 1
-  return { ok: b.n <= limit, retryAfterS: Math.ceil((b.resetAt - now) / 1000) }
-}
+const anonLimiter = createAnonLimiter()
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
@@ -172,28 +177,54 @@ const httpServer = createHttpServer(async (req, res) => {
     return
   }
 
-  if (url.pathname !== MCP_PATH) {
+  if (url.pathname !== MCP_PATH && url.pathname !== SIGN_IN_MCP_PATH) {
     sendJson(res, 404, { error: 'not_found' })
     return
   }
+  const mcpPath = url.pathname
 
-  // Auth is PARTIAL. Anyone can initialize, list tools, and call the free
-  // (DOM/scanner) tools anonymously — rate-limited per IP. A valid per-user
-  // token lifts the limits and unlocks the account tools, which run on that
-  // caller's account. A GARBAGE token is still a hard 401 (a caller who tried
-  // to authenticate should learn their token is bad, not be silently
-  // downgraded to anonymous). The shared operator token is accepted too.
+  // Auth is PARTIAL on /mcp. Anyone can initialize, list tools, and call the
+  // free (DOM/scanner) tools anonymously — rate-limited per IP. A valid
+  // per-user token lifts the limits and unlocks the account tools, which run
+  // on that caller's account. /mcp/auth has no anonymous mode: a request
+  // without a token gets 401 + WWW-Authenticate so the client signs in. A
+  // GARBAGE token is a hard 401 on both paths (a caller who tried to
+  // authenticate should learn their token is bad, not be silently downgraded
+  // to anonymous; the MCP spec requires 401 for an invalid token). The shared
+  // operator token is accepted too.
   const token = bearer(req)
   let authToken: string | undefined
   let anonymous = false
-  if (!token) {
+  let tokenCheck: TokenCheck = { state: 'invalid' }
+  if (!token && mcpPath === SIGN_IN_MCP_PATH) {
+    res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
+    sendJson(res, 401, {
+      jsonrpc: '2.0',
+      error: {
+        code: -32001,
+        message:
+          'This URL is the sign-in path: sign in with a free WebAbility account when your client asks. ' +
+          `The scan and check tools also work without an account at ${PUBLIC_URL}${MCP_PATH}. Docs: https://www.webability.io/docs/mcp`,
+      },
+      id: null,
+    })
+    return
+  } else if (!token) {
     anonymous = true
   } else if (matchesShared(token)) {
     authToken = undefined // operator mode: account tools use the deploy's WEBABILITY_API_KEY
-  } else if (await isValidUserToken(token)) {
+  } else if ((tokenCheck = await checkUserToken(token)).state === 'valid') {
     authToken = token // per-user mode: account tools use the caller's key
+  } else if (tokenCheck.state === 'unavailable') {
+    res.setHeader('Retry-After', tokenCheck.retryAfter)
+    sendJson(res, 503, {
+      jsonrpc: '2.0',
+      error: { code: -32603, message: 'WebAbility could not check your sign-in right now (the account service did not answer). Retry in a minute; your sign-in is still valid.' },
+      id: null,
+    })
+    return
   } else {
-    res.setHeader('WWW-Authenticate', wwwAuthenticate())
+    res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
     sendJson(res, 401, {
       jsonrpc: '2.0',
       error: {
@@ -216,33 +247,22 @@ const httpServer = createHttpServer(async (req, res) => {
     if (anonymous) {
       // Every tool the body calls — a JSON-RPC batch must not slip past the
       // gate by hiding its calls in an array (see anonGate.ts).
+      // Account tools are not refused here: their handlers return an isError
+      // tool result before any browser or API work (server.ts).
       const tools = calledTools(body)
-      const needsAccount = tools.map((t) => t.name).find((n) => ACCOUNT_TOOLS.has(n))
-      if (needsAccount) {
-        res.setHeader('WWW-Authenticate', wwwAuthenticate())
-        sendJson(res, 401, {
-          jsonrpc: '2.0',
-          error: {
-            code: -32001,
-            message:
-              `${needsAccount} needs a free WebAbility account. Sign in when your client prompts you (OAuth), or run \`webability login\`. ` +
-              'The scanning tools work without an account.',
-          },
-          id: null,
-        })
-        return
-      }
       for (const tool of tools) {
         const cls = anonLimitClass(tool)
         if (!cls) continue
-        const gate = allowAnon(`${ip}:${cls}`, cls === 'ai' ? ANON_AI_PER_HOUR : ANON_HEAVY_PER_HOUR)
+        const limit = cls === 'ai' ? ANON_AI_PER_HOUR : ANON_HEAVY_PER_HOUR
+        const gate = anonLimiter.allow(`${ip}:${cls}`, limit)
         if (!gate.ok) {
           res.setHeader('Retry-After', String(gate.retryAfterS))
           sendJson(res, 429, {
             jsonrpc: '2.0',
             error: {
               code: -32001,
-              message: 'Anonymous rate limit reached for this tool. Sign in with a free WebAbility account to continue without limits, or retry later.',
+              message: anonLimitMessage({ cls, limit, retryAfterS: gate.retryAfterS, resetAt: gate.resetAt }),
+              data: { limit, perHours: 1, retryAfterSeconds: gate.retryAfterS, resetAt: new Date(gate.resetAt).toISOString() },
             },
             id: null,
           })

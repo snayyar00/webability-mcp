@@ -84,7 +84,6 @@ const WEBABILITY_RULE_META: Record<string, RuleFixMeta> = {
   missing_media_controls: { op: 'add-attribute', attribute: 'controls', fixability: 'mechanical' },
   unsafe_autoplay: { op: 'remove-attribute', attribute: 'autoplay', fixability: 'mechanical' },
   zoom_restriction: { op: 'set-attribute', attribute: 'content', fixability: 'mechanical' },
-  missing_aria_required: { op: 'add-attribute', attribute: 'aria-required', fixability: 'mechanical' },
   missing_autocomplete: { op: 'add-attribute', attribute: 'autocomplete', fixability: 'mechanical' },
   identify_input_purpose: { op: 'add-attribute', attribute: 'autocomplete', fixability: 'mechanical' },
   decorative_icon: { op: 'add-attribute', attribute: 'aria-hidden', fixability: 'mechanical' },

@@ -14,7 +14,8 @@ export const GET_RULES_VALID_KEYS = 'tags, rule, fixability, engine'
 
 export const normRuleId = (s: string) => s.trim().toLowerCase().replace(/-/g, '_')
 
-export type GetRulesArgs = { tags?: string[]; rule?: string; error?: string }
+/** `expanded`: tags derived from level / wcag / criterion — tags the caller did not type. */
+export type GetRulesArgs = { tags?: string[]; rule?: string; error?: string; expanded?: boolean }
 
 const asList = (k: string, v: unknown): string[] | string => {
   if (typeof v === 'string') return [v]
@@ -40,6 +41,7 @@ export function resolveGetRulesArgs(args: Record<string, unknown> | undefined): 
   if (unknown.length > 0) return { error: `Error: unknown argument '${unknown[0]}' — valid keys: ${GET_RULES_VALID_KEYS}` }
 
   let tags = a.tags as string[] | undefined // canonical: validated by the caller
+  let expanded = false
   if (tags === undefined) {
     for (const k of TAG_ALIASES) {
       const v = a[k]
@@ -56,7 +58,7 @@ export function resolveGetRulesArgs(args: Record<string, unknown> | undefined): 
         if (typeof t === 'string') return { error: t }
         out.push(...t)
       }
-      if (out.length > 0) { tags = out; break }
+      if (out.length > 0) { tags = out; expanded = k === 'level' || k === 'wcag' || k === 'criterion'; break }
     }
   }
 
@@ -68,5 +70,22 @@ export function resolveGetRulesArgs(args: Record<string, unknown> | undefined): 
   } else if (typeof rule !== 'string') return { error: 'Error: rule must be a string' }
   const ruleStr = typeof rule === 'string' && rule.trim() !== '' ? normRuleId(rule) : undefined
 
-  return { tags, rule: ruleStr }
+  return { tags, rule: ruleStr, ...(expanded ? { expanded } : {}) }
+}
+
+/**
+ * Word match on a rule id: the query's words appear in the id as consecutive
+ * whole words (split on - and _), a trailing "s" tolerated either way.
+ * "link" matches link-name and identical-links-same-purpose, never blink
+ * (persona round 4: substring matching listed blink for "link").
+ */
+export function ruleIdMatches(ruleId: string, query: string): boolean {
+  const words = normRuleId(ruleId).split('_').filter(Boolean)
+  const want = normRuleId(query).split('_').filter(Boolean)
+  if (want.length === 0 || want.length > words.length) return false
+  const same = (a: string, b: string) => a === b || a === `${b}s` || `${a}s` === b
+  for (let i = 0; i + want.length <= words.length; i++) {
+    if (want.every((w, j) => same(words[i + j]!, w))) return true
+  }
+  return false
 }

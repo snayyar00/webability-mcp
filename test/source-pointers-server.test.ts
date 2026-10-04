@@ -66,7 +66,7 @@ test('minImpact filters before the cap and is echoed in the summary line', async
   const res: any = await client.callTool({ name: 'scan_page', arguments: { url, minImpact: 'critical' } })
   const payload = jsonBlock(res)
   for (const i of payload.issues) assert.equal(i.impact, 'critical')
-  assert.match(String(res.content[0].text), /after filters \(filtered: minImpact=critical\)/)
+  assert.match(String(res.content[0].text), /matching the filters \(minImpact=critical\)/)
   const bad: any = await client.callTool({ name: 'scan_page', arguments: { url, minImpact: 'huge' } })
   assert.match(String(bad.content[0].text), /^Error: minImpact/)
 })

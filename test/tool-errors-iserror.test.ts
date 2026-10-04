@@ -105,6 +105,8 @@ const RESULT_PREFIXES = [
   'text: `# Visual Audit: ',
   'text: `No source files under ',
   "text: lines.join('\\n')",
+  // get_rules: a WCAG criterion no automated rule covers is an answer, not a failure.
+  'text: `0 rules: no rule covers',
 ]
 
 test('every plain one-line text return is a reviewed result, not a refusal', () => {

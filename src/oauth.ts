@@ -20,11 +20,10 @@
  */
 import type { IncomingMessage, ServerResponse } from 'http'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
+import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
 
-const ISSUER = (process.env.MCP_PUBLIC_URL || 'https://mcp.webability.io').replace(/\/+$/, '')
+const ISSUER = PUBLIC_URL
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
-
-export const RESOURCE_METADATA_URL = `${ISSUER}/.well-known/oauth-protected-resource/mcp`
 
 // HMAC key for client_id blobs. Losing it only forces clients through one
 // re-registration (DCR is automatic), so a per-boot fallback is acceptable —
@@ -198,13 +197,18 @@ const AS_METADATA = {
   service_documentation: 'https://www.webability.io/docs/mcp',
 }
 
-const RESOURCE_METADATA = {
-  resource: `${ISSUER}/mcp`,
+/** RFC 9728 metadata for one MCP path: /mcp (anonymous allowed) or /mcp/auth (sign-in path).
+ * The issued access token is the caller's WebAbility token, valid on both
+ * paths: the `resource` value tells the client which URL it is signing in
+ * for; it is not an audience binding. The bare /.well-known path serves the
+ * /mcp document. */
+const resourceMetadata = (mcpPath: string) => ({
+  resource: `${ISSUER}${mcpPath}`,
   authorization_servers: [ISSUER],
   bearer_methods_supported: ['header'],
   scopes_supported: ['mcp'],
   resource_documentation: 'https://www.webability.io/docs/mcp',
-}
+})
 
 function escapeJsonForHtml(value: unknown): string {
   return JSON.stringify(value).replace(/</g, '\\u003c')
@@ -283,8 +287,8 @@ async function post(path, body) {
 }
 
 /** RFC 9728 §5.1 challenge — tells spec-following clients where auth lives. */
-export function wwwAuthenticate(): string {
-  return `Bearer error="invalid_token", resource_metadata="${RESOURCE_METADATA_URL}"`
+export function wwwAuthenticate(mcpPath: string = MCP_PATH): string {
+  return `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(mcpPath)}"`
 }
 
 /** Route OAuth endpoints. Returns true when the request was handled here. */
@@ -292,12 +296,21 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
   sweep()
   const path = url.pathname
 
-  if (req.method === 'GET' && (path === '/.well-known/oauth-authorization-server' || path === '/.well-known/oauth-authorization-server/mcp')) {
+  if (
+    req.method === 'GET' &&
+    (path === '/.well-known/oauth-authorization-server' ||
+      path === `/.well-known/oauth-authorization-server${MCP_PATH}` ||
+      path === `/.well-known/oauth-authorization-server${SIGN_IN_MCP_PATH}`)
+  ) {
     json(res, 200, AS_METADATA)
     return true
   }
-  if (req.method === 'GET' && (path === '/.well-known/oauth-protected-resource' || path === '/.well-known/oauth-protected-resource/mcp')) {
-    json(res, 200, RESOURCE_METADATA)
+  if (req.method === 'GET' && (path === '/.well-known/oauth-protected-resource' || path === `/.well-known/oauth-protected-resource${MCP_PATH}`)) {
+    json(res, 200, resourceMetadata(MCP_PATH))
+    return true
+  }
+  if (req.method === 'GET' && path === `/.well-known/oauth-protected-resource${SIGN_IN_MCP_PATH}`) {
+    json(res, 200, resourceMetadata(SIGN_IN_MCP_PATH))
     return true
   }
 

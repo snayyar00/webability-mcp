@@ -30,6 +30,11 @@ const NAME_RULES = new Set([
   'empty_link', 'link-name',
   // images
   'missing_alt', 'image-alt', 'h37',
+  // buttons and named graphics — svg_missing_name reports the enclosing
+  // control's selector when the svg sits in one, so an icon button came back
+  // as svg_missing_name AND unlabeled_button (allbirds.com, MCP dogfood
+  // 2026-10-03): one missing name, one fix.
+  'unlabeled_button', 'button-name', 'input-button-name', 'svg_missing_name', 'svg-img-alt', 'role-img-alt',
 ])
 const isNameRule = (type: string | undefined) => !!type && (NAME_RULES.has(type) || /^h91_[a-z0-9]+_name$/.test(type))
 
@@ -191,4 +196,83 @@ export function truncationNote(o: { remote: boolean; cap: number; returned: numb
   return o.remote
     ? head + ' To see the rest, narrow the scan: minImpact (e.g. "serious"), rules [...] or wcag [...], rootSelector for one region of the page, and format: "compact" for fewer tokens per finding. For a full report of the whole site, use start_audit.'
     : head + ' Retrieve the FULL untruncated set via `scan_history` (pass this scan\'s id), or narrow with minImpact / rules / wcag / rootSelector, or use format: "compact".'
+}
+
+export const OBSOLETE_PARSING_REASON =
+  'WCAG 4.1.1 Parsing is obsolete in WCAG 2.2 and always satisfied for HTML, so this is not a conformance failure. A duplicate id only harms users when a label for= / aria-labelledby / aria-describedby reference resolves to the wrong element — those cases are reported under 1.3.1 / 4.1.2. Rename the id if a reference points at it; otherwise this is cleanup.'
+
+const onlyParsing = (wcag: string | undefined) => {
+  const c = String(wcag ?? '').split(/[,\s]+/).filter(Boolean)
+  return c.length > 0 && c.every((x) => x === '4.1.1')
+}
+
+/**
+ * Move findings whose only criterion is 4.1.1 (duplicate_id, HTML_CodeSniffer
+ * f77, axe duplicate-id / duplicate-id-active) from issues to needs-review,
+ * with the reason. axe duplicate-id-aria is tagged 4.1.2 and stays an issue.
+ */
+export function demoteObsoleteParsing<T extends Shaped & { confidence?: string; reviewReason?: string }>(issues: readonly T[], incomplete: readonly T[]): { issues: T[]; incomplete: T[]; demoted: number } {
+  const keep: T[] = []
+  const moved: T[] = []
+  for (const i of issues) (onlyParsing(i.wcag) ? moved : keep).push(i)
+  const tag = (i: T): T => ({ ...i, confidence: 'needs_review', reviewReason: OBSOLETE_PARSING_REASON })
+  return {
+    issues: keep,
+    incomplete: [...incomplete.map((i) => (onlyParsing(i.wcag) ? tag(i) : i)), ...moved.map(tag)],
+    demoted: moved.length,
+  }
+}
+
+export type SeveritySummary = ReturnType<typeof recountSummary>
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
+
+/**
+ * The lead sentence of a scan_page response. Persona round 4: 24/80 runs read
+ * "Found 67 issue(s) … issues[] has 34 entries for 67 issue(s)" as two
+ * competing counts, and 21/80 saw a page-wide "Found 67" above a filtered
+ * list of 1. One number is the issue count (one per affected element and
+ * problem); entries are only how the list groups them. With filters active
+ * (`page` set) the filtered set leads and the page-wide total is a secondary
+ * clause.
+ */
+export function scanHeadline(o: {
+  url: string
+  /** Severity counts of the set being returned (the filtered set when filters are on). */
+  shown: SeveritySummary
+  /** Page-wide counts — set only when filters narrowed the result. */
+  page?: SeveritySummary
+  /** Filter description, e.g. "rules=[missing_alt]". */
+  filters?: string
+  issueEntries: number
+  incompleteEntries: number
+  collapsedGroups: number
+}): string {
+  const s = o.shown
+  const matching = o.page ? ` matching the filters${o.filters ? ` (${o.filters})` : ''}` : ''
+  let text =
+    `Found ${plural(s.total, 'high-confidence issue', 'high-confidence issues')}${matching} on ${o.url}: ` +
+    `${s.critical} critical, ${s.serious} serious, ${s.moderate} moderate, ${s.minor} minor.`
+  if (s.incomplete > 0) {
+    text += ` ${s.incomplete} additional finding(s)${o.page ? ' matching the filters' : ''} need human review (gradient backgrounds, marketing imagery, etc.) — see \`incomplete[]\`. Do NOT auto-fix these.`
+  }
+  if (o.page) {
+    text +=
+      ` Whole page, before filters: ${plural(o.page.total, 'issue', 'issues')} and ${o.page.incomplete} needing review — that is the total to report.` +
+      ' `summary` counts the filtered set; `pageSummary` counts the whole page.'
+  } else {
+    text += ` Total to report: ${plural(s.total, 'issue', 'issues')} (one per affected element and problem).`
+  }
+  const issuesGrouped = o.issueEntries < s.total
+  const reviewGrouped = o.incompleteEntries < s.incomplete
+  if (o.collapsedGroups > 0 && (issuesGrouped || reviewGrouped)) {
+    const parts: string[] = []
+    if (issuesGrouped) parts.push(`the ${plural(s.total, 'issue is', 'issues are')} grouped into ${o.issueEntries} entries in issues[]`)
+    if (reviewGrouped) parts.push(`the ${s.incomplete} needs-review finding(s) into ${o.incompleteEntries} entries in incomplete[]`)
+    const joined = parts.join('; ')
+    text +=
+      ` Listing: ${joined} — ${o.collapsedGroups} rule(s) repeat with the same fix and are listed once with \`count\`.` +
+      ' Pass rules: ["<rule id>"] to list every element of a rule.'
+  }
+  return text
 }
