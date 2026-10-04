@@ -1,0 +1,12 @@
+{
+  "name": "webability",
+  "description": "WebAbility accessibility tools for AI coding agents",
+  "owner": { "name": "WebAbility", "url": "https://webability.io" },
+  "plugins": [
+    {
+      "name": "webability-accessibility",
+      "source": "./",
+      "description": "Scan pages and HTML for WCAG 2.2 / ADA / Section 508 issues, get framework-aware fixes, and verify them. Free hosted MCP server."
+    }
+  ]
+}
