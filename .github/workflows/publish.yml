@@ -124,6 +124,22 @@ jobs:
             echo "$name $version already in the MCP registry, skip"
             exit 0
           fi
+          # npm accepts a publish with 202 and lists the version minutes later;
+          # the registry rejects a version npm does not list yet.
+          listed=false
+          for i in $(seq 1 40); do
+            if curl -fsS "https://registry.npmjs.org/$(jq -r '.packages[0].identifier' server.json | sed 's|/|%2f|')" \
+                 | jq -e --arg v "$version" '.versions | has($v)' >/dev/null; then
+              listed=true
+              break
+            fi
+            echo "waiting for npm to list $version ($i/40)"
+            sleep 15
+          done
+          if [ "$listed" != true ]; then
+            echo "::error::npm still does not list $version after 10 minutes; re-run this job once it does"
+            exit 1
+          fi
           curl -fsSL https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz \
             | tar -xz mcp-publisher
           ./mcp-publisher login github-oidc
