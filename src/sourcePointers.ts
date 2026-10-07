@@ -13,6 +13,8 @@
  * find_source token grep over `sourceRoot`) is the fallback.
  */
 import { execFile } from 'child_process'
+import { readdir, readFile, stat } from 'fs/promises'
+import { join } from 'path'
 import { promisify } from 'util'
 
 const execFileAsync = promisify(execFile)
@@ -166,6 +168,10 @@ export async function findSourceCandidates(selector: string, rootDir: string): P
   for (const token of tokens.slice(0, 5)) {
     // Never let a token be parsed as a flag (argument injection); `--` stops rg flag parsing.
     if (token.startsWith('-')) continue
+    if (!rgAvailable) {
+      for (const f of await walkGrep(token, rootDir)) matches.add(f)
+      continue
+    }
     try {
       const { stdout } = await execFileAsync('rg', [
         '-l',
@@ -177,9 +183,82 @@ export async function findSourceCandidates(selector: string, rootDir: string): P
         rootDir,
       ], { timeout: 5000 })
       stdout.split('\n').filter(Boolean).forEach((f) => matches.add(f))
-    } catch {
-      // No matches for this token, continue
+    } catch (err) {
+      // ripgrep not installed (e.g. a bare CI runner or a user machine):
+      // fall back to a Node walk for this and every later token.
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        rgAvailable = false
+        for (const f of await walkGrep(token, rootDir)) matches.add(f)
+      }
+      // Otherwise: no matches for this token (rg exits 1), continue
     }
   }
   return Array.from(matches).slice(0, 10)
+}
+
+let rgAvailable = true
+
+const WEB_EXT = /\.(tsx|jsx|ts|js|vue|svelte|html|php|astro)$/
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage'])
+const WALK_MAX_FILES = 5000
+const WALK_MAX_FILE_BYTES = 1_000_000
+const WALK_MAX_TOTAL_BYTES = 50_000_000
+const WALK_BUDGET_MS = 5000
+const WALK_CACHE_MS = 30_000
+
+type WebFile = { path: string; text: string }
+const walkCache = new Map<string, { at: number; files: Promise<WebFile[]> }>()
+
+/**
+ * Node fallback for rg: read the project's web files ONCE per root (cached
+ * 30 s, so every token of every selector in one scan shares one walk), with
+ * file-count, byte and time caps.
+ */
+function loadWebFiles(rootDir: string): Promise<WebFile[]> {
+  const hit = walkCache.get(rootDir)
+  if (hit && Date.now() - hit.at < WALK_CACHE_MS) return hit.files
+  const files = (async () => {
+    const out: WebFile[] = []
+    const stack = [rootDir]
+    const deadline = Date.now() + WALK_BUDGET_MS
+    let bytes = 0
+    while (stack.length > 0 && out.length < WALK_MAX_FILES && Date.now() < deadline) {
+      const dir = stack.pop()!
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const e of entries) {
+        const p = join(dir, e.name)
+        if (e.isDirectory()) {
+          if (!SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) stack.push(p)
+        } else if (e.isFile() && WEB_EXT.test(e.name)) {
+          try {
+            const size = (await stat(p)).size
+            if (size > WALK_MAX_FILE_BYTES || bytes + size > WALK_MAX_TOTAL_BYTES) continue
+            bytes += size
+            out.push({ path: p, text: await readFile(p, 'utf8') })
+          } catch {
+            // unreadable file, skip
+          }
+          if (out.length >= WALK_MAX_FILES) break
+        }
+      }
+    }
+    return out
+  })()
+  walkCache.set(rootDir, { at: Date.now(), files })
+  return files
+}
+
+async function walkGrep(token: string, rootDir: string): Promise<string[]> {
+  const files = await loadWebFiles(rootDir)
+  const found: string[] = []
+  for (const f of files) {
+    if (f.text.includes(token)) found.push(f.path)
+    if (found.length >= 10) break
+  }
+  return found
 }

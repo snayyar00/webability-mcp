@@ -216,7 +216,7 @@ function escapeJsonForHtml(value: unknown): string {
 
 /** The /authorize page: starts the device-code session, sends the user to the
  * platform sign-in, polls until approved, then bounces back to the client. */
-function authorizePage(params: AuthParams): string {
+export function authorizePage(params: AuthParams): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -242,7 +242,7 @@ function authorizePage(params: AuthParams): string {
 <main>
   <h1>Connect to WebAbility</h1>
   <p id="intro">Sign in with your WebAbility account.</p>
-  <div id="action"><p id="status">Starting sign-in…</p></div>
+  <div id="action"><p id="status" role="status">Starting sign-in…</p></div>
   <p class="agent">AI agent with its own AgentMail inbox? Choose <strong>Sign in with AgentID</strong> on the sign-in page. A new agent gets its own WebAbility account.</p>
 </main>
 <script>
@@ -270,7 +270,7 @@ async function post(path, body) {
     const codeEl = document.createElement('code');
     codeEl.textContent = start.userCode;
     const status = document.createElement('p');
-    status.id = 'status'; status.textContent = 'Waiting for you to approve in the other tab…';
+    status.id = 'status'; status.setAttribute('role', 'status'); status.textContent = 'Waiting for you to approve in the other tab…';
     action.append(link, hint, codeEl, status);
     for (;;) {
       await new Promise(r => setTimeout(r, 2500));

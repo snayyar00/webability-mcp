@@ -140,6 +140,10 @@ export interface OpenSessionOptions {
   setupContext?: (context: any) => Promise<void> | void
 }
 
+export function isBrowserClosedError(err: unknown): boolean {
+  return /Target page, context or browser has been closed/.test((err as Error)?.message ?? '')
+}
+
 export function isHttp2ProtocolError(err: unknown): boolean {
   return /ERR_HTTP2_PROTOCOL_ERROR/.test((err as Error)?.message ?? '')
 }
@@ -151,7 +155,7 @@ export function normalizeScanUrl(url: string): string {
 
 export function createSessionOpener(launch: (o: LaunchOptions) => Promise<any>) {
   return async function openSession(opts: OpenSessionOptions = {}): Promise<BrowserSession> {
-    const build = async (args?: string[]) => {
+    const buildOnce = async (args?: string[]) => {
       const browser = await launch({ remote: opts.remote, ...(args ? { args } : {}) })
       try {
         const context = await browser.newContext(opts.contextOptions)
@@ -161,6 +165,16 @@ export function createSessionOpener(launch: (o: LaunchOptions) => Promise<any>) 
       } catch (err) {
         await browser.close().catch(() => {})
         throw err
+      }
+    }
+    // Chromium can die between launch and the first context on a cold host
+    // ("Target page, context or browser has been closed"). Relaunch once.
+    const build = async (args?: string[]) => {
+      try {
+        return await buildOnce(args)
+      } catch (err) {
+        if (!isBrowserClosedError(err)) throw err
+        return await buildOnce(args)
       }
     }
 

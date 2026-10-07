@@ -66,6 +66,40 @@ test('findSourceCandidates greps the project for selector tokens', async () => {
   assert.deepEqual(await findSourceCandidates('div', root), [])
 })
 
+test('findSourceCandidates still works when ripgrep is not installed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wa-src-norg-'))
+  mkdirSync(join(root, 'src'))
+  mkdirSync(join(root, 'node_modules', 'lib'), { recursive: true })
+  writeFileSync(join(root, 'src', 'Hero.tsx'), 'export const Hero = () => <img className="hero-image" src="x.png" alt="Hero" />\n')
+  writeFileSync(join(root, 'src', 'notes.md'), 'hero-image\n')
+  writeFileSync(join(root, 'node_modules', 'lib', 'x.js'), 'hero-image\n')
+  const savedPath = process.env.PATH
+  process.env.PATH = mkdtempSync(join(tmpdir(), 'wa-empty-path-'))
+  try {
+    const files = await findSourceCandidates('img.hero-image', root)
+    assert.deepEqual(files.map((f) => f.replace(root + '/', '')), ['src/Hero.tsx'])
+  } finally {
+    process.env.PATH = savedPath
+  }
+})
+
+test('without ripgrep, the project is walked once for all tokens and selectors', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wa-src-walk1-'))
+  mkdirSync(join(root, 'src'))
+  writeFileSync(join(root, 'src', 'Hero.tsx'), '<img className="hero-image" id="main-banner" alt="Banner" />\n')
+  const savedPath = process.env.PATH
+  process.env.PATH = mkdtempSync(join(tmpdir(), 'wa-empty-path-'))
+  try {
+    assert.deepEqual((await findSourceCandidates('img.hero-image#main-banner', root)).length, 1)
+    // A file added after the first walk is not seen inside the cache window:
+    // proof the second selector reused the walk instead of re-reading the tree.
+    writeFileSync(join(root, 'src', 'Late.tsx'), '<p className="late-token" />\n')
+    assert.deepEqual(await findSourceCandidates('p.late-token', root), [])
+  } finally {
+    process.env.PATH = savedPath
+  }
+})
+
 test('minified or framework-internal component names are omitted; a pointer with nothing left is dropped', async () => {
   const pw = await import('playwright')
   const browser = await pw.chromium.launch({ headless: true })
