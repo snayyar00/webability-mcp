@@ -1,7 +1,7 @@
 {
   "name": "@webability/mcp",
   "mcpName": "io.github.snayyar00/webability",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "WebAbility MCP server — WCAG 2.2 / ADA / EAA accessibility scanning with three-tier confidence output (issues + incomplete + summary), framework-aware AI fix suggestions, and brand-palette contrast checks. For Cursor, Claude Code, and other IDEs.",
   "type": "module",
   "bin": {
@@ -12,7 +12,6 @@
     "webability-tunnel": "./dist/tunnel-cli.js"
   },
   "scripts": {
-    "prepublishOnly": "node ../scripts/require-pnpm-publish.mjs",
     "build": "tsup src/index.ts src/http.ts src/tunnel-cli.ts --format esm --dts --minify --clean",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/http.ts",
@@ -42,7 +41,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@posthog/mcp": "0.17.0",
-    "@webability/core": "1.5.0",
+    "@webability/core": "1.6.0",
     "axe-core": "^4.11.3",
     "jsdom": "^29.0.2",
     "playwright": "1.59.1",

@@ -22,8 +22,7 @@ export interface PdfIssue {
 
 /** Same penalty ladder as the server's calculateEnhancedScore: errors 5,
  *  warnings 2, notices 1, clamped to 0..100. Tiers: critical/serious → error,
- *  moderate → warning, minor → notice. Violations only — needs-review items
- *  never reach the PDF. */
+ *  moderate → warning, minor → notice. Violations only. */
 export function localScore(issues: PdfIssue[]): number {
   let score = 100
   for (const i of issues) {

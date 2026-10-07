@@ -49,7 +49,6 @@ export interface ScanEventSummary {
   serious?: number
   moderate?: number
   minor?: number
-  incomplete?: number
 }
 
 /**

@@ -235,6 +235,7 @@ function authorizePage(params: AuthParams): string {
          background: #1c1f26; font-size: 1.1rem; letter-spacing: 0.1em; }
   #status { margin-top: 1.5rem; font-size: 0.9rem; color: #9aa0a6; }
   .err { color: #f28b82; }
+  .agent { margin-top: 2rem; font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -242,6 +243,7 @@ function authorizePage(params: AuthParams): string {
   <h1>Connect to WebAbility</h1>
   <p id="intro">Sign in with your WebAbility account.</p>
   <div id="action"><p id="status">Starting sign-in…</p></div>
+  <p class="agent">AI agent with its own AgentMail inbox? Choose <strong>Sign in with AgentID</strong> on the sign-in page. A new agent gets its own WebAbility account.</p>
 </main>
 <script>
 const AUTH = ${escapeJsonForHtml(params)};

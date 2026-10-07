@@ -1,0 +1,150 @@
+name: Publish
+
+# Publishes @webability/mcp to npm, then server.json to the MCP registry, then
+# creates a GitHub release, whenever master carries a version that is not yet
+# published. This repo is a generated mirror: do not edit by hand.
+#
+# Auth, no tokens stored:
+# - npm: Trusted Publishing (OIDC). One-time setup on npmjs.com, package
+#   @webability/mcp -> Settings -> Trusted Publisher -> GitHub Actions,
+#   owner snayyar00, repository webability-mcp, workflow publish.yml.
+# - MCP registry: `mcp-publisher login github-oidc` (namespace io.github.snayyar00).
+# - Release: the workflow GITHUB_TOKEN.
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      name: ${{ steps.meta.outputs.name }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          set -euo pipefail
+          echo "name=$(jq -r .name package.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+          echo "core=$(jq -r '.dependencies["@webability/core"]' package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version is already on npm
+        id: check
+        run: |
+          set -euo pipefail
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
+            echo "already on npm, nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # core is published from the private repo in the same release. Wait for it.
+      - name: Wait for the pinned @webability/core
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          core="@webability/core@${{ steps.meta.outputs.core }}"
+          for i in $(seq 1 30); do
+            if npm view "$core" version >/dev/null 2>&1; then
+              echo "$core is on npm"
+              exit 0
+            fi
+            echo "waiting for $core ($i/30)"
+            sleep 20
+          done
+          echo "::error::$core is not on npm after 10 minutes. Publish core first, then re-run this workflow."
+          exit 1
+
+      - uses: pnpm/action-setup@v4
+        if: steps.check.outputs.publish == 'true'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.publish == 'true'
+        with:
+          node-version: 22
+          # No registry-url: its placeholder NODE_AUTH_TOKEN blocks the
+          # Trusted Publishing (OIDC) exchange.
+
+      # Trusted Publishing needs npm >= 11.5.1 and Node >= 22.14.
+      - name: Install npm 11
+        if: steps.check.outputs.publish == 'true'
+        run: npm install -g npm@^11.5.1
+
+      - name: Install, build, test
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
+          pnpm test
+
+      - name: Refuse a package that misses a bin file
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          for f in $(jq -r '.bin | .[]' package.json | sort -u); do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+
+      - name: Publish with provenance
+        if: steps.check.outputs.publish == 'true'
+        run: npm publish --access public --provenance
+
+  registry:
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish server.json if this version is new
+        run: |
+          set -euo pipefail
+          name=$(jq -r .name server.json)
+          version=$(jq -r .version server.json)
+          if curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=$name" \
+               | jq -e --arg v "$version" --arg n "$name" '.servers[] | select(.server.name == $n and .server.version == $v)' >/dev/null; then
+            echo "$name $version already in the MCP registry, skip"
+            exit 0
+          fi
+          curl -fsSL https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz \
+            | tar -xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
+
+  release:
+    needs: [npm, registry]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the GitHub release if it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ needs.npm.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists, skip"
+            exit 0
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes

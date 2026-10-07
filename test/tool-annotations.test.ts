@@ -46,5 +46,7 @@ test('tools that create something, spend credit, or send page content are not re
   // start_audit: creates a server-side job (credit). generate_report_pdf:
   // writes a file and posts findings to the API. generate_ai_fix /
   // visual_audit: send an HTML snippet / screenshot to a third-party model.
-  assert.deepEqual(writes, ['generate_ai_fix', 'generate_report_pdf', 'start_audit', 'visual_audit'])
+  // add_site: adds a site to the account. create_upgrade_link: creates a
+  // Stripe Checkout session.
+  assert.deepEqual(writes, ['add_site', 'create_upgrade_link', 'generate_ai_fix', 'generate_report_pdf', 'start_audit', 'visual_audit'])
 })

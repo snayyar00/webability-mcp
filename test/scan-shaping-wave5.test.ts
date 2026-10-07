@@ -51,22 +51,17 @@ test('merge guard holds: two svg_missing_name rows on one shared selector stay t
   assert.equal(out.length, 3)
 })
 
-test('4.1.1-only findings move from issues to needs-review with the reason, and are counted', () => {
-  const fn = (shaping as any).demoteObsoleteParsing
-  assert.equal(typeof fn, 'function', 'scanShaping must export demoteObsoleteParsing')
+test('4.1.1-only findings are dropped, and counted', () => {
+  const fn = (shaping as any).dropObsoleteParsing
+  assert.equal(typeof fn, 'function', 'scanShaping must export dropObsoleteParsing')
   const issues = [
     { id: 'wa-duplicate_id-1', impact: 'moderate', wcag: '4.1.1', type: 'duplicate_id', selector: 'svg > g' },
     { id: 'htmlcs-f77-1', impact: 'moderate', wcag: '4.1.1', type: 'f77', selector: 'a > svg > g' },
     { id: 'axe-duplicate-id-aria-1', impact: 'critical', wcag: '4.1.2', type: 'duplicate-id-aria', selector: '#lbl' },
     { id: 'wa-missing_alt-1', impact: 'serious', wcag: '1.1.1', type: 'missing_alt', selector: 'img' },
   ]
-  const incomplete = [{ id: 'x', impact: 'moderate', wcag: '1.4.3', type: 'contrast_insufficient', selector: 'p' }]
-  const r = fn(issues, incomplete)
+  const r = fn(issues)
   assert.deepEqual(r.issues.map((i: any) => i.type), ['duplicate-id-aria', 'missing_alt'], 'duplicate-id-aria is 4.1.2 and stays')
-  assert.deepEqual(r.incomplete.map((i: any) => i.type).sort(), ['contrast_insufficient', 'duplicate_id', 'f77'])
-  assert.equal(r.demoted, 2)
-  for (const i of r.incomplete.filter((x: any) => x.wcag === '4.1.1')) {
-    assert.match(i.reviewReason, /4\.1\.1.*obsolete/i)
-    assert.equal(i.confidence, 'needs_review')
-  }
+  assert.equal(r.dropped, 2)
+  assert.equal(r.incomplete, undefined)
 })

@@ -64,13 +64,13 @@ test('default format: same headline and counts as json', async () => {
 test('scanHeadline (pure): zero issues, no grouping clause; singular noun', async () => {
   const shaping: any = await import('../src/scanShaping.ts')
   assert.equal(typeof shaping.scanHeadline, 'function', 'scanShaping must export scanHeadline')
-  const zero = { total: 0, critical: 0, serious: 0, moderate: 0, minor: 0, incomplete: 0 }
-  const h0 = shaping.scanHeadline({ url: 'https://x.test/', shown: zero, issueEntries: 0, incompleteEntries: 0, collapsedGroups: 0 })
+  const zero = { total: 0, critical: 0, serious: 0, moderate: 0, minor: 0 }
+  const h0 = shaping.scanHeadline({ url: 'https://x.test/', shown: zero, issueEntries: 0, collapsedGroups: 0 })
   assert.match(h0, /^Found 0 high-confidence issues on https:\/\/x\.test\/: 0 critical/)
   assert.match(h0, /Total to report: 0 issues/)
   assert.doesNotMatch(h0, /grouped|need human review/)
   const one = { ...zero, total: 1, serious: 1 }
-  const h1 = shaping.scanHeadline({ url: 'https://x.test/', shown: one, issueEntries: 1, incompleteEntries: 0, collapsedGroups: 0 })
+  const h1 = shaping.scanHeadline({ url: 'https://x.test/', shown: one, issueEntries: 1, collapsedGroups: 0 })
   assert.match(h1, /^Found 1 high-confidence issue on /)
   assert.match(h1, /Total to report: 1 issue\b/)
 })

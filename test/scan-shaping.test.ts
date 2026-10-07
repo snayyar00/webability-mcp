@@ -96,7 +96,7 @@ test('merge folds a stored merged entry and a fresh duplicate without losing rul
 
 test('recountSummary counts the merged list', () => {
   const issues = mergeSameElement(vercelInput())
-  assert.deepEqual(recountSummary(issues, [{ impact: 'minor' }]), { total: 2, critical: 0, serious: 1, moderate: 1, minor: 0, incomplete: 1 })
+  assert.deepEqual(recountSummary(issues), { total: 2, critical: 0, serious: 1, moderate: 1, minor: 0 })
 })
 
 test('filterIssues rules[] matches a merged-in rule id', () => {
@@ -142,10 +142,10 @@ test('compact output prints the true instance count for a collapsed entry', () =
 })
 
 test('truncation note: hosted never points at scan_history; local may', () => {
-  const remote = truncationNote({ remote: true, cap: 50, returned: 50, total: 64, incompleteReturned: 13, incompleteTotal: 13, stratified: false })
+  const remote = truncationNote({ remote: true, cap: 50, returned: 50, total: 64, stratified: false })
   assert.doesNotMatch(remote, /scan_history/)
   for (const hint of ['minImpact', 'rules', 'wcag', 'format: "compact"', 'rootSelector', 'start_audit']) assert.ok(remote.includes(hint), hint)
-  const local = truncationNote({ remote: false, cap: 50, returned: 50, total: 64, incompleteReturned: 13, incompleteTotal: 13, stratified: false })
+  const local = truncationNote({ remote: false, cap: 50, returned: 50, total: 64, stratified: false })
   assert.match(local, /scan_history/)
 })
 

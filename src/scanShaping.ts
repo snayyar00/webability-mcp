@@ -118,14 +118,13 @@ export function mergeSameElement<T extends Shaped>(list: readonly T[]): T[] {
 }
 
 /** Severity counts for a (merged) result — the summary must match the list. */
-export function recountSummary(issues: readonly Shaped[], incomplete: readonly Shaped[]) {
-  const s = { total: 0, critical: 0, serious: 0, moderate: 0, minor: 0, incomplete: 0 }
+export function recountSummary(issues: readonly Shaped[]) {
+  const s = { total: 0, critical: 0, serious: 0, moderate: 0, minor: 0 }
   for (const i of issues) {
     const n = i.count ?? 1
     s.total += n
     if (i.impact === 'critical' || i.impact === 'serious' || i.impact === 'moderate' || i.impact === 'minor') s[i.impact] += n
   }
-  for (const i of incomplete) s.incomplete += i.count ?? 1
   return s
 }
 
@@ -189,17 +188,14 @@ export function collapseRepeats<T extends Shaped>(list: readonly T[], controls: 
   return { list: out, collapsedGroups }
 }
 
-export function truncationNote(o: { remote: boolean; cap: number; returned: number; total: number; incompleteReturned: number; incompleteTotal: number; stratified: boolean }): string {
+export function truncationNote(o: { remote: boolean; cap: number; returned: number; total: number; stratified: boolean }): string {
   const head =
     ` NOTE: each list is capped at ${o.cap} entries, highest severity first (criticals are never dropped${o.stratified ? '; every issue type keeps at least one entry' : ''})` +
-    ` — showing ${o.returned}/${o.total} issue entries and ${o.incompleteReturned}/${o.incompleteTotal} needs-review entries.`
+    ` — showing ${o.returned}/${o.total} issue entries.`
   return o.remote
     ? head + ' To see the rest, narrow the scan: minImpact (e.g. "serious"), rules [...] or wcag [...], rootSelector for one region of the page, and format: "compact" for fewer tokens per finding. For a full report of the whole site, use start_audit.'
     : head + ' Retrieve the FULL untruncated set via `scan_history` (pass this scan\'s id), or narrow with minImpact / rules / wcag / rootSelector, or use format: "compact".'
 }
-
-export const OBSOLETE_PARSING_REASON =
-  'WCAG 4.1.1 Parsing is obsolete in WCAG 2.2 and always satisfied for HTML, so this is not a conformance failure. A duplicate id only harms users when a label for= / aria-labelledby / aria-describedby reference resolves to the wrong element — those cases are reported under 1.3.1 / 4.1.2. Rename the id if a reference points at it; otherwise this is cleanup.'
 
 const onlyParsing = (wcag: string | undefined) => {
   const c = String(wcag ?? '').split(/[,\s]+/).filter(Boolean)
@@ -207,20 +203,16 @@ const onlyParsing = (wcag: string | undefined) => {
 }
 
 /**
- * Move findings whose only criterion is 4.1.1 (duplicate_id, HTML_CodeSniffer
- * f77, axe duplicate-id / duplicate-id-active) from issues to needs-review,
- * with the reason. axe duplicate-id-aria is tagged 4.1.2 and stays an issue.
+ * Drop findings whose only criterion is 4.1.1 (duplicate_id, HTML_CodeSniffer
+ * f77, axe duplicate-id / duplicate-id-active). WCAG 4.1.1 Parsing is obsolete
+ * in WCAG 2.2 and always satisfied for HTML; a duplicate id only harms users
+ * when a label/aria reference resolves to the wrong element, and those cases
+ * are reported under 1.3.1 / 4.1.2. axe duplicate-id-aria is tagged 4.1.2 and
+ * stays an issue.
  */
-export function demoteObsoleteParsing<T extends Shaped & { confidence?: string; reviewReason?: string }>(issues: readonly T[], incomplete: readonly T[]): { issues: T[]; incomplete: T[]; demoted: number } {
-  const keep: T[] = []
-  const moved: T[] = []
-  for (const i of issues) (onlyParsing(i.wcag) ? moved : keep).push(i)
-  const tag = (i: T): T => ({ ...i, confidence: 'needs_review', reviewReason: OBSOLETE_PARSING_REASON })
-  return {
-    issues: keep,
-    incomplete: [...incomplete.map((i) => (onlyParsing(i.wcag) ? tag(i) : i)), ...moved.map(tag)],
-    demoted: moved.length,
-  }
+export function dropObsoleteParsing<T extends Shaped>(issues: readonly T[]): { issues: T[]; dropped: number } {
+  const keep = issues.filter((i) => !onlyParsing(i.wcag))
+  return { issues: keep, dropped: issues.length - keep.length }
 }
 
 export type SeveritySummary = ReturnType<typeof recountSummary>
@@ -245,7 +237,6 @@ export function scanHeadline(o: {
   /** Filter description, e.g. "rules=[missing_alt]". */
   filters?: string
   issueEntries: number
-  incompleteEntries: number
   collapsedGroups: number
 }): string {
   const s = o.shown
@@ -253,22 +244,17 @@ export function scanHeadline(o: {
   let text =
     `Found ${plural(s.total, 'high-confidence issue', 'high-confidence issues')}${matching} on ${o.url}: ` +
     `${s.critical} critical, ${s.serious} serious, ${s.moderate} moderate, ${s.minor} minor.`
-  if (s.incomplete > 0) {
-    text += ` ${s.incomplete} additional finding(s)${o.page ? ' matching the filters' : ''} need human review (gradient backgrounds, marketing imagery, etc.) — see \`incomplete[]\`. Do NOT auto-fix these.`
-  }
   if (o.page) {
     text +=
-      ` Whole page, before filters: ${plural(o.page.total, 'issue', 'issues')} and ${o.page.incomplete} needing review — that is the total to report.` +
+      ` Whole page, before filters: ${plural(o.page.total, 'issue', 'issues')} — that is the total to report.` +
       ' `summary` counts the filtered set; `pageSummary` counts the whole page.'
   } else {
     text += ` Total to report: ${plural(s.total, 'issue', 'issues')} (one per affected element and problem).`
   }
   const issuesGrouped = o.issueEntries < s.total
-  const reviewGrouped = o.incompleteEntries < s.incomplete
-  if (o.collapsedGroups > 0 && (issuesGrouped || reviewGrouped)) {
+  if (o.collapsedGroups > 0 && issuesGrouped) {
     const parts: string[] = []
     if (issuesGrouped) parts.push(`the ${plural(s.total, 'issue is', 'issues are')} grouped into ${o.issueEntries} entries in issues[]`)
-    if (reviewGrouped) parts.push(`the ${s.incomplete} needs-review finding(s) into ${o.incompleteEntries} entries in incomplete[]`)
     const joined = parts.join('; ')
     text +=
       ` Listing: ${joined} — ${o.collapsedGroups} rule(s) repeat with the same fix and are listed once with \`count\`.` +

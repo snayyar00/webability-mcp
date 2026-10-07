@@ -293,8 +293,8 @@ type IssueLike = Pick<ScanIssue, 'type'> & Partial<Pick<ScanIssue, 'fix' | 'conf
  * attribute exists, whether removal was meant, whether it is a text/element
  * insertion); the rule table is the fallback. The tier is the stricter of the
  * rule tier and what the payload admits: a visual rule stays visual even with
- * a proposed value, and a value the engine could not compute (needsManualReview,
- * or a needs_review confidence) can never be mechanical.
+ * a proposed value, and a value the engine could not compute (needsManualReview)
+ * can never be mechanical.
  */
 export function structuredFix(issue: IssueLike): StructuredFix {
   const type = String(issue.type ?? '')
@@ -308,7 +308,7 @@ export function structuredFix(issue: IssueLike): StructuredFix {
 
   const attribute = f.attribute
   const value = typeof f.suggestedValue === 'string' && f.suggestedValue.length > 0 ? f.suggestedValue : undefined
-  const valueUnknown = f.needsManualReview || value === undefined || issue.confidence === 'needs_review'
+  const valueUnknown = f.needsManualReview || value === undefined
 
   let op: FixOp
   let attr: string | undefined = attribute

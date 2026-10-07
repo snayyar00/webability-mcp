@@ -7,13 +7,23 @@
  *   rules[]     allow-list of rule ids (WebAbility type or axe rule id)
  *   wcag[]      allow-list of criteria; a prefix selects the guideline ("1.4") or principle ("1")
  *   format      'json' (default) | 'compact' — one line per element, rule metadata printed once
+ *   level       'A' | 'AA' (default) | 'AAA' — highest WCAG level reported. AAA
+ *               criteria are not reported unless the caller asks: level "AAA",
+ *               or a wcag[] entry naming one AAA criterion exactly ("3.2.5").
  */
+import { getWcagLevel, issueLevel } from '@webability/core'
 
 export type Impact = 'critical' | 'serious' | 'moderate' | 'minor'
 const IMPACTS: Impact[] = ['critical', 'serious', 'moderate', 'minor']
 const RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, minor: 1 }
 
+export type Level = 'A' | 'AA' | 'AAA'
+const LEVELS: Level[] = ['A', 'AA', 'AAA']
+const LEVEL_RANK: Record<Level, number> = { A: 1, AA: 2, AAA: 3 }
+
 export interface OutputControls {
+  /** Highest WCAG level the caller asked for; undefined = AA default. */
+  level?: Level
   minImpact?: Impact
   rules?: Set<string>
   wcag?: Set<string>
@@ -24,6 +34,7 @@ export interface OutputControls {
 
 /** JSON-schema fragment every scan tool spreads into its `properties`. */
 export const OUTPUT_CONTROL_PROPERTIES = {
+  level: { type: 'string', enum: LEVELS, description: 'Highest WCAG conformance level to report. Default "AA" — Level AAA criteria are not reported. Pass "AAA" to include them (naming one AAA criterion in `wcag`, e.g. "3.2.5", also includes it).' },
   minImpact: { type: 'string', enum: IMPACTS, description: 'Only findings at this severity or above (critical > serious > moderate > minor)' },
   rules: { type: 'array', items: { type: 'string' }, description: 'Only these rule ids (WebAbility type such as "missing_alt" or axe rule id such as "image-alt"). See get_rules.' },
   wcag: { type: 'array', items: { type: 'string' }, description: 'Only these WCAG criteria. A prefix selects the whole guideline ("1.4") or principle ("2").' },
@@ -37,8 +48,22 @@ export function parseOutputControls(args: Record<string, unknown> | undefined): 
   const formatExplicit = a.format !== undefined && a.format !== null
   const format = (a.format as string | undefined) ?? 'json'
   if (format !== 'json' && format !== 'compact') throw new Error('format must be "json" or "compact"')
+  const level = a.level as string | undefined
+  if (level !== undefined && level !== null && !LEVELS.includes(level as Level)) throw new Error(`level must be one of ${LEVELS.join(' | ')}`)
   const list = (v: unknown) => (Array.isArray(v) && v.length ? new Set(v.map((x) => String(x).trim()).filter(Boolean)) : undefined)
-  return { ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format, formatExplicit }
+  return { ...(level ? { level: level as Level } : {}), ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format, formatExplicit }
+}
+
+/** AAA criteria the caller named exactly in wcag[] (a prefix like "2.4" never opts in). */
+const namedAaa = (c: OutputControls): Set<string> => new Set([...(c.wcag ?? [])].filter((w) => /^\d+\.\d+\.\d+$/.test(w) && getWcagLevel(w) === 'AAA'))
+
+/**
+ * The level to ask the scanner for. Default AA; AAA when the caller passed
+ * level "AAA", named an AAA criterion in wcag[], or an axe "wcag2aaa" tag.
+ */
+export function scanLevel(c: OutputControls, axeTags?: readonly string[]): Level {
+  if (c.level === 'AAA' || namedAaa(c).size > 0 || (axeTags ?? []).includes('wcag2aaa')) return 'AAA'
+  return c.level ?? 'AA'
 }
 
 export interface IssueRow {
@@ -76,7 +101,13 @@ const matchesWcag = (criteria: string | undefined, wanted: Set<string>) => {
 }
 
 export function filterIssues<T extends IssueRow>(list: readonly T[], c: OutputControls): T[] {
+  const max = LEVEL_RANK[c.level ?? 'AA']
+  const aaaNamed = namedAaa(c)
   return list.filter((i) => {
+    // Level gate: above the asked level is out, except an AAA criterion the
+    // caller named in wcag[] (that request is the opt-in for it).
+    const lvl = issueLevel({ wcag: i.wcag ?? '', level: (i as { level?: Level }).level })
+    if (LEVEL_RANK[lvl] > max && !(lvl === 'AAA' && String(i.wcag ?? '').split(/[,\s]+/).some((w) => aaaNamed.has(w)))) return false
     if (c.minImpact && (RANK[i.impact ?? ''] ?? 0) < RANK[c.minImpact]) return false
     if (c.rules && !c.rules.has(String(i.type ?? '')) && !(i.rules ?? []).some((r) => c.rules!.has(r))) return false
     if (c.wcag && !matchesWcag(i.wcag, c.wcag)) return false
@@ -85,11 +116,11 @@ export function filterIssues<T extends IssueRow>(list: readonly T[], c: OutputCo
 }
 
 /** True when any control narrows the list — used to label filtered totals. */
-export const isFiltered = (c: OutputControls) => Boolean(c.minImpact || c.rules || c.wcag)
+export const isFiltered = (c: OutputControls) => Boolean(c.minImpact || c.rules || c.wcag || c.level === 'A')
 
 /** The active filters as "minImpact=serious rules=[a,b]" ('' when none). */
 export function controlsList(c: OutputControls): string {
-  return [c.minImpact ? `minImpact=${c.minImpact}` : '', c.rules ? `rules=[${[...c.rules].join(',')}]` : '', c.wcag ? `wcag=[${[...c.wcag].join(',')}]` : ''].filter(Boolean).join(' ')
+  return [c.level && c.level !== 'AA' ? `level=${c.level}` : '', c.minImpact ? `minImpact=${c.minImpact}` : '', c.rules ? `rules=[${[...c.rules].join(',')}]` : '', c.wcag ? `wcag=[${[...c.wcag].join(',')}]` : ''].filter(Boolean).join(' ')
 }
 
 export function describeControls(c: OutputControls): string {
@@ -152,7 +183,7 @@ function formatSourceInline(s: NonNullable<IssueRow['source']>): string {
  */
 export const INLINE_BUDGET = 24_000
 
-const LIST_KEYS = new Set(['issues', 'incomplete', 'new', 'fixed', 'remaining'])
+const LIST_KEYS = new Set(['issues', 'new', 'fixed', 'remaining'])
 
 /** Elements per rule id over a list (a collapsed entry counts its `count`). */
 export function countByRule(list: readonly IssueRow[]): Record<string, number> {
@@ -195,7 +226,7 @@ export function renderFindingsBlock(
   controls: OutputControls,
   payload: Record<string, unknown>,
   compactLists: CompactList[],
-  fullLists?: { issues: readonly IssueRow[]; incomplete?: readonly IssueRow[] },
+  fullLists?: { issues: readonly IssueRow[] },
 ): { type: 'text'; text: string } {
   const sections = () => compactLists.map((l) => `${compactHeading(l)}\n${compactText(l.items)}`).join('\n\n')
   if (controls.format === 'compact') return { type: 'text', text: sections() }
@@ -206,7 +237,6 @@ export function renderFindingsBlock(
   for (const [k, v] of Object.entries(payload)) if (!LIST_KEYS.has(k)) summary[k] = v
   if (fullLists) {
     summary.byRule = countByRule(fullLists.issues)
-    if (fullLists.incomplete) summary.incompleteByRule = countByRule(fullLists.incomplete)
   }
   const head =
     `Output: compact — the full JSON is ${json.length.toLocaleString('en-US')} chars, over the inline budget of ${INLINE_BUDGET.toLocaleString('en-US')}. ` +

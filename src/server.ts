@@ -26,11 +26,12 @@ import { enablePostHogMcpAnalytics } from './posthog.js'
 import { MCP_VERSION } from './version.js'
 import { generateReportPdf, type PdfIssue } from './reportPdf.js'
 import { axeRuleFixMeta, enrichIssue, webabilityRuleFixMeta, FIXABILITY_TIERS, type Fixability } from './fixOps.js'
-import { INLINE_BUDGET, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, type OutputControls } from './outputControls.js'
+import { INLINE_BUDGET, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
-import { collapseRepeats, demoteObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote } from './scanShaping.js'
+import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote } from './scanShaping.js'
 import { fastScanHtml } from './fastScan.js'
 import { openSession } from './browser.js'
+import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
 
@@ -252,7 +253,7 @@ async function scanWithSourcePointers(
   const scanOpenPage = async (page: any, mainStatus?: number) => {
     const result = await scan(page, { ...scanOptions, mainStatus } as any)
     if (result.blocked) return { result, pointers: {} }
-    const pointers = await collectSourcePointers(page, [...result.issues, ...result.incomplete].map((i) => i.selector))
+    const pointers = await collectSourcePointers(page, result.issues.map((i) => i.selector))
     // The SAME function detect_framework calls, read from the page the scan
     // just used, so the two tools cannot disagree.
     let framework: PageStack | undefined
@@ -384,7 +385,7 @@ function buildInstructions(isLite: boolean): string {
   const edition = isLite
     ? `This is **WebAbility MCP Lite** (local, free, no account). Scan / fix / verify / report-PDF run on this machine.
 \`visual_audit\`, \`start_audit\`, and \`get_audit\` are listed so you know they exist — they are **free with a WebAbility account** on hosted Full at ${HOSTED_MCP_URL} (dashboard / Smithery: ${SMITHERY_INSTALL}). When the user needs vision or a compliance report, tell them to connect Full (still free; a free account is all it needs). To sign in from this machine, run \`webability login\` (from \`@webability/cli\`).`
-    : `This is **WebAbility MCP** (hosted Full). Free for everyone. Scan and check tools work with no account or key, under fair-use limits per IP. A free WebAbility account unlocks \`visual_audit\`, \`start_audit\` and \`get_audit\`; called without one, they return the sign-in steps for each client.`
+    : `This is **WebAbility MCP** (hosted Full). Free for everyone. Scan and check tools work with no account or key, under fair-use limits per IP. A free WebAbility account unlocks \`visual_audit\`, \`start_audit\` and \`get_audit\`; called without one, they return the sign-in steps for each client. An AI agent with its own AgentMail inbox can sign itself up: choose "Sign in with AgentID" on the WebAbility sign-in page. A signed-in agent can then set up a site with no human: \`add_site\`, \`get_install_snippet\`, and \`create_upgrade_link\` (a payment link it gives to its owner); \`list_sites\` shows each plan.`
 
   const routingExtra = isLite
     ? `- Vision / compliance report → \`visual_audit\` / \`start_audit\` (listed as Full stubs here; free with account on hosted Full at ${HOSTED_MCP_URL})
@@ -404,12 +405,10 @@ ${edition}
 - HTML_CodeSniffer (200+ rules)
 Results from all three are deduplicated into one issue list.
 
-## Three-tier output (since v1.2.1, mirrors axe-core)
-\`scan_page\` and \`flow_scan\` return (\`scan_html\` is axe-only and returns raw violations):
-- **issues**: high-confidence violations — safe to act on
-- **incomplete**: needs human review — DO NOT auto-fix these. Common causes: contrast against gradient/image backgrounds, marketing-image alt text, framer-motion pre-animation states.
-- **summary**: counts by severity + an \`incomplete\` count
-When proposing fixes to the user, treat \`incomplete\` items as questions, not bugs.
+## Output (the scanner judges uncertain findings itself)
+\`scan_page\` and \`flow_scan\` return:
+- **issues**: violations the scanner stands behind. A finding it cannot judge is resolved to a verdict (e.g. contrast on a gradient is measured from rendered pixels) or dropped.
+- **summary**: counts by severity
 
 ## Structured fixes (since v1.6.0)
 Every issue carries \`fix.op\` from a closed set — \`add-attribute\`, \`set-attribute\`, \`remove-attribute\`, \`add-element\`, \`remove-element\`, \`add-text-content\`, \`suggest\` — plus \`fix.attribute\` / \`fix.value\` when known, and a top-level \`fixability\`:
@@ -459,7 +458,7 @@ const REMOTE_LOCALHOST_CAVEAT =
 const ALL_TOOLS = [
     {
       name: 'scan_page',
-      description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns the three-tier shape: `issues` (high-confidence violations safe to fix), `incomplete` (needs human review — gradient backgrounds, marketing imagery, axe-incomplete results, framer-motion pre-animation states), and a `summary`. Treat `incomplete` as questions, never auto-fix them. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
+      description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns `issues` (violations the scanner stands behind; uncertain findings are judged or dropped, never listed for review) and a `summary`. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -474,7 +473,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'verify_fix',
-      description: 'Re-scan a specific element after applying an accessibility fix and confirm the violation is gone — closes the loop that find-only tools leave open. After you edit the code and serve it (deployed, staging, or http://localhost:3000), call this with the URL and the selector you fixed to get a machine-checked verified: true|false (DOM engines only — visual_audit findings and needs-review items are out of scope). Pass the WCAG criterion (e.g. "1.1.1") or axe rule id (e.g. "color-contrast") to check just that criterion; omit it to require the element be clean of ALL violations. A blocked page (bot-challenge / HTTP error) is reported as unverified, never a pass — verification fails closed. If the selector matches no element, the result is verified: false with reason "not-found" — pass the element\'s current selector, or re-run scan_page if your fix removed the element. Pair with scan_page → generate_ai_fix → verify_fix for a full find-fix-verify cycle.',
+      description: 'Re-scan a specific element after applying an accessibility fix and confirm the violation is gone — closes the loop that find-only tools leave open. After you edit the code and serve it (deployed, staging, or http://localhost:3000), call this with the URL and the selector you fixed to get a machine-checked verified: true|false (DOM engines only — visual_audit findings are out of scope). Pass the WCAG criterion (e.g. "1.1.1") or axe rule id (e.g. "color-contrast") to check just that criterion; omit it to require the element be clean of ALL violations. A blocked page (bot-challenge / HTTP error) is reported as unverified, never a pass — verification fails closed. If the selector matches no element, the result is verified: false with reason "not-found" — pass the element\'s current selector, or re-run scan_page if your fix removed the element. Pair with scan_page → generate_ai_fix → verify_fix for a full find-fix-verify cycle.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -488,7 +487,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'diff_scan',
-      description: 'Compare two scans of the same page and report what changed: `fixed[]` (in the baseline, gone now), `new[]` (regressions — not in the baseline, present now), `remaining[]` (still there). Page-level complement to verify_fix (one element). Baseline is a scan_history id (`baselineId`, local installs) or a live scan of `baselineUrl`; current is `url` (scanned live now) or another history id (`currentId`). Findings are matched by issue id (rule + element), so a changed class/id on a fixed element reads as fixed AND new — check `new[]` before calling it a regression. Needs-review findings are diffed separately (`incompleteResolved` / `incompleteNew`) and never counted as fixed. Typical loop: scan_page → edit → diff_scan(baselineId=<that scan id>, url=<same url>) → confirm new[] is empty.',
+      description: 'Compare two scans of the same page and report what changed: `fixed[]` (in the baseline, gone now), `new[]` (regressions — not in the baseline, present now), `remaining[]` (still there). Page-level complement to verify_fix (one element). Baseline is a scan_history id (`baselineId`, local installs) or a live scan of `baselineUrl`; current is `url` (scanned live now) or another history id (`currentId`). Findings are matched by issue id (rule + element), so a changed class/id on a fixed element reads as fixed AND new — check `new[]` before calling it a regression. Typical loop: scan_page → edit → diff_scan(baselineId=<that scan id>, url=<same url>) → confirm new[] is empty.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -519,6 +518,39 @@ const ALL_TOOLS = [
       },
     },
     {
+      name: 'add_site',
+      description: 'Add a website to the signed-in WebAbility account. The site gets the full widget for its first 30 days and a first scan. Returns the site id and plan tier. Next: put the get_install_snippet tag on the site, and use create_upgrade_link to get a payment link for the WebAbility Pro plan. Needs a free WebAbility account (an AI agent can sign itself up with "Sign in with AgentID").',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          url: { type: 'string', description: 'The site to add, for example https://shop.example.com. One domain per site.' },
+        },
+        required: ['url'],
+      },
+    },
+    {
+      name: 'list_sites',
+      description: 'List the sites on the signed-in WebAbility account with each site id, plan tier and the date the current plan ends. Use it to check that a payment activated WebAbility Pro on a site. Needs a free WebAbility account.',
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    {
+      name: 'get_install_snippet',
+      description: 'Get the one-line script tag that installs the WebAbility accessibility widget. Put it in the <head> or before </body> of every page of a site added with add_site. The widget finds the site by its domain, so the same tag works on every site. No account needed.',
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    {
+      name: 'create_upgrade_link',
+      description: 'Get a Stripe Checkout link that puts one site on the WebAbility Pro plan (the widget subscription). Give the link to the human who pays (your owner). When they pay, the plan activates on that site automatically; check with list_sites. You never handle card details. The site must be on the account (add_site first). Needs a free WebAbility account.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          domain: { type: 'string', description: 'The site to upgrade, as added with add_site (for example shop.example.com)' },
+          billing_interval: { type: 'string', enum: ['monthly', 'yearly'], description: 'Billing period. Default monthly.' },
+        },
+        required: ['domain'],
+      },
+    },
+    {
       name: 'get_audit',
       description: 'Check an audit started with start_audit: returns overall status, per-step progress (scan → viewports → screenshots → agent → excel → publish), and — once complete — a severity summary plus short-lived download URLs for the report (JSON) and the Excel workbook. Poll every ~15s while status is pending/running. Only the account that started an audit can read it. Free with a WebAbility account.',
       inputSchema: {
@@ -531,7 +563,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'flow_scan',
-      description: 'Scan a multi-page user journey. Walks startUrl plus the required `autoNavigate` URLs sequentially (deterministic — one page fully rendered and scanned before the next), then returns ONE consolidated report with issues deduplicated across pages, each carrying the same fix payload / confidence / review flags as scan_page. Every requested URL gets an explicit outcome in `pages[]` (scanned / nav_failed / scan_failed / redirected_duplicate / duplicate_request / skipped_cap / blocked — bot-challenge, not a clean page) — a page is never silently dropped. Better than per-page scans for journeys (login → checkout etc). For a single page, use scan_page.',
+      description: 'Scan a multi-page user journey. Walks startUrl plus the required `autoNavigate` URLs sequentially (deterministic — one page fully rendered and scanned before the next), then returns ONE consolidated report with issues deduplicated across pages, each carrying the same fix payload as scan_page. Every requested URL gets an explicit outcome in `pages[]` (scanned / nav_failed / scan_failed / redirected_duplicate / duplicate_request / skipped_cap / blocked — bot-challenge, not a clean page) — a page is never silently dropped. Better than per-page scans for journeys (login → checkout etc). For a single page, use scan_page.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -599,7 +631,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'scan_html',
-      description: 'Scan a raw HTML snippet or component markup without serving it — IN-PROCESS by default (jsdom + WebAbility detectors + axe-core): milliseconds, no browser, no network, so it fits inside a tight edit loop. Fragments are auto-wrapped into a document. Returns scan_page\'s three-tier shape (issues / incomplete / summary) with `fix.op` + `fixability` on every finding. jsdom has no layout, so visual-tier rules (contrast, target size, focus ring) are NOT evaluated — the dropped count is reported as `skippedVisual`; pass `engine: "browser"` to run the axe-core headless-browser path for those (slower, axe rules only, returns axe `violations`).',
+      description: 'Scan a raw HTML snippet or component markup without serving it — IN-PROCESS by default (jsdom + WebAbility detectors + axe-core): milliseconds, no browser, no network, so it fits inside a tight edit loop. Fragments are auto-wrapped into a document. Returns scan_page\'s shape (issues / summary) with `fix.op` + `fixability` on every finding. jsdom has no layout, so visual-tier rules (contrast, target size, focus ring) are NOT evaluated — the dropped count is reported as `skippedVisual`; pass `engine: "browser"` to run the axe-core headless-browser path for those (slower, axe rules only, returns axe `violations`).',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -628,7 +660,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'check_color_contrast',
-      description: 'Check text contrast against WCAG thresholds. Either pass a `foreground` / `background` color pair, or pass `url` + `selector` to read the element\'s own text color, background (composited from the nearest painted ancestors), font size and weight from the live page; explicit colors win over the page. A gradient or image background is reported as an error, never a guessed ratio. When it fails, suggests BRAND-aligned replacements — extracts the actual brand palette from the `url` page using our scanner (CSS vars + most-used colors), or use a provided `brandColors` array. No `url` and no `brandColors` = ratio + pass/fail only.',
+      description: 'Check text contrast against the WCAG AA threshold (4.5:1, or 3:1 for large text); the AAA verdict is shown only when you pass level: "AAA". Either pass a `foreground` / `background` color pair, or pass `url` + `selector` to read the element\'s own text color, background (composited from the nearest painted ancestors), font size and weight from the live page; explicit colors win over the page. A gradient or image background is reported as an error, never a guessed ratio. When it fails, suggests BRAND-aligned replacements — extracts the actual brand palette from the `url` page using our scanner (CSS vars + most-used colors), or use a provided `brandColors` array. No `url` and no `brandColors` = ratio + pass/fail only.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -639,12 +671,13 @@ const ALL_TOOLS = [
           url: { type: 'string', description: 'Live page: with `selector`, the colors are read from that element; on a failing pair, the brand palette is extracted from it (uses our scanner — CSS vars + dominant colors).' },
           selector: { type: 'string', description: 'CSS selector of the text element on `url` (e.g. the `selector` from a scan_page issue)' },
           brandColors: { type: 'array', items: { type: 'string' }, description: 'Pre-supplied brand palette. Skips URL extraction if provided.' },
+          level: { type: 'string', enum: ['AA', 'AAA'], description: 'Conformance level to judge. Default "AA". "AAA" adds the enhanced-contrast (1.4.6) verdict and AAA palette suggestions.' },
         },
       },
     },
     {
       name: 'check_aria',
-      description: 'Validate ARIA attribute + accessible name/role/value usage — in an HTML snippet (`html`) or on a live page (`url`), optionally limited to one element and its descendants (`selector`). Runs axe-core `cat.aria` and `cat.name-role-value` rules (aria-* attribute correctness, role validity, required parents/children, aria-hidden-focus, accessible names). Returns `violations` (high-confidence) and `incomplete` (needs human review, e.g. dangling ARIA references — do NOT auto-fix). A selector that matches nothing, or a page that answers an HTTP error, is an error — never "no violations". Nodes cap at 5 per rule by default — every rule reports nodesTotal + truncated; raise nodeLimit (max 50) or use scan_history(id) for the full set.',
+      description: 'Validate ARIA attribute + accessible name/role/value usage — in an HTML snippet (`html`) or on a live page (`url`), optionally limited to one element and its descendants (`selector`). Runs axe-core `cat.aria` and `cat.name-role-value` rules (aria-* attribute correctness, role validity, required parents/children, aria-hidden-focus, accessible names). Returns `violations`. A selector that matches nothing, or a page that answers an HTTP error, is an error — never "no violations". Nodes cap at 5 per rule by default — every rule reports nodesTotal + truncated; raise nodeLimit (max 50) or use scan_history(id) for the full set.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -676,7 +709,7 @@ const ALL_TOOLS = [
           url: { type: 'string', description: 'The scanned page URL (used for the report header and file name)' },
           issues: {
             type: 'array',
-            description: 'Findings to include — pass the `issues[]` array from scan_page (message/type/wcag/selector/html/impact/fix). Needs-review `incomplete[]` items are NOT valid input.',
+            description: 'Findings to include — pass the `issues[]` array from scan_page (message/type/wcag/selector/html/impact/fix).',
             items: {
               type: 'object',
               properties: {
@@ -713,6 +746,10 @@ const TOOL_ANNOTATIONS: Record<string, Hints> = {
   diff_scan: read('Compare two accessibility scans', true),
   start_audit: { title: 'Start a full accessibility audit', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   get_audit: read('Get audit status and report', true),
+  add_site: { title: 'Add a site to the account', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  list_sites: read('List the account sites and plans', false),
+  get_install_snippet: read('Get the widget install tag', false),
+  create_upgrade_link: { title: 'Get a WebAbility Pro payment link', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   flow_scan: read('Scan a multi-page user flow', true),
   detect_framework: read('Detect the site framework', true),
   // Not read-only: both send page content (an HTML snippet / a screenshot) to
@@ -817,7 +854,9 @@ const handleCallTool = async (request: CallToolRequest, opts: ServerOptions = {}
   const firstText = Array.isArray((response as any)?.content)
     ? ((response as any).content.find((c: any) => c?.type === 'text')?.text ?? '')
     : ''
-  const ok = !looksFailed(firstText)
+  // isError is the tool's own verdict; the text match stays for older
+  // handlers that return a failure without setting it.
+  const ok = !(response as any)?.isError && !looksFailed(firstText)
   const { summary, meta } = extractToolTelemetry(toolName, response)
 
   if (LOGGED_SCAN_TOOLS.has(toolName) && !opts.remote && scanLogEnabled()) {
@@ -919,6 +958,62 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
   // browser or API work. These calls are in no rate-limit class.
   if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return toolError(signInRequired(name))
 
+  // Account tools call only our own API with the caller's token, so they run
+  // before the hosted URL guard (which would DNS-check a site the agent has
+  // not deployed yet).
+  if (name === 'get_install_snippet') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Put this tag in the <head> (or before </body>) of every page of the site:\n\n${INSTALL_SNIPPET}\n\nThe widget finds the site by its domain, so the site must be on the account (add_site).`,
+        },
+      ],
+    }
+  }
+  if (name === 'add_site' || name === 'list_sites' || name === 'create_upgrade_link') {
+    const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
+    if (!token) return toolError(signInRequired(name))
+    try {
+      if (name === 'list_sites') {
+        const sites = await listSites(API_URL, token)
+        if (!sites.length) return { content: [{ type: 'text', text: 'No sites on this account yet. Add one with add_site.' }] }
+        return { content: [{ type: 'text', text: `${sites.length} site(s):\n${sites.map(describeSite).join('\n')}` }] }
+      }
+      if (name === 'add_site') {
+        const url = typeof args?.url === 'string' ? args.url : ''
+        if (!url.trim()) return toolError('add_site needs a url, for example https://shop.example.com')
+        const site = await addSite(API_URL, token, url)
+        if (!site) return toolError(`WebAbility accepted ${url}, but it is not in the site list yet. Call list_sites in a minute.`)
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Added ${site.url}.\n${describeSite(site)}\n\nNext:\n1. Install the widget: call get_install_snippet and put the tag on every page.\n2. For WebAbility Pro: call create_upgrade_link with domain ${site.url} and give the link to the person who pays.`,
+            },
+          ],
+        }
+      }
+      const domain = typeof args?.domain === 'string' ? args.domain : ''
+      if (!domain.trim()) return toolError('create_upgrade_link needs a domain, for example shop.example.com')
+      const interval = String(args?.billing_interval || 'monthly').toLowerCase() === 'yearly' ? 'YEARLY' : 'MONTHLY'
+      const site = findSite(await listSites(API_URL, token), domain)
+      if (!site) return toolError(`${domain} is not on this account. Add it with add_site first, then call create_upgrade_link again.`)
+      const link = await createUpgradeLink(API_URL, token, site, interval)
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Payment link for the WebAbility Pro plan on ${site.url} (${interval.toLowerCase()} billing):\n\n${link}\n\nGive this link to your owner, the person who pays. The price shows on the page. When they pay, the plan activates on ${site.url} automatically; check with list_sites. The link expires in 24 hours.`,
+          },
+        ],
+      }
+    } catch (err) {
+      if (err instanceof AccountError) return toolError(`${name}: ${err.message}`)
+      return toolError(`${name} error: ${(err as Error).message}`)
+    }
+  }
+
   // Hardening for the hosted/remote (HTTP) transport: the server is internet-reachable,
   // so block local-filesystem tools and validate every outbound URL (SSRF) before any fetch.
   if (opts.remote) {
@@ -956,6 +1051,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
+        level: scanLevel(controls),
       }
       const { result, pointers, framework } = await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, Boolean(opts.remote))
 
@@ -975,7 +1071,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           ...(b.signal ? { signal: b.signal } : {}),
           summary: result.summary,
           issues: [],
-          incomplete: [],
         }
         return {
           content: [
@@ -1003,8 +1098,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         html: i.html?.slice(0, 400),
         fix: i.fix,
         ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}),
-        ...(i.confidence ? { confidence: i.confidence } : {}),
-        ...(i.reviewReason ? { reviewReason: i.reviewReason } : {}),
       })
       type ProjectedIssue = ReturnType<typeof projectIssue> & { sourceCandidates?: string[] }
 
@@ -1026,43 +1119,35 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // Same-element findings that are one problem across engines are merged
       // first (scanShaping.mergeSameElement); the summary is recounted from
       // the merged lists, and the archive keeps them merged but not collapsed.
-      // 4.1.1 Parsing is obsolete in WCAG 2.2 — those findings are review
-      // items, not issues (scanShaping.demoteObsoleteParsing).
-      const parsing = demoteObsoleteParsing(result.issues.map(projectIssue) as ProjectedIssue[], result.incomplete.map(projectIssue) as ProjectedIssue[])
+      // 4.1.1 Parsing is obsolete in WCAG 2.2 — those findings are dropped
+      // (scanShaping.dropObsoleteParsing).
+      const parsing = dropObsoleteParsing(result.issues.map(projectIssue) as ProjectedIssue[])
       const projectedIssues: ProjectedIssue[] = bySeverityDesc(mergeSameElement(parsing.issues))
-      const projectedIncomplete: ProjectedIssue[] = bySeverityDesc(mergeSameElement(parsing.incomplete))
-      const mergedSummary = recountSummary(projectedIssues, projectedIncomplete)
+      const mergedSummary = recountSummary(projectedIssues)
       await attachSourceCandidates(projectedIssues, args?.sourceRoot as string | undefined, Boolean(opts.remote))
       const filteredIssues = filterIssues(projectedIssues, controls)
-      const filteredIncomplete = filterIssues(projectedIncomplete, controls)
       // With filters on, `summary` and the headline describe the FILTERED set
       // (persona round 4: "Found 67 … Returning 1"); the page-wide counts move
       // to `pageSummary`.
       const filtered = isFiltered(controls)
-      const shownSummary = filtered ? recountSummary(filteredIssues, filteredIncomplete) : mergedSummary
+      const shownSummary = filtered ? recountSummary(filteredIssues) : mergedSummary
       // Repeats of one rule with one fix → one entry with `count` (after the
       // filters, so a caller who names the rule in rules[] sees every one).
       const collapsedIssues = collapseRepeats(filteredIssues, controls)
-      const collapsedIncomplete = collapseRepeats(filteredIncomplete, controls)
       const sortedIssues = collapsedIssues.list
-      const sortedIncomplete = collapsedIncomplete.list
       // Instance counts (every element) vs entry counts (after collapsing).
       const issuesTotal = filteredIssues.length
-      const incompleteTotal = filteredIncomplete.length
       const issueEntries = sortedIssues.length
-      const incompleteEntries = sortedIncomplete.length
       const issuesTruncated = issueEntries > RESULT_CAP
-      const incompleteTruncated = incompleteEntries > RESULT_CAP
       // Stratify the cap: one representative per issue TYPE first, then fill by
       // severity. Without this, a majority type (e.g. 25 contrast_insufficient
       // moderates) can fill the entire moderate band and hide a whole type —
       // observed on squarespace.com (155 issues incl. 26 keyboard_trap; the
       // default response returned 0 of them, persona P007 round 3).
       const [capIssues, typesRescued] = stratifiedCap(sortedIssues, RESULT_CAP)
-      const [capIncomplete, incompleteTypesRescued] = stratifiedCap(sortedIncomplete, RESULT_CAP)
-      const typeStratified = typesRescued || incompleteTypesRescued
+      const typeStratified = typesRescued
 
-      const collapsedGroups = collapsedIssues.collapsedGroups + collapsedIncomplete.collapsedGroups
+      const collapsedGroups = collapsedIssues.collapsedGroups
       const payload = {
         url,
         summary: shownSummary,
@@ -1074,26 +1159,21 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         /** @deprecated Alias of cssToolkit, kept for JSON consumers of <= 1.6.4. Remove in a major release. */
         cssFramework: framework?.cssToolkit ?? 'unknown',
         ...(framework?.builder ? { builder: framework.builder } : {}),
-        truncated: issuesTruncated || incompleteTruncated,
+        truncated: issuesTruncated,
         issues: capIssues,
         issuesReturned: capIssues.length,
         issueEntries,
         issuesTotal,
-        incomplete: capIncomplete,
-        incompleteReturned: capIncomplete.length,
-        incompleteEntries,
-        incompleteTotal,
         ...(collapsedGroups > 0
-          ? { counts: 'summary.* and issuesTotal / incompleteTotal count every element. issues[] / incomplete[] hold issueEntries / incompleteEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`). issuesReturned / incompleteReturned count entries.' }
+          ? { counts: 'summary.* and issuesTotal count every element. issues[] holds issueEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`). issuesReturned counts entries.' }
           : {}),
       }
 
-      const note = issuesTruncated || incompleteTruncated
-        ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: payload.issuesReturned, total: issueEntries, incompleteReturned: payload.incompleteReturned, incompleteTotal: incompleteEntries, stratified: typeStratified })
+      const note = issuesTruncated
+        ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: payload.issuesReturned, total: issueEntries, stratified: typeStratified })
         : ''
       const summary =
-        scanHeadline({ url, shown: shownSummary, ...(filtered ? { page: mergedSummary, filters: controlsList(controls) } : {}), issueEntries, incompleteEntries, collapsedGroups }) +
-        (parsing.demoted > 0 ? ` ${parsing.demoted} duplicate-id (WCAG 4.1.1 Parsing, obsolete in WCAG 2.2) finding(s) are listed under needs-review, not issues.` : '') +
+        scanHeadline({ url, shown: shownSummary, ...(filtered ? { page: mergedSummary, filters: controlsList(controls) } : {}), issueEntries, collapsedGroups }) +
         note
 
       const response = {
@@ -1104,9 +1184,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
             payload,
             [
               { title: 'Issues', items: payload.issues, total: issuesTotal, entries: issueEntries },
-              { title: 'Needs review — do NOT auto-fix', items: payload.incomplete, total: incompleteTotal, entries: incompleteEntries, noun: ['finding', 'findings'] },
             ],
-            { issues: sortedIssues, incomplete: sortedIncomplete },
+            { issues: sortedIssues },
           ),
         ],
       }
@@ -1136,10 +1215,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
                     issuesReturned: projectedIssues.length,
                     issueEntries: projectedIssues.length,
                     issuesTotal: projectedIssues.length,
-                    incomplete: projectedIncomplete,
-                    incompleteReturned: projectedIncomplete.length,
-                    incompleteEntries: projectedIncomplete.length,
-                    incompleteTotal: projectedIncomplete.length,
                   },
                   null,
                   2,
@@ -1202,6 +1277,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // Re-scan scoped to the fixed element only — a focused, fast check rather
       // than a whole-page scan. Same engine and options as scan_page.
       const verifyOptions = {
+        // The caller named one rule/criterion; check it whatever its level
+        // (an AAA criterion would otherwise be gated out and read as fixed).
+        level: 'AAA' as const,
         rootSelector: selector,
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
@@ -1243,7 +1321,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         return {
           content: [
             { type: 'text', text },
-            { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, remainingCount: null, remainingIssues: [], needsReview: null }, null, 2) + '\n```' },
+            { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, remainingCount: null, remainingIssues: [] }, null, 2) + '\n```' },
           ],
         }
       }
@@ -1259,7 +1337,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         return normRule(i.type || '') === normRule(wcag) || normRule(i.id || '') === normRule(wcag)
       }
       const remaining = result.issues.filter(matchesWcag)
-      const needsReview = result.incomplete.filter(matchesWcag)
       const resolved = remaining.length === 0
 
       const evidence = remaining.slice(0, 10).map((i: any) => ({
@@ -1279,12 +1356,10 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         verified: resolved,
         remainingCount: remaining.length,
         remainingIssues: evidence,
-        needsReview: needsReview.length,
       }
 
       const text = resolved
-        ? `VERIFIED: no ${wcag ? `${wcag} ` : ''}violation remains on \`${selector}\` at ${url}.` +
-          (needsReview.length ? ` (${needsReview.length} finding(s) on this element still need human review — see needsReview; verification does not cover those.)` : '')
+        ? `VERIFIED: no ${wcag ? `${wcag} ` : ''}violation remains on \`${selector}\` at ${url}.`
         : `NOT RESOLVED: ${remaining.length} ${wcag ? `${wcag} ` : ''}violation(s) still present on \`${selector}\` at ${url}. The fix did not clear them — see remainingIssues[] for what remains.`
 
       return {
@@ -1312,20 +1387,21 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     try { diffControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
 
     type Projected = ReturnType<typeof enrichIssue> & { id: string; impact?: string }
-    const live = async (target: string): Promise<{ issues: Projected[]; incomplete: Projected[]; blocked?: unknown }> => {
+    const live = async (target: string): Promise<{ issues: Projected[]; blocked?: unknown }> => {
       const scanOptions = {
         rootSelector: args?.rootSelector as string | undefined,
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
+        level: scanLevel(diffControls),
       }
       const t = parseTunnelTarget(target, String((args as any)?.tunnel_secret ?? ''))
       const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote))
-      if (result.blocked) return { issues: [], incomplete: [], blocked: result.blocked }
-      const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}), ...(i.confidence ? { confidence: i.confidence } : {}), ...(i.reviewReason ? { reviewReason: i.reviewReason } : {}) })
-      return { issues: mergeSameElement(result.issues.map(project)), incomplete: mergeSameElement(result.incomplete.map(project)) }
+      if (result.blocked) return { issues: [], blocked: result.blocked }
+      const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}) })
+      return { issues: mergeSameElement(result.issues.map(project)) }
     }
-    const stored = (id: string): { issues: Projected[]; incomplete: Projected[] } => {
+    const stored = (id: string): { issues: Projected[] } => {
       const rec = readScanResult(id) as any
       if (!rec) throw new Error(`no stored scan with id "${id}" (pruned, or never logged — see scan_history)`)
       const blocks: any[] = rec?.response?.content ?? []
@@ -1338,7 +1414,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // Merge here too: archives written before same-element merging still
       // hold both engine findings, and diffing them against a merged live
       // scan would report the folded one as fixed.
-      return { issues: mergeSameElement(payload.issues.map(project)), incomplete: mergeSameElement((payload.incomplete ?? []).map(project)) }
+      return { issues: mergeSameElement(payload.issues.map(project)) }
     }
 
     try {
@@ -1389,7 +1465,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         return { gone: bySeverityDesc(gone), added: bySeverityDesc(added), kept: bySeverityDesc(kept) }
       }
       const issues = diff(filterIssues(baseline.issues as any[], diffControls), filterIssues(current.issues as any[], diffControls))
-      const review = diff(filterIssues(baseline.incomplete as any[], diffControls), filterIssues(current.incomplete as any[], diffControls))
       const CAP = 50
       const payload = {
         baseline: baselineId ?? baselineUrl,
@@ -1398,18 +1473,15 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         fixed: issues.gone.slice(0, CAP),
         new: issues.added.slice(0, CAP),
         remaining: issues.kept.slice(0, CAP),
-        incompleteResolved: review.gone.slice(0, CAP),
-        incompleteNew: review.added.slice(0, CAP),
-        truncated: [issues.gone, issues.added, issues.kept, review.gone, review.added].some((l) => l.length > CAP),
+        truncated: [issues.gone, issues.added, issues.kept].some((l) => l.length > CAP),
       }
       const verdict = issues.added.length === 0
         ? `No regressions: ${issues.gone.length} fixed, 0 new, ${issues.kept.length} remaining (${baseline.issues.length} → ${current.issues.length}).`
         : `REGRESSIONS: ${issues.added.length} new issue(s) not in the baseline — see new[]. Also ${issues.gone.length} fixed, ${issues.kept.length} remaining (${baseline.issues.length} → ${current.issues.length}).`
-      const reviewNote = review.added.length || review.gone.length ? ` Needs-review findings: ${review.added.length} new, ${review.gone.length} no longer flagged (not counted above).` : ''
       const idNote = issues.added.length && issues.gone.length ? ' If you changed a fixed element\'s class/id, it appears in BOTH fixed[] and new[] — compare selectors before calling it a regression.' : ''
       return {
         content: [
-          { type: 'text', text: verdict + reviewNote + idNote + (isFiltered(diffControls) ? describeControls(diffControls) : '') + (payload.truncated ? ` Lists capped at ${CAP} (severity-sorted).` : '') },
+          { type: 'text', text: verdict + idNote + (isFiltered(diffControls) ? describeControls(diffControls) : '') + (payload.truncated ? ` Lists capped at ${CAP} (severity-sorted).` : '') },
           renderFindings(diffControls, payload, [{ title: 'New (regressions)', items: payload.new }, { title: 'Fixed', items: payload.fixed }, { title: 'Remaining', items: payload.remaining }]),
         ],
       }
@@ -1549,7 +1621,6 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       finalUrl?: string
       reason?: string
       issues?: any[]
-      incomplete?: any[]
     }
 
     const normalize = (u: string) => (u.startsWith('http') ? u : `https://${u}`)
@@ -1606,7 +1677,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           scannedFinalUrls.add(finalUrl)
 
           try {
-            const r = await scan(page, { includeAxe: true, dismissModals: true, mainStatus })
+            const r = await scan(page, { includeAxe: true, dismissModals: true, mainStatus, level: scanLevel(flowControls) })
             // Bot-challenge / interstitial guard — scan() sets `blocked` when the
             // DOM is a Cloudflare/PerimeterX/error page, not the real site. Record
             // it as NOT scanned (with the reason) so its empty issue list never
@@ -1615,9 +1686,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
               outcomes.push({ requested: target, status: 'blocked', finalUrl, reason: r.blocked.reason })
             } else {
               // Framework source pointers, read while this page's DOM is still open.
-              const pointers = await collectSourcePointers(page, [...r.issues, ...r.incomplete].map((i) => i.selector))
+              const pointers = await collectSourcePointers(page, r.issues.map((i) => i.selector))
               const withSource = (list: typeof r.issues) => list.map((i) => (pointers[i.selector] ? { ...i, source: pointers[i.selector] } : i))
-              outcomes.push({ requested: target, status: 'scanned', finalUrl, issues: withSource(r.issues), incomplete: withSource(r.incomplete) })
+              outcomes.push({ requested: target, status: 'scanned', finalUrl, issues: withSource(r.issues) })
               scannedCount++
             }
           } catch (err) {
@@ -1630,7 +1701,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
 
       // Same per-issue projection scan_page returns, so a finding in a
       // multi-page flow is exactly as actionable as a single-page scan
-      // (carries fix payload, confidence, reviewReason — previously dropped).
+      // (carries the fix payload).
       const projectIssue = (i: any) => enrichIssue({
         id: i.id,
         impact: i.impact,
@@ -1643,19 +1714,17 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         // core's `source` is the ENGINE name ('webability' | 'axe' | 'htmlcs');
         // only the pointer object attached above is a source pointer.
         ...(i.source && typeof i.source === 'object' ? { source: i.source } : {}),
-        ...(i.confidence ? { confidence: i.confidence } : {}),
-        ...(i.reviewReason ? { reviewReason: i.reviewReason } : {}),
       })
 
       const scannedPages = outcomes.filter((o) => o.status === 'scanned')
       const droppedPages = outcomes.filter((o) => o.status !== 'scanned')
 
       // Dedupe across pages — same type+selector+wcag = one finding, tracking
-      // which pages it appeared on. Keep `issues` / `incomplete` separate.
-      const dedupAcrossPages = (source: 'issues' | 'incomplete') => {
+      // which pages it appeared on. 
+      const dedupAcrossPages = () => {
         const map = new Map<string, any & { foundOn: string[] }>()
         for (const pr of scannedPages) {
-          for (const issue of ((pr as any)[source] as any[]) || []) {
+          for (const issue of ((pr as any).issues as any[]) || []) {
             const k = `${issue.type}::${issue.selector}::${issue.wcag}`
             const existing = map.get(k)
             if (existing) {
@@ -1673,24 +1742,19 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // a lower-severity one that happened to be deduped first.
       // Same-element findings that are one problem across engines merge
       // first (foundOn is unioned), as in scan_page.
-      const parsing = demoteObsoleteParsing(dedupAcrossPages('issues'), dedupAcrossPages('incomplete'))
+      const parsing = dropObsoleteParsing(dedupAcrossPages())
       const allUnique = bySeverityDesc(mergeSameElement(parsing.issues))
-      const allUniqueIncomplete = bySeverityDesc(mergeSameElement(parsing.incomplete))
       await attachSourceCandidates(allUnique as any[], args?.sourceRoot as string | undefined, Boolean(opts.remote))
       const unique = filterIssues(allUnique as any[], flowControls)
-      const uniqueIncomplete = filterIssues(allUniqueIncomplete as any[], flowControls)
       // Repeats of one rule with one fix → one entry with `count`.
       const collapsedIssues = collapseRepeats(unique, flowControls)
-      const collapsedIncomplete = collapseRepeats(uniqueIncomplete, flowControls)
-      const collapsedGroups = collapsedIssues.collapsedGroups + collapsedIncomplete.collapsedGroups
+      const collapsedGroups = collapsedIssues.collapsedGroups
 
       const RESULT_CAP = 50
       // Stratified cap — same rationale as scan_page: a majority type must not
       // fill the list and hide other types across a multi-page journey.
       const [capIssues, typesRescued] = stratifiedCap(collapsedIssues.list, RESULT_CAP)
-      const [capIncomplete, incompleteTypesRescued] = stratifiedCap(collapsedIncomplete.list, RESULT_CAP)
       const issuesTruncated = collapsedIssues.list.length > RESULT_CAP
-      const incompleteTruncated = collapsedIncomplete.list.length > RESULT_CAP
 
       const payload = {
         startUrl,
@@ -1702,34 +1766,30 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           ...(o.finalUrl ? { finalUrl: o.finalUrl } : {}),
           ...(o.reason ? { reason: o.reason } : {}),
           ...(o.status === 'scanned'
-            ? { issueCount: mergeSameElement((o.issues ?? []).map(projectIssue)).length, incompleteCount: mergeSameElement((o.incomplete ?? []).map(projectIssue)).length }
+            ? { issueCount: mergeSameElement((o.issues ?? []).map(projectIssue)).length }
             : {}),
         })),
         summary: {
           uniqueIssues: unique.length,
-          needsReview: uniqueIncomplete.length,
           pagesDropped: droppedPages.length,
         },
         ...(isFiltered(flowControls)
-          ? { pageSummary: { uniqueIssues: allUnique.length, needsReview: allUniqueIncomplete.length, pagesDropped: droppedPages.length }, filters: controlsList(flowControls) }
+          ? { pageSummary: { uniqueIssues: allUnique.length, pagesDropped: droppedPages.length }, filters: controlsList(flowControls) }
           : {}),
-        truncated: issuesTruncated || incompleteTruncated,
+        truncated: issuesTruncated,
         issues: capIssues,
         issueEntries: collapsedIssues.list.length,
         issuesTotal: unique.length,
-        incomplete: capIncomplete,
-        incompleteEntries: collapsedIncomplete.list.length,
-        incompleteTotal: uniqueIncomplete.length,
         ...(collapsedGroups > 0
-          ? { counts: 'summary.uniqueIssues / needsReview and issuesTotal / incompleteTotal count every element. issues[] / incomplete[] hold issueEntries / incompleteEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`).' }
+          ? { counts: 'summary.uniqueIssues and issuesTotal count every element. issues[] holds issueEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`).' }
           : {}),
       }
       const flowNote =
         (collapsedGroups > 0
           ? `${isFiltered(flowControls) ? '' : `Total to report: ${unique.length} unique issue(s). `}Listing: the ${unique.length} unique issue(s) are grouped into ${collapsedIssues.list.length} entries in issues[] — ${collapsedGroups} rule(s) repeat with the same fix and are listed once with \`count\`. Pass rules: ["<rule id>"] to list every element of a rule.\n`
           : '') +
-        (issuesTruncated || incompleteTruncated
-          ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: capIssues.length, total: collapsedIssues.list.length, incompleteReturned: capIncomplete.length, incompleteTotal: collapsedIncomplete.list.length, stratified: typesRescued || incompleteTypesRescued }).trim() + '\n'
+        (issuesTruncated
+          ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: capIssues.length, total: collapsedIssues.list.length, stratified: typesRescued }).trim() + '\n'
           : '')
 
       // Human-readable summary. Surface dropped pages EXPLICITLY — never
@@ -1743,26 +1803,19 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         (i.count
           ? `[${i.impact}] WCAG ${i.wcag} — ${i.message} (×${i.count} elements)\n  Examples: ${(i.examples ?? []).join(' | ')}\n  ${i.expand ?? ''}`
           : `[${i.impact}] WCAG ${i.wcag} — ${i.message}\n  Selector: ${i.selector}`) +
-        `\n  Found on: ${(i.foundOn ?? []).join(', ')}` +
-        (i.reviewReason ? `\n  ⚠ Review: ${i.reviewReason}` : '')
-
-      const incompleteSection = uniqueIncomplete.length > 0
-        ? `\n\n## Needs Review (${uniqueIncomplete.length}) — do NOT auto-fix\n\n` +
-          collapsedIncomplete.list.slice(0, 20).map(renderLine).join('\n\n')
-        : ''
+        `\n  Found on: ${(i.foundOn ?? []).join(', ')}`
 
       const findingsBlock = renderFindings(
         flowControls,
         payload,
         [
           { title: 'Issues', items: payload.issues, total: unique.length, entries: collapsedIssues.list.length },
-          { title: 'Needs review — do NOT auto-fix', items: payload.incomplete, total: uniqueIncomplete.length, entries: collapsedIncomplete.list.length, noun: ['finding', 'findings'] },
         ],
-        { issues: collapsedIssues.list, incomplete: collapsedIncomplete.list },
+        { issues: collapsedIssues.list },
       )
       // The readable list repeats the JSON. Print it only beside a JSON block,
       // and only when both still fit inline (or the caller asked for JSON).
-      const readableList = collapsedIssues.list.slice(0, 30).map(renderLine).join('\n\n') + incompleteSection
+      const readableList = collapsedIssues.list.slice(0, 30).map(renderLine).join('\n\n')
       const showReadable =
         findingsBlock.text.startsWith('```json') && (flowControls.formatExplicit || findingsBlock.text.length + readableList.length <= INLINE_BUDGET)
       const response = {
@@ -1775,11 +1828,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
               `Pages scanned: ${scannedPages.length}\n` +
               (droppedPages.length > 0 ? `Pages dropped: ${droppedPages.length} (see below)\n` : '') +
               `Unique high-confidence issues: ${unique.length}${isFiltered(flowControls) ? describeControls(flowControls) : ''}\n` +
-              `Needs review: ${uniqueIncomplete.length}\n` +
               (isFiltered(flowControls)
-                ? `Whole flow, before filters: ${allUnique.length} unique issue(s), ${allUniqueIncomplete.length} needing review — that is the total to report (\`summary\` counts the filtered set, \`pageSummary\` the whole flow).\n`
+                ? `Whole flow, before filters: ${allUnique.length} unique issue(s), that is the total to report (\`summary\` counts the filtered set, \`pageSummary\` the whole flow).\n`
                 : '') +
-              (parsing.demoted > 0 ? `(${parsing.demoted} duplicate-id finding(s) — WCAG 4.1.1 Parsing, obsolete in WCAG 2.2 — are under needs review, not issues.)\n` : '') +
               `\n` +
               flowNote +
               (showReadable ? readableList : '') +
@@ -1800,7 +1851,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
               text:
                 '```json\n' +
                 JSON.stringify(
-                  { ...payload, summary: { uniqueIssues: allUnique.length, needsReview: allUniqueIncomplete.length, pagesDropped: droppedPages.length }, pageSummary: undefined, filters: undefined, truncated: false, counts: undefined, issues: allUnique, issueEntries: allUnique.length, issuesTotal: allUnique.length, incomplete: allUniqueIncomplete, incompleteEntries: allUniqueIncomplete.length, incompleteTotal: allUniqueIncomplete.length },
+                  { ...payload, summary: { uniqueIssues: allUnique.length, pagesDropped: droppedPages.length }, pageSummary: undefined, filters: undefined, truncated: false, counts: undefined, issues: allUnique, issueEntries: allUnique.length, issuesTotal: allUnique.length },
                   null,
                   2,
                 ) +
@@ -2079,14 +2130,15 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     if (engine !== 'in-process' && engine !== 'browser') return toolError('Error: engine must be "in-process" or "browser"')
     let htmlControls: OutputControls
     try { htmlControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
+    // An explicit axe wcag2aaa tag is an AAA request (the level gate would drop it otherwise).
+    if (tags.includes('wcag2aaa') && !htmlControls.level) htmlControls = { ...htmlControls, level: 'AAA' }
 
     if (engine === 'in-process') {
       try {
-        const r = await fastScanHtml(html, { wcagTags: tags })
+        const r = await fastScanHtml(html, { wcagTags: tags, level: scanLevel(htmlControls, tags) })
         const issues = filterIssues(r.issues, htmlControls)
-        const incomplete = filterIssues(r.incomplete, htmlControls)
         const htmlFiltered = isFiltered(htmlControls)
-        const shown = htmlFiltered ? recountSummary(issues, incomplete) : r.summary
+        const shown = htmlFiltered ? recountSummary(issues) : r.summary
         const payload = {
           engine: r.engine,
           fragment: r.fragment,
@@ -2096,18 +2148,16 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
           skippedVisual: r.skippedVisual,
           ...(r.engineWarnings ? { engineWarnings: r.engineWarnings } : {}),
           issues,
-          incomplete,
         }
         const text =
           `Found ${shown.total} issue(s)${htmlFiltered ? ` matching the filters (${controlsList(htmlControls)})` : ''} in the HTML ${r.fragment ? 'fragment' : 'document'} in ${r.durationMs}ms (in-process: WebAbility detectors + axe-core, no browser): ` +
           `${shown.critical} critical, ${shown.serious} serious, ${shown.moderate} moderate, ${shown.minor} minor.` +
-          (shown.incomplete ? ` ${shown.incomplete} need human review — see incomplete[].` : '') +
-          (htmlFiltered ? ` Whole snippet, before filters: ${r.summary.total} issue(s), ${r.summary.incomplete} needing review (\`pageSummary\`).` : '') +
+          (htmlFiltered ? ` Whole snippet, before filters: ${r.summary.total} issue(s) (\`pageSummary\`).` : '') +
           (r.skippedVisual ? ` ${r.skippedVisual} visual-tier finding(s) (contrast / target size / focus) were NOT evaluated — jsdom has no layout; use engine:"browser" or scan_page for those.` : ' Visual-tier rules (contrast / target size / focus) are not evaluated in-process.')
         return {
           content: [
             { type: 'text', text },
-            renderFindings(htmlControls, payload, [{ title: 'Issues', items: issues }, { title: 'Needs review — do NOT auto-fix', items: incomplete }]),
+            renderFindings(htmlControls, payload, [{ title: 'Issues', items: issues }]),
           ],
         }
       } catch (err) {
@@ -2125,7 +2175,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       try {
         await session.page.setContent(html, { waitUntil: 'domcontentloaded' })
         const { runAxe } = await import('@webability/core')
-        result = await runAxe(session.page, tags)
+        // level:"AAA" must run the axe AAA rules in the browser engine too, as the in-process path does.
+        const axeTags = htmlControls.level === 'AAA' && !tags.includes('wcag2aaa') ? [...tags, 'wcag2aaa'] : tags
+        result = await runAxe(session.page, axeTags)
       } finally {
         await session.close()
       }
@@ -2150,7 +2202,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       return {
         content: [
           { type: 'text', text: `${violations.length} violation${violations.length === 1 ? '' : 's'} found in HTML snippet (browser engine, axe-core only; tags: ${tags.join(', ')})${isFiltered(htmlControls) ? describeControls(htmlControls) : ''}.` },
-          { type: 'text', text: '```json\n' + JSON.stringify({ violations, passes: result.passes.length, incomplete: result.incomplete.length }, null, 2) + '\n```' },
+          { type: 'text', text: '```json\n' + JSON.stringify({ violations, passes: result.passes.length }, null, 2) + '\n```' },
         ],
       }
     } catch (err) {
@@ -2267,6 +2319,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     if ((!fg || !bg) && !(url && selector)) {
       return toolError('Error: pass foreground and background colors, or `url` + `selector` to read them from an element on the live page.')
     }
+    const contrastLevel = args?.level === undefined || args?.level === null ? 'AA' : String(args.level)
+    if (contrastLevel !== 'AA' && contrastLevel !== 'AAA') return toolError('Error: level must be "AA" or "AAA"')
+    const showAaa = contrastLevel === 'AAA'
     let fontSize = typeof args?.fontSize === 'number' && args.fontSize > 0 ? args.fontSize : undefined
     let isBold = typeof args?.isBold === 'boolean' ? args.isBold : undefined
     let palette = contrastPalette(args?.brandColors)
@@ -2329,7 +2384,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     const lines = [
       `Contrast ratio: ${ratio.toFixed(2)}:1 (${fg} on ${bg}, ${size}px${bold ? ' bold' : ''}, ${isLarge ? 'large' : 'normal'} text)`,
       `WCAG AA  (≥ ${aaThreshold}): ${aaPass ? 'PASS' : 'FAIL'}`,
-      `WCAG AAA (≥ ${aaaThreshold}): ${aaaPass ? 'PASS' : 'FAIL'}`,
+      // AA is the default and only verdict; AAA only on request (owner: "always AA").
+      ...(showAaa ? [`WCAG AAA (≥ ${aaaThreshold}): ${aaaPass ? 'PASS' : 'FAIL'}`] : []),
       ...(readNote ? [readNote] : []),
     ]
 
@@ -2360,7 +2416,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         } else {
           lines.push(`  Brand colors passing AA  (≥ ${aaThreshold}): ${aaCandidates.slice(0, 3).map((c) => `${c.color} (${c.ratio.toFixed(2)}:1)`).join(', ')}`)
         }
-        if (!aaaPass) {
+        if (showAaa && !aaaPass) {
           if (aaaCandidates.length === 0) {
             lines.push(`  No brand color passes AAA on ${bg}.`)
           } else {
@@ -2406,7 +2462,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         const { runAxe } = await import('@webability/core')
         const r = await runAxe(page, ['cat.aria', 'cat.name-role-value'])
         if (!selector) return r
-        return { ...r, violations: await scopeAxeRules(page, r.violations as any[], selector), incomplete: await scopeAxeRules(page, r.incomplete as any[], selector) }
+        return { ...r, violations: await scopeAxeRules(page, r.violations as any[], selector) }
       }
       let result: Awaited<ReturnType<typeof import('@webability/core').runAxe>>
       if (url) {
@@ -2424,7 +2480,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
         }
       }
 
-      // Shared projection so `violations` and `incomplete` have identical shape.
+      // Shared projection so violations have a stable shape.
       // Nodes cap at nodeLimit per rule (default 5) — every rule discloses
       // nodesTotal + truncated in the scan_page vocabulary, and the FULL set
       // is archived for scan_history(id) recovery (previously the cap was
@@ -2447,39 +2503,31 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       })
 
       const violations = result.violations.map(projectAxe(nodeLimit))
-      // Surface axe's `incomplete` bucket (mirrors scan_page). Dangling ARIA
-      // references (e.g. `aria-labelledby="missing-id"`) land here, NOT in
-      // `violations`, so dropping it silently hid real ARIA defects. These need
-      // human review — do NOT auto-fix.
-      const incomplete = result.incomplete.map(projectAxe(nodeLimit))
-
-      const truncatedRules = [...violations, ...incomplete].filter((r) => r.truncated).length
+      // axe incomplete results (dangling ARIA references etc.) are not
+      // reported: the scanner judges or drops what axe could not decide.
+      const truncatedRules = violations.filter((r) => r.truncated).length
       const scope = (url ? ` on ${url}` : '') + (selector ? ` within ${selector}` : '')
       const summaryLine = violations.length === 0
         ? `No ARIA violations found${scope}.`
         : `${violations.length} ARIA violation${violations.length === 1 ? '' : 's'} found${scope}.`
-      const incompleteNote = incomplete.length > 0
-        ? ` ${incomplete.length} finding(s) need human review (e.g. dangling ARIA references) — see \`incomplete[]\`. Do NOT auto-fix these.`
-        : ''
       const truncationNote = truncatedRules > 0
         ? ` NOTE: ${truncatedRules} rule(s) truncated to ${nodeLimit} nodes each (see truncated/nodesTotal per rule) — pass nodeLimit (max 50)${opts.remote ? '' : ' or retrieve the FULL untruncated set via `scan_history` with this scan\'s id'}.`
         : ''
 
       const response = {
         content: [
-          { type: 'text', text: summaryLine + incompleteNote + truncationNote },
-          { type: 'text', text: '```json\n' + JSON.stringify({ violations, incomplete }, null, 2) + '\n```' },
+          { type: 'text', text: summaryLine + truncationNote },
+          { type: 'text', text: '```json\n' + JSON.stringify({ violations }, null, 2) + '\n```' },
         ],
       }
       // Archive the FULL untruncated set so scan_history(id) recovers nodes
       // clipped from this response (same pattern as scan_page).
       {
         const fullViolations = result.violations.map(projectAxe(Number.MAX_SAFE_INTEGER))
-        const fullIncomplete = result.incomplete.map(projectAxe(Number.MAX_SAFE_INTEGER))
         fullScanResultByResponse.set(response, {
           content: [
             response.content[0]!,
-            { type: 'text', text: '```json\n' + JSON.stringify({ violations: fullViolations, incomplete: fullIncomplete }, null, 2) + '\n```' },
+            { type: 'text', text: '```json\n' + JSON.stringify({ violations: fullViolations }, null, 2) + '\n```' },
           ],
         })
       }

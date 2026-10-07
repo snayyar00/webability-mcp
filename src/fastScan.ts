@@ -28,8 +28,6 @@ export interface FastScanIssue {
   message: string
   selector: string
   html?: string
-  confidence?: string
-  reviewReason?: string
   fixability: Fixability
   fix: { op: string; attribute?: string; value?: string; currentValue?: string; suggestedValue?: string; needsManualReview?: boolean }
 }
@@ -38,8 +36,7 @@ export interface FastScanResult {
   engine: 'in-process'
   fragment: boolean
   issues: FastScanIssue[]
-  incomplete: FastScanIssue[]
-  summary: { total: number; critical: number; serious: number; moderate: number; minor: number; incomplete: number }
+  summary: { total: number; critical: number; serious: number; moderate: number; minor: number }
   skippedVisual: number
   engineWarnings?: string[]
   durationMs: number
@@ -103,7 +100,7 @@ function sharedWindow() {
   return shared
 }
 
-export async function fastScanHtml(html: string, opts: { wcagTags?: string[] } = {}): Promise<FastScanResult> {
+export async function fastScanHtml(html: string, opts: { wcagTags?: string[]; level?: 'A' | 'AA' | 'AAA' } = {}): Promise<FastScanResult> {
   // The detector kernel and axe read the ambient `window`/`document`; scans
   // must not interleave. Serialise on a module-level chain.
   const run = scanning.then(() => fastScanHtmlSerial(html, opts))
@@ -111,7 +108,7 @@ export async function fastScanHtml(html: string, opts: { wcagTags?: string[] } =
   return run
 }
 
-async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[] }): Promise<FastScanResult> {
+async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[]; level?: 'A' | 'AA' | 'AAA' }): Promise<FastScanResult> {
   const started = Date.now()
   const fragment = !looksLikeDocument(html)
   const doc = fragment ? `<!doctype html><html lang="en"><head><title>snippet</title></head><body><main><h1>Snippet</h1>${html}</main></body></html>` : html
@@ -121,27 +118,25 @@ async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[] }): 
   win.document.close()
 
   const { scanDocument } = await import('@webability/core/dom')
-  const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags })
+  const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags, level: opts.level })
   let skippedVisual = 0
   const project = (list: any[]) => {
     const out: FastScanIssue[] = []
     for (const i of list) {
-      const e = enrichIssue({ id: i.id, type: i.type, wcag: i.wcag, level: i.level, impact: i.impact, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(i.confidence ? { confidence: i.confidence } : {}), ...(i.reviewReason ? { reviewReason: i.reviewReason } : {}) }) as any
+      const e = enrichIssue({ id: i.id, type: i.type, wcag: i.wcag, level: i.level, impact: i.impact, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix }) as any
       if (e.fixability === 'visual') { skippedVisual++; continue }
       out.push(e)
     }
     return out
   }
   const issues = project(result.issues)
-  const incomplete = project(result.incomplete)
   const count = (lvl: string) => issues.filter((i) => i.impact === lvl).length
   const warnings = (result.engineWarnings ?? []).filter((w) => !w.startsWith('focus:'))
   return {
     engine: 'in-process',
     fragment,
     issues,
-    incomplete,
-    summary: { total: issues.length, critical: count('critical'), serious: count('serious'), moderate: count('moderate'), minor: count('minor'), incomplete: incomplete.length },
+    summary: { total: issues.length, critical: count('critical'), serious: count('serious'), moderate: count('moderate'), minor: count('minor') },
     skippedVisual,
     ...(warnings.length ? { engineWarnings: warnings } : {}),
     durationMs: Date.now() - started,

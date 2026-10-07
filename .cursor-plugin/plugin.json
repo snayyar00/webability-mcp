@@ -1,7 +1,7 @@
 {
   "name": "webability-accessibility",
   "description": "Scan pages and HTML for WCAG 2.2 / ADA / Section 508 issues, get framework-aware fixes, and verify them. Free hosted MCP server from WebAbility.",
-  "version": "1.6.3",
+  "version": "1.8.0",
   "author": { "name": "WebAbility", "url": "https://webability.io" },
   "homepage": "https://webability.io",
   "repository": "https://github.com/snayyar00/webability-mcp",

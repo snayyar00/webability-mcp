@@ -26,10 +26,13 @@ const BANNED = /trial|claimToken|paid|credit/i
 for (const remote of [false, true]) {
   const label = remote ? 'hosted (Full)' : 'local (Lite)'
 
-  test(`${label}: no trial/paid/credit wording in tool descriptions or schemas`, async () => {
+  test(`${label}: no trial/paid/credit wording in tool titles, descriptions or schemas`, async () => {
     const { tools } = await (await connect(remote)).listTools()
     for (const t of tools) {
       assert.doesNotMatch(t.description ?? '', BANNED, `${t.name} description`)
+      // MCP clients show the title to the user, so it is held to the same rule.
+      assert.doesNotMatch(t.title ?? '', BANNED, `${t.name} title`)
+      assert.doesNotMatch(String((t.annotations as any)?.title ?? ''), BANNED, `${t.name} annotations.title`)
       assert.doesNotMatch(JSON.stringify(t.inputSchema), BANNED, `${t.name} input schema`)
     }
   })

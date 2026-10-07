@@ -29,6 +29,7 @@ import { createServer } from './server.js'
 import { handleOAuth, wwwAuthenticate } from './oauth.js'
 import { anonLimitClass, anonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
 import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH } from './signIn.js'
+import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
@@ -166,6 +167,23 @@ const httpServer = createHttpServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
     res.end(challenge)
+    return
+  }
+
+  // Static server card (SEP-1649) for directories like Smithery.
+  if (url.pathname === SERVER_CARD_PATH && req.method === 'GET') {
+    try {
+      const card = await getServerCard()
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=300',
+      })
+      res.end(JSON.stringify(card))
+    } catch (err) {
+      console.error('[server-card] build error:', err)
+      sendJson(res, 500, { error: 'server_error' })
+    }
     return
   }
 

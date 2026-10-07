@@ -19,7 +19,7 @@ export const MCP_PATH = '/mcp'
 export const SIGN_IN_MCP_PATH = '/mcp/auth'
 
 /** Tools that need the caller's own WebAbility account. */
-export const ACCOUNT_TOOLS: ReadonlySet<string> = new Set(['start_audit', 'get_audit', 'visual_audit'])
+export const ACCOUNT_TOOLS: ReadonlySet<string> = new Set(['start_audit', 'get_audit', 'visual_audit', 'add_site', 'list_sites', 'create_upgrade_link'])
 
 /** The protected-resource metadata URL for one of the two MCP paths (RFC 9728 §3.1 path form). */
 export function resourceMetadataUrl(mcpPath: string): string {
@@ -34,6 +34,7 @@ export function signInSteps(): string[] {
     '- Codex: run `codex mcp login <server-name>`. opencode: run `opencode mcp auth <server-name>`.',
     `- claude.ai, Claude Desktop, Cursor, VS Code and other clients: add ${PUBLIC_URL}${SIGN_IN_MCP_PATH} as a server. It asks you to sign in when you connect, and it has every tool.`,
     '- Any client: send the header `Authorization: Bearer <token>` with the token `webability login` saves.',
+    '- An AI agent with its own AgentMail inbox needs no human account: on the WebAbility sign-in page choose "Sign in with AgentID". A new agent gets its own free account.',
   ]
 }
 

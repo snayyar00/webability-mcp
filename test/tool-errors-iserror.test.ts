@@ -107,6 +107,9 @@ const RESULT_PREFIXES = [
   "text: lines.join('\\n')",
   // get_rules: a WCAG criterion no automated rule covers is an answer, not a failure.
   'text: `0 rules: no rule covers',
+  // list_sites: an empty account and the site list are answers.
+  "text: 'No sites on this account yet.",
+  'text: `${sites.length} site(s)',
 ]
 
 test('every plain one-line text return is a reviewed result, not a refusal', () => {

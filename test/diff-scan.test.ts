@@ -73,10 +73,10 @@ test('two stored scans → fixed / new / remaining, counted and keyed by issue i
   assert.equal(out.new[0].fixability, 'contextual')
 })
 
-test('needs-review findings are diffed separately and never counted as fixed', async () => {
+test('a stored legacy incomplete[] is ignored: never diffed, never counted as fixed', async () => {
   const client = await connect(false)
   const out = jsonBlock(await client.callTool({ name: 'diff_scan', arguments: { baselineId: 'base-1', currentId: 'cur-1' } }))
-  assert.deepEqual(out.incompleteResolved.map((i: any) => i.id), ['q'])
+  assert.equal(out.incompleteResolved, undefined)
   assert.ok(!out.fixed.some((i: any) => i.id === 'q'))
 })
 
