@@ -2,7 +2,7 @@
 /**
  * E2E for partial auth: the hosted /mcp starts AUTHLESS for the free tools,
  * and an anonymous call to an account tool (start_audit / get_audit /
- * visual_audit) gets an isError tool result with the sign-in steps — not an
+ * visual_audit) gets a normal tool result with the sign-in steps — not an
  * HTTP 401, which makes Claude Code drop every tool. /mcp/auth is the path
  * that answers 401 + WWW-Authenticate so a client signs in on connect.
  * Anonymous callers are rate-limited per IP; authenticated callers are not.
@@ -84,11 +84,11 @@ try {
   const rules = await post(rpc('tools/call', { name: 'get_rules', arguments: { tags: ['wcag2aa'] } }))
   check('anonymous free tool (get_rules) → 200', rules.status === 200, rules.status)
 
-  // 3. anonymous account tool → 200 isError tool result, no 401 / WWW-Authenticate
+  // 3. anonymous account tool → 200 tool result (not an error), no 401 / WWW-Authenticate
   for (const name of ['start_audit', 'get_audit', 'visual_audit']) {
     const r = await post(rpc('tools/call', { name, arguments: { url: 'https://webability.io', id: 1 } }))
     const j = await r.json().catch(() => ({}))
-    check(`anonymous ${name} → 200 isError, no WWW-Authenticate`, r.status === 200 && j?.result?.isError === true && !r.headers.get('www-authenticate'), `${r.status} ${JSON.stringify(j).slice(0, 160)}`)
+    check(`anonymous ${name} → 200 result (not an error), no WWW-Authenticate`, r.status === 200 && j?.result?.isError !== true && !r.headers.get('www-authenticate'), `${r.status} ${JSON.stringify(j).slice(0, 160)}`)
   }
 
   // 4. anonymous AI tool is rate limited (cap 2/hour in this test)

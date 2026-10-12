@@ -5,7 +5,7 @@
  * get_audit with HTTP 401 + WWW-Authenticate. Claude Code then caches the
  * server as `needs-auth`, and every later session on that machine lists zero
  * tools (real-client transcripts in the PR). Now /mcp answers with a normal
- * tool result (isError) that says how to sign in, and /mcp/auth is the URL that
+ * tool result (not an error) that says how to sign in, and /mcp/auth is the URL that
  * always challenges, for clients that start OAuth only on a 401.
  *
  * Spawns the real HTTP entry against a mock platform API. No network.
@@ -114,11 +114,11 @@ async function post(body: unknown, headers: Record<string, string> = {}, path = 
 const resultText = (r: any) => (r?.result?.content ?? []).map((c: any) => c.text).join('\n')
 
 for (const tool of ACCOUNT_TOOLS) {
-  test(`anonymous ${tool} on /mcp → 200 tool result with isError, no 401 and no WWW-Authenticate`, async () => {
+  test(`anonymous ${tool} on /mcp → 200 tool result (not an error), no 401 and no WWW-Authenticate`, async () => {
     const r = await post(call(tool))
     assert.equal(r.status, 200, r.text.slice(0, 200))
     assert.equal(r.www, null)
-    assert.equal(r.json?.result?.isError, true)
+    assert.notEqual(r.json?.result?.isError, true)
     const text = resultText(r.json)
     assert.match(text, new RegExp(`${tool} needs a free WebAbility account`))
     assert.match(text, /claude mcp login/)
@@ -144,7 +144,7 @@ test('batch with one account tool and one free tool → both answered, only the 
   assert.equal(r.www, null)
   assert.ok(Array.isArray(r.json), r.text.slice(0, 200))
   const byId = new Map(r.json.map((m: any) => [m.id, m]))
-  assert.equal((byId.get(paid.id) as any)?.result?.isError, true)
+  assert.notEqual((byId.get(paid.id) as any)?.result?.isError, true)
   assert.match(resultText(byId.get(paid.id)), /needs a free WebAbility account/)
   assert.notEqual((byId.get(free.id) as any)?.result?.isError, true)
 })
@@ -233,7 +233,7 @@ test('anonymous visual_audit refuses before it opens a browser', async () => {
   await Promise.all([server.connect(st), client.connect(ct)])
   const started = Date.now()
   const r: any = await client.callTool({ name: 'visual_audit', arguments: { url: 'https://203.0.113.10/' } })
-  assert.equal(r.isError, true)
+  assert.notEqual(r.isError, true)
   assert.match(r.content[0].text, /visual_audit needs a free WebAbility account/)
   assert.match(r.content[0].text, /scan and check tools keep working/)
   assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`)

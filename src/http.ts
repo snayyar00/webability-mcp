@@ -107,7 +107,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 // Partial auth on /mcp: anyone can list and call the scan/check tools
 // anonymously. Everything is free; fair-use limits apply. The account tools
 // (start_audit/get_audit/visual_audit) need a free WebAbility account. An
-// anonymous call to one gets a normal tool result with isError and the
+// anonymous call to one gets a normal tool result (not isError) with the
 // sign-in steps (server.ts, signIn.ts) — NOT an HTTP 401: a 401 on a tool call
 // makes Claude Code cache the server as needs-auth, and every later session
 // then lists zero tools. Clients that start OAuth only on a 401 use
@@ -265,8 +265,8 @@ const httpServer = createHttpServer(async (req, res) => {
     if (anonymous) {
       // Every tool the body calls — a JSON-RPC batch must not slip past the
       // gate by hiding its calls in an array (see anonGate.ts).
-      // Account tools are not refused here: their handlers return an isError
-      // tool result before any browser or API work (server.ts).
+      // Account tools are not refused here: their handlers return a sign-in
+      // result before any browser or API work (server.ts).
       const tools = calledTools(body)
       for (const tool of tools) {
         const cls = anonLimitClass(tool)

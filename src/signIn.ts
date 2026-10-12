@@ -6,7 +6,9 @@
  *   makes Claude Code cache the server as `needs-auth`, and every later session
  *   on that machine starts with zero tools (measured with Claude Code 2.1.288).
  *   So an anonymous call to an account tool gets a normal tool result with
- *   `isError: true` and the steps below. Clients that sign in on demand from
+ *   no `isError` (a missing sign-in is a normal state, not a server failure,
+ *   and connector health views count isError results as request errors) and
+ *   the steps below. Clients that sign in on demand from
  *   the protected-resource metadata (Claude Code `claude mcp login`, Codex
  *   `codex mcp login`) use this URL for everything.
  * - `/mcp/auth` answers every request without a valid token with 401 +
@@ -41,7 +43,7 @@ export function signInSteps(): string[] {
 /** Tool-result text for an anonymous call to an account tool on the hosted `/mcp`. */
 export function signInRequired(tool: string): string {
   return [
-    `${tool} needs a free WebAbility account, and this connection is not signed in. The scan and check tools keep working here without an account.`,
+    `${tool} needs a free WebAbility account, and this connection is not signed in. Nothing ran. The scan and check tools keep working here without an account.`,
     '',
     'To sign in:',
     ...signInSteps(),

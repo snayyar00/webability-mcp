@@ -21,7 +21,7 @@ import { isIP } from 'net'
 import type { BrowserContext } from 'playwright'
 import { blockedUrlMessage, resolvedAddressFrom } from './blockedUrlMessage.js'
 import { describeScanTarget, newScanId, readScanHistory, readScanResult, recordScan, scanLogDir, scanLogEnabled } from './scanLog.js'
-import { describeTelemetryTarget, extractToolTelemetry, reportScanEvent } from './telemetry.js'
+import { classifyToolError, describeTelemetryTarget, extractToolTelemetry, reportScanEvent, sanitizeTelemetryError } from './telemetry.js'
 import { enablePostHogMcpAnalytics } from './posthog.js'
 import { MCP_VERSION } from './version.js'
 import { generateReportPdf, type PdfIssue } from './reportPdf.js'
@@ -56,8 +56,23 @@ function bySeverityDesc<T extends { impact?: string }>(list: readonly T[]): T[] 
   return [...list].sort((a, b) => (IMPACT_RANK[b.impact ?? ''] ?? 0) - (IMPACT_RANK[a.impact ?? ''] ?? 0))
 }
 
+/** Reason code for responses that are not tool errors but still count as a failed call in telemetry. */
+const errorCodeByResponse = new WeakMap<object, string>()
+
 /**
- * A refused or failed tool call. `isError: true` is how an MCP client tells a
+ * A call to an account tool on a connection with no account. This is a normal
+ * state, not a server failure, so the result is NOT `isError`: connector
+ * health views count isError results as request errors. The text says nothing
+ * ran and how to sign in; telemetry records ok:false with `auth_required`.
+ */
+function authRequired(text: string): ToolResponse {
+  const response: ToolResponse = { content: [{ type: 'text', text: /nothing ran/i.test(text) ? text : `${text}\n\nNothing ran: no account data was read and nothing was changed.` }] }
+  errorCodeByResponse.set(response, 'auth_required')
+  return response
+}
+
+/**
+ * A genuine failure or refused call (bad input, blocked URL, API error). `isError: true` is how an MCP client tells a
  * refusal from a result; without it an agent reads the error text as success.
  */
 function toolError(text: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
@@ -563,17 +578,17 @@ const ALL_TOOLS = [
     },
     {
       name: 'flow_scan',
-      description: 'Scan a multi-page user journey. Walks startUrl plus the required `autoNavigate` URLs sequentially (deterministic — one page fully rendered and scanned before the next), then returns ONE consolidated report with issues deduplicated across pages, each carrying the same fix payload as scan_page. Every requested URL gets an explicit outcome in `pages[]` (scanned / nav_failed / scan_failed / redirected_duplicate / duplicate_request / skipped_cap / blocked — bot-challenge, not a clean page) — a page is never silently dropped. Better than per-page scans for journeys (login → checkout etc). For a single page, use scan_page.',
+      description: 'Scan a multi-page user journey. Walks startUrl plus the `autoNavigate` URLs sequentially (deterministic — one page fully rendered and scanned before the next), then returns ONE consolidated report with issues deduplicated across pages, each carrying the same fix payload as scan_page. Every requested URL gets an explicit outcome in `pages[]` (scanned / nav_failed / scan_failed / redirected_duplicate / duplicate_request / skipped_cap / blocked — bot-challenge, not a clean page) — a page is never silently dropped. Better than per-page scans for journeys (login → checkout etc). Without `autoNavigate` it scans only startUrl, exactly like scan_page.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           startUrl: { type: 'string', description: 'Starting URL of the journey' },
           maxPages: { type: 'number', description: 'Max pages to scan (default 10)' },
-          autoNavigate: { type: 'array', items: { type: 'string' }, description: 'REQUIRED — the URLs to walk after startUrl (the MCP server is headless and cannot discover a journey interactively). For a single page, use scan_page instead.' },
+          autoNavigate: { type: 'array', items: { type: 'string' }, description: 'The URLs to walk after startUrl, in order (the MCP server is headless and cannot discover a journey interactively). Omit or pass [] to scan only startUrl as a single page.' },
           sourceRoot: { type: 'string', description: 'Local project root (local installs only) for `sourceCandidates[]` on issues without a framework `source` pointer.' },
           ...OUTPUT_CONTROL_PROPERTIES,
         },
-        required: ['startUrl', 'autoNavigate'],
+        required: ['startUrl'],
       },
     },
     {
@@ -849,15 +864,25 @@ const handleCallTool = async (request: CallToolRequest, opts: ServerOptions = {}
   const toolName = request.params.name
   const started = Date.now()
   const target = describeTelemetryTarget(toolName, request.params.arguments as Record<string, unknown> | undefined)
-  const response = await dispatchTool(request, opts)
+  let response: ToolResponse
+  try {
+    response = await dispatchTool(request, opts)
+  } catch (err) {
+    // A handler threw. Record why before the SDK turns it into a protocol error.
+    const error = sanitizeTelemetryError(`exception: ${(err as Error)?.message ?? err}`)
+    reportScanEvent({ tool: toolName, target, source: opts.remote ? 'hosted' : 'local', ok: false, durationMs: Date.now() - started, summary: null, error })
+    throw err
+  }
   const durationMs = Date.now() - started
   const firstText = Array.isArray((response as any)?.content)
     ? ((response as any).content.find((c: any) => c?.type === 'text')?.text ?? '')
     : ''
   // isError is the tool's own verdict; the text match stays for older
   // handlers that return a failure without setting it.
-  const ok = !(response as any)?.isError && !looksFailed(firstText)
+  const authCode = errorCodeByResponse.get(response as object)
+  const ok = !authCode && !(response as any)?.isError && !looksFailed(firstText)
   const { summary, meta } = extractToolTelemetry(toolName, response)
+  const error = ok ? undefined : (authCode ?? classifyToolError(firstText))
 
   if (LOGGED_SCAN_TOOLS.has(toolName) && !opts.remote && scanLogEnabled()) {
     // Persist the FULL (pre-truncation) result when the handler recorded one,
@@ -891,15 +916,17 @@ const handleCallTool = async (request: CallToolRequest, opts: ServerOptions = {}
     // friendly. Scan-shaped tools keep the original `scan` type for existing
     // log consumers; everything else is a `tool` line.
     const type = LOGGED_SCAN_TOOLS.has(toolName) ? 'scan' : 'tool'
-    console.error(JSON.stringify({ type, ts: new Date(started).toISOString(), tool: toolName, target, ok, durationMs, summary, ...(meta ? { meta } : {}) }))
+    console.error(JSON.stringify({ type, ts: new Date(started).toISOString(), tool: toolName, target, ok, durationMs, summary, ...(meta ? { meta } : {}), ...(error ? { error } : {}) }))
   }
 
-  reportScanEvent({ tool: toolName, target, source: opts.remote ? 'hosted' : 'local', ok, durationMs, summary, meta })
+  reportScanEvent({ tool: toolName, target, source: opts.remote ? 'hosted' : 'local', ok, durationMs, summary, meta, error })
 
   return response
 }
 
-const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) => {
+// Explicit: flow_scan re-enters dispatchTool for the single-page case.
+type ToolResponse = { content: Array<{ type: string; text?: string; [k: string]: unknown }>; isError?: boolean; [k: string]: unknown }
+const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}): Promise<ToolResponse> => {
   const name = request.params.name
   const args = stripAnalyticsArgs(name, request.params.arguments as Record<string, unknown> | undefined)
 
@@ -953,10 +980,10 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     }
   }
 
-  // Hosted anonymous call to an account tool: refuse as a tool result (never an
-  // HTTP 401 — see signIn.ts), before the URL guard's DNS lookup and before any
+  // Hosted anonymous call to an account tool: answer with a sign-in result (not an
+  // error, never an HTTP 401 — see signIn.ts), before the URL guard's DNS lookup and before any
   // browser or API work. These calls are in no rate-limit class.
-  if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return toolError(signInRequired(name))
+  if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return authRequired(signInRequired(name))
 
   // Account tools call only our own API with the caller's token, so they run
   // before the hosted URL guard (which would DNS-check a site the agent has
@@ -973,7 +1000,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
   }
   if (name === 'add_site' || name === 'list_sites' || name === 'create_upgrade_link') {
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
-    if (!token) return toolError(signInRequired(name))
+    if (!token) return authRequired(signInRequired(name))
     try {
       if (name === 'list_sites') {
         const sites = await listSites(API_URL, token)
@@ -1505,7 +1532,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     }
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
     if (!token) {
-      return toolError('start_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+      return authRequired('start_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
@@ -1545,7 +1572,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     if (!id && id !== 0) return toolError('Error: id is required (from start_audit)')
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
     if (!token) {
-      return toolError('get_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+      return authRequired('get_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
@@ -1598,7 +1625,18 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
     const autoNav = (args?.autoNavigate as string[]) || []
 
     if (autoNav.length === 0) {
-      return toolError('Error: flow_scan requires autoNavigate — the list of URLs in the journey to walk after startUrl. The MCP server is headless and cannot discover a journey interactively, so pass the steps explicitly. For a single page, use scan_page instead.')
+      // No journey given. Agents call flow_scan with only a startUrl (109 of
+      // 110 hosted calls failed on the old "requires autoNavigate" error), so
+      // scan the start page exactly as scan_page would and say so.
+      const single = await dispatchTool({ ...request, params: { ...request.params, name: 'scan_page', arguments: { ...(request.params.arguments ?? {}), url: startUrl } } }, opts)
+      if (!(single as any)?.isError && Array.isArray((single as any).content)) {
+        // Mutate in place: the full-result archive is keyed by this object.
+        ;(single as any).content.unshift({
+          type: 'text',
+          text: 'Note: no `autoNavigate` was given, so only the start page was scanned (same result as scan_page). To scan a journey, call flow_scan again with `autoNavigate`: the ordered list of URLs to visit after startUrl.',
+        })
+      }
+      return single
     }
 
     // Deterministic, sequential walk. The previous model raced a tight
@@ -2059,7 +2097,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}) 
       // vision on the caller's account (#124).
       const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
       if (!token) {
-        return toolError('visual_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+        return authRequired('visual_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
       }
 
       let res: Response

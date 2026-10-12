@@ -117,6 +117,55 @@ export function scrubTelemetryTarget(label: string): string {
   }
 }
 
+const MAX_ERROR_CHARS = 300
+
+/**
+ * Scrub an error reason before it leaves the machine. Keeps the shape of the
+ * message, drops anything that can identify a person or grant access: URL
+ * query strings and hashes, bearer values, key=value secrets, e-mail addresses
+ * and long opaque tokens (tunnel secrets, API keys). Collapses whitespace and
+ * caps at 300 chars.
+ */
+export function sanitizeTelemetryError(message: string): string {
+  return String(message)
+    .replace(/https?:\/\/[^\s"'<>)\]]+/gi, (u) => scrubTelemetryTarget(u))
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b(token|secret|key|password|passwd|auth|authorization|api[_-]?key|access[_-]?token)=\S+/gi, '$1=[redacted]')
+    .replace(/(?<![\w:/.~])(?:\/[^\s/'"`)\]]+){2,}/g, '[path]')
+    .replace(/(?<![\w:/.])~(?:\/[^\s/'"`)\]]+)+/g, '[path]')
+    .replace(/\b[A-Za-z]:\\[^\s'"`)\]]+/g, '[path]')
+    .replace(/[^\s@<>"']+@[^\s@<>"']+\.[A-Za-z]{2,}/g, '[email]')
+    .replace(/[A-Za-z0-9_\-.]{32,}/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_ERROR_CHARS)
+}
+
+/**
+ * Turn a failed tool response's first text block into "<code>: <short msg>".
+ * Codes: auth_required, blocked, blocked_url, rate_limited, timeout,
+ * fetch_failed, navigation_failed, invalid_args, unsupported, exception.
+ * Status-code failures keep only the status — the response body can hold page
+ * content and is never forwarded.
+ */
+export function classifyToolError(text: string): string {
+  const first = String(text ?? '').split('\n').find((l) => l.trim()) ?? ''
+  const msg = sanitizeTelemetryError(first)
+  if (/needs a free WebAbility account|not signed in/i.test(first)) return 'auth_required'
+  if (/^BLOCKED:/.test(first)) return sanitizeTelemetryError(`blocked: ${first.replace(/^BLOCKED:\s*/, '')}`)
+  if (/rate-limited|rate limit|too many requests|\b429\b/i.test(first)) return 'rate_limited'
+  const status = first.match(/(?:failed|error|authenticate|unavailable|returned HTTP)\s*\(?(\d{3})\b/i) ?? first.match(/\bHTTP (\d{3})\b/)
+  if (status) return `fetch_failed: ${status[1]}`
+  if (/^Blocked URL\b|\bBlocked URL:|private (address|network)|resolves to|SSRF|not a public/i.test(first)) return `blocked_url: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  if (/timeout|timed out|did not finish within/i.test(first)) return `timeout: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  const errno = first.match(/\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|EHOSTUNREACH|CERT_[A-Z_]+)\b/)
+  if (errno) return `fetch_failed: ${errno[1]}`
+  if (/net::ERR_|page\.goto|navigation|Navigation/.test(first)) return `navigation_failed: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  if (/not available|is disabled|cannot reach a localhost/i.test(first)) return `unsupported: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  if (/is required|are required|requires |must be|pass |needs a [a-z]+|Could not parse|Unknown tool|not both|No (stored )?(scan|audit)/i.test(first)) return `invalid_args: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  return `exception: ${msg.replace(/^[^:]*(?:failed|error):\s*/i, '')}`.slice(0, MAX_ERROR_CHARS)
+}
+
 /** Pull summary counts out of a tool response (the ```json block). Best-effort. */
 export function extractSummary(response: unknown): ScanEventSummary | null {
   try {
@@ -194,6 +243,8 @@ export function reportScanEvent(event: {
   summary: ScanEventSummary | null
   /** Optional short enrichment, e.g. "framework:tailwind", "fix:yes", "aa:fail". */
   meta?: string | null
+  /** Why a failed call failed ("code: short message"). Only sent when ok is false. */
+  error?: string | null
 }): void {
   if (!telemetryEnabled()) return
   try {
@@ -208,6 +259,7 @@ export function reportScanEvent(event: {
         durationMs: event.durationMs,
         summary: event.summary ?? undefined,
         ...(event.meta ? { meta: event.meta.slice(0, 120) } : {}),
+        ...(!event.ok && event.error ? { error: sanitizeTelemetryError(event.error) } : {}),
         clientId: event.source === 'local' ? clientId() : null,
       }),
       signal: AbortSignal.timeout(3000),

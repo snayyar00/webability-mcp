@@ -178,7 +178,7 @@ for (const name of ['add_site', 'list_sites', 'create_upgrade_link']) {
   test(`${name} on an anonymous hosted connection returns the sign-in steps, not an API call`, async () => {
     const calls = stubApi()
     const { text, isError } = await call(name, { url: 'a.example.org', domain: 'a.example.org' }, { remote: true, anonymous: true })
-    assert.equal(isError, true)
+    assert.equal(isError, false)
     assert.match(text, /Sign in with AgentID/)
     assert.equal(calls.length, 0)
   })
