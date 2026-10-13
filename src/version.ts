@@ -5,4 +5,4 @@
  * gave @webability/core its CORE_VERSION: a months-old npm build was mistaken
  * for the freshly deployed server).
  */
-export const MCP_VERSION = '1.8.1'
+export const MCP_VERSION = '1.8.2'
