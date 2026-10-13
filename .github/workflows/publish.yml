@@ -91,6 +91,10 @@ jobs:
           set -euo pipefail
           pnpm install --frozen-lockfile
           pnpm run build
+          # Install Chromium once, up front. Otherwise each test process
+          # downloads it on first use, and a parallel download overwrites the
+          # binary while another process launches it (spawn ETXTBSY).
+          pnpm exec playwright install chromium
           pnpm test
 
       - name: Refuse a package that misses a bin file
