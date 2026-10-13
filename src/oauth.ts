@@ -47,6 +47,8 @@ interface Session extends AuthParams {
 }
 interface IssuedCode {
   token: string
+  /** Platform refresh token (absent if the platform did not send one) */
+  refresh_token?: string
   code_challenge: string
   redirect_uri: string
   client_id: string
@@ -88,6 +90,34 @@ function parseClientId(clientId: string): { redirectUris: string[]; name: string
     const parsed = JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
     if (!Array.isArray(parsed.r) || !parsed.r.every((u: unknown) => typeof u === 'string')) return null
     return { redirectUris: parsed.r, name: typeof parsed.n === 'string' ? parsed.n : '' }
+  } catch {
+    return null
+  }
+}
+
+/** Refresh tokens handed to clients are bound to the client that signed in:
+ * base64url(JSON{c: sha256(client_id), t: platform refresh token}) + "." + HMAC.
+ * A token issued to one client cannot be redeemed or rotated through another. */
+function clientHash(clientId: string): string {
+  return b64url(createHash('sha256').update(clientId).digest())
+}
+function bindRefreshToken(platformToken: string, clientId: string): string {
+  const payload = b64url(Buffer.from(JSON.stringify({ c: clientHash(clientId), t: platformToken })))
+  return `${payload}.${sign(payload)}`
+}
+/** The platform refresh token inside a bound token, or null unless it was issued to this client_id. */
+function unbindRefreshToken(token: string, clientId: string): string | null {
+  if (!parseClientId(clientId)) return null
+  const dot = token.lastIndexOf('.')
+  if (dot < 1) return null
+  const payload = token.slice(0, dot)
+  const mac = Buffer.from(token.slice(dot + 1))
+  const expected = Buffer.from(sign(payload))
+  if (mac.length !== expected.length || !timingSafeEqual(mac, expected)) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+    if (parsed.c !== clientHash(clientId) || typeof parsed.t !== 'string' || !parsed.t) return null
+    return parsed.t
   } catch {
     return null
   }
@@ -190,7 +220,7 @@ const AS_METADATA = {
   token_endpoint: `${ISSUER}/token`,
   registration_endpoint: `${ISSUER}/register`,
   response_types_supported: ['code'],
-  grant_types_supported: ['authorization_code'],
+  grant_types_supported: ['authorization_code', 'refresh_token'],
   code_challenge_methods_supported: ['S256'],
   token_endpoint_auth_methods_supported: ['none'],
   scopes_supported: ['mcp'],
@@ -293,7 +323,49 @@ export function wwwAuthenticate(mcpPath: string = MCP_PATH): string {
   return `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(mcpPath)}"`
 }
 
+/** refresh_token grant: the platform verifies the refresh token and rotates both tokens. */
+async function refreshGrant(boundToken: string | undefined, clientId: string | undefined, res: ServerResponse): Promise<void> {
+  if (!boundToken) {
+    json(res, 400, { error: 'invalid_request', error_description: 'refresh_token is required' })
+    return
+  }
+  const refreshToken = clientId ? unbindRefreshToken(boundToken, clientId) : null
+  if (!refreshToken) {
+    json(res, 400, { error: 'invalid_grant', error_description: 'refresh_token is invalid or was not issued to this client' })
+    return
+  }
+  let apiRes: Response
+  try {
+    apiRes = await fetch(`${API_URL}/cli/refresh-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    })
+  } catch (err) {
+    console.error('[oauth] refresh-token request failed:', err)
+    json(res, 503, { error: 'temporarily_unavailable', error_description: 'Could not reach the WebAbility sign-in service.' })
+    return
+  }
+  const payload = (await apiRes.json().catch(() => ({}))) as any
+  if (apiRes.status === 400 || apiRes.status === 401) {
+    json(res, 400, { error: 'invalid_grant', error_description: 'refresh_token is invalid, expired or revoked' })
+    return
+  }
+  if (!apiRes.ok || typeof payload.token !== 'string' || !payload.token) {
+    console.error(`[oauth] refresh-token returned ${apiRes.status}`)
+    json(res, 503, { error: 'temporarily_unavailable', error_description: 'The WebAbility sign-in service returned an error.' })
+    return
+  }
+  json(res, 200, {
+    access_token: payload.token,
+    token_type: 'Bearer',
+    scope: 'mcp',
+    ...(typeof payload.refreshToken === 'string' && payload.refreshToken ? { refresh_token: bindRefreshToken(payload.refreshToken, clientId!) } : {}),
+  })
+}
+
 /** Route OAuth endpoints. Returns true when the request was handled here. */
+
 export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   sweep()
   const path = url.pathname
@@ -334,7 +406,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       client_id_issued_at: Math.floor(Date.now() / 1000),
       redirect_uris: uris,
       token_endpoint_auth_method: 'none',
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       client_name: typeof body?.client_name === 'string' ? body.client_name : undefined,
     })
@@ -404,6 +476,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
         const code = b64url(randomBytes(32))
         codes.set(code, {
           token,
+          refresh_token: typeof payload.refreshToken === 'string' && payload.refreshToken ? payload.refreshToken : undefined,
           code_challenge: session.code_challenge,
           redirect_uri: session.redirect_uri,
           client_id: session.client_id,
@@ -430,6 +503,10 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
 
   if (path === '/token' && req.method === 'POST') {
     const p = await readParams(req)
+    if (p.grant_type === 'refresh_token') {
+      await refreshGrant(p.refresh_token, p.client_id, res)
+      return true
+    }
     if (p.grant_type !== 'authorization_code') {
       json(res, 400, { error: 'unsupported_grant_type' })
       return true
@@ -453,10 +530,9 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       json(res, 400, { error: 'invalid_grant', error_description: 'PKCE verification failed' })
       return true
     }
-    // WebAbility tokens are long-lived API keys — no expires_in, no refresh
-    // token. If the user revokes the key, /mcp starts returning 401 and the
-    // client re-runs this flow.
-    json(res, 200, { access_token: issued.token, token_type: 'Bearer', scope: 'mcp' })
+    // The access token is a 30-day WebAbility JWT. No expires_in: the client
+    // learns it expired from a 401 on /mcp/auth, then uses refresh_token.
+    json(res, 200, { access_token: issued.token, token_type: 'Bearer', scope: 'mcp', ...(issued.refresh_token ? { refresh_token: bindRefreshToken(issued.refresh_token, issued.client_id) } : {}) })
     return true
   }
 

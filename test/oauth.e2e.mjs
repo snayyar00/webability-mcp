@@ -30,6 +30,9 @@ function check(name, cond, detail = '') {
 // approve(). Until then /cli/device-token returns authorization_pending.
 const devices = new Map() // deviceCode -> { approved: boolean }
 const USER_TOKEN = 'wa_live_test_token_abc123'
+const REFRESH_TOKEN = 'wa_refresh_test_token_r1'
+const USER_TOKEN_2 = 'wa_live_test_token_rotated'
+const REFRESH_TOKEN_2 = 'wa_refresh_test_token_r2'
 const mockApi = createServer((req, res) => {
   let body = ''
   req.on('data', (c) => (body += c))
@@ -53,7 +56,13 @@ const mockApi = createServer((req, res) => {
       // Real platform behavior (verified 2026-08-20): pending is HTTP 202 —
       // which fetch's res.ok treats as success — with an error body.
       if (!d.approved) { res.statusCode = 202; res.end(JSON.stringify({ error: 'authorization_pending' })); return }
-      res.end(JSON.stringify({ token: USER_TOKEN }))
+      res.end(JSON.stringify({ token: USER_TOKEN, refreshToken: REFRESH_TOKEN }))
+      return
+    }
+    if (req.url === '/cli/refresh-token' && req.method === 'POST') {
+      const { refreshToken } = JSON.parse(body || '{}')
+      if (refreshToken !== REFRESH_TOKEN && refreshToken !== REFRESH_TOKEN_2) { res.statusCode = 401; res.end(JSON.stringify({ error: 'invalid_grant' })); return }
+      res.end(JSON.stringify({ token: USER_TOKEN_2, refreshToken: REFRESH_TOKEN_2 }))
       return
     }
     if (req.url === '/cli/whoami') {
@@ -196,19 +205,73 @@ try {
     body: form({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: b64url(randomBytes(32)) }),
   })
   check('token rejects wrong verifier', badVerifier.status === 400, badVerifier.status)
+  // Codes are burned on the first redemption attempt, even a failed one.
+  const afterBad = await fetch(as.token_endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier }),
+  })
+  check('wrong-verifier attempt burns the code', afterBad.status === 400, afterBad.status)
+
+  // A fresh sign-in for the real exchange.
+  const start2 = await (await fetch(`${BASE}/authorize/start`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate2', code_challenge: challenge, code_challenge_method: 'S256' }),
+  })).json()
+  for (const d of devices.values()) d.approved = true
+  let done2
+  for (let i = 0; i < 20; i++) {
+    done2 = await (await fetch(`${BASE}/authorize/poll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sid: start2.sid }) })).json()
+    if (done2.status === 'complete') break
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  const code2 = new URL(done2.redirect).searchParams.get('code')
+  check('second sign-in yields a fresh code', !!code2 && code2 !== code)
 
   const tokRes = await fetch(as.token_endpoint, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: form({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier }),
+    body: form({ grant_type: 'authorization_code', code: code2, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier }),
   })
   const tok = await tokRes.json().catch(() => ({}))
   check('token exchange → 200', tokRes.status === 200, `${tokRes.status} ${JSON.stringify(tok)}`)
   check('access_token is the user token', tok.access_token === USER_TOKEN)
   check('token_type Bearer', tok.token_type === 'Bearer')
+  check('token exchange returns a refresh token', typeof tok.refresh_token === 'string' && tok.refresh_token.length > 0, JSON.stringify(tok))
+  check('refresh token is bound to the client, not the raw platform token', tok.refresh_token !== REFRESH_TOKEN, tok.refresh_token)
+  check('AS advertises refresh_token grant', (as.grant_types_supported || []).includes('refresh_token'), JSON.stringify(as.grant_types_supported))
+
+  // 7b. refresh grant (Zapier and other long-lived clients)
+  const tokenPost = (o) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: form(o) })
+  const reg2 = await (await fetch(as.registration_endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: ['https://other.example.org/cb'], client_name: 'Other' }),
+  })).json()
+  const refOther = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id: reg2.client_id }))
+  const refOtherJson = await refOther.json()
+  check('refresh via another client → 400 invalid_grant', refOther.status === 400 && refOtherJson.error === 'invalid_grant', `${refOther.status} ${JSON.stringify(refOtherJson)}`)
+  const refNoClient = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }))
+  const refNoClientJson = await refNoClient.json()
+  check('refresh without client_id → 400 invalid_grant', refNoClient.status === 400 && refNoClientJson.error === 'invalid_grant', `${refNoClient.status} ${JSON.stringify(refNoClientJson)}`)
+  const refRaw = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: REFRESH_TOKEN, client_id: reg.client_id }))
+  const refRawJson = await refRaw.json()
+  check('raw platform refresh token → 400 invalid_grant', refRaw.status === 400 && refRawJson.error === 'invalid_grant', `${refRaw.status} ${JSON.stringify(refRawJson)}`)
+  const refRes = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id: reg.client_id }))
+  const ref = await refRes.json()
+  check('refresh grant → 200', refRes.status === 200, `${refRes.status} ${JSON.stringify(ref)}`)
+  check('refresh grant returns the new access token', ref.access_token === USER_TOKEN_2, JSON.stringify(ref))
+  check('refresh grant rotates the refresh token', typeof ref.refresh_token === 'string' && ref.refresh_token !== tok.refresh_token && ref.refresh_token !== REFRESH_TOKEN_2, JSON.stringify(ref))
+  check('refresh grant token_type Bearer', ref.token_type === 'Bearer')
+  const refAgain = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: ref.refresh_token, client_id: reg.client_id }))
+  check('rotated refresh token works again for the same client', refAgain.status === 200, refAgain.status)
+  const refBad = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token', refresh_token: 'nope', client_id: reg.client_id }))
+  const refBadJson = await refBad.json()
+  check('bad refresh token → 400 invalid_grant', refBad.status === 400 && refBadJson.error === 'invalid_grant', `${refBad.status} ${JSON.stringify(refBadJson)}`)
+  const refMissing = await fetch(as.token_endpoint, tokenPost({ grant_type: 'refresh_token' }))
+  const refMissingJson = await refMissing.json()
+  check('missing refresh token → 400 invalid_request', refMissing.status === 400 && refMissingJson.error === 'invalid_request', `${refMissing.status} ${JSON.stringify(refMissingJson)}`)
 
   const reuse = await fetch(as.token_endpoint, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: form({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier }),
+    body: form({ grant_type: 'authorization_code', code: code2, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier }),
   })
   check('code is single-use', reuse.status === 400, reuse.status)
 
