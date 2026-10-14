@@ -4,9 +4,12 @@
  * Local (stdio) installs talk to an OpenAI-compatible chat endpoint
  * (OpenRouter by default) with the operator's own key. The hosted server
  * never holds a model key in the scan path: it posts the undecided set to the
- * platform's `/api/judge-incomplete`, which fails closed (items stay dropped)
- * until that endpoint exists.
+ * platform's `/api/judge-incomplete`. The platform answers only the caller's
+ * bearer token or the hosted server's shared secret (`x-mcp-internal`), so
+ * anonymous hosted scans are judged too. Any platform error fails closed
+ * (items stay dropped).
  *
+ *   MCP_TRIAL_INTERNAL_SECRET     hosted only: sent as x-mcp-internal (name is historical)
  *   OPENROUTER_API_KEY            enables the local judge
  *   WEBABILITY_JUDGE=off          disables it everywhere
  *   WEBABILITY_JUDGE_BASE_URL     default https://openrouter.ai/api/v1
@@ -28,7 +31,13 @@ export function judgeOptionsFromEnv(ctx: JudgeEnvContext, env: NodeJS.ProcessEnv
   const timeoutRaw = Number(env.WEBABILITY_JUDGE_TIMEOUT_MS)
   const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(timeoutRaw, 120_000) : undefined
   if (ctx.remote) {
-    return { apiUrl: ctx.apiUrl, ...(ctx.anonymous ? {} : ctx.authToken ? { apiToken: ctx.authToken } : {}), ...(timeoutMs ? { timeoutMs } : {}) }
+    const internalSecret = (env.MCP_TRIAL_INTERNAL_SECRET || '').trim()
+    return {
+      apiUrl: ctx.apiUrl,
+      ...(ctx.anonymous ? {} : ctx.authToken ? { apiToken: ctx.authToken } : {}),
+      ...(internalSecret ? { internalSecret } : {}),
+      ...(timeoutMs ? { timeoutMs } : {}),
+    }
   }
   const apiKey = env.OPENROUTER_API_KEY || ''
   if (!apiKey) return undefined
