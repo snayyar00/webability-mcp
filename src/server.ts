@@ -20,6 +20,7 @@ import dnsPromises from 'dns/promises'
 import { isIP } from 'net'
 import type { BrowserContext } from 'playwright'
 import { blockedUrlMessage, resolvedAddressFrom } from './blockedUrlMessage.js'
+import { judgeOptionsFromEnv } from './judgeConfig.js'
 import { describeScanTarget, newScanId, readScanHistory, readScanResult, recordScan, scanLogDir, scanLogEnabled } from './scanLog.js'
 import { classifyToolError, describeTelemetryTarget, extractToolTelemetry, reportScanEvent, sanitizeTelemetryError } from './telemetry.js'
 import { enablePostHogMcpAnalytics } from './posthog.js'
@@ -40,6 +41,9 @@ export const HOSTED_URL_ARG_KEYS: string[] = [...new Set(['url', 'startUrl', 'ba
 
 const execFileAsync = promisify(execFile)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
+
+/** AI-judge options for this request (see judgeConfig.ts). Undefined = judge skipped. */
+const judgeFor = (opts: ServerOptions) => judgeOptionsFromEnv({ remote: opts.remote, anonymous: opts.anonymous, authToken: opts.authToken, apiUrl: API_URL })
 
 /**
  * Severity ordering for the axe-style impact taxonomy (`critical > serious >
@@ -422,7 +426,7 @@ Results from all three are deduplicated into one issue list.
 
 ## Output (the scanner judges uncertain findings itself)
 \`scan_page\` and \`flow_scan\` return:
-- **issues**: violations the scanner stands behind. A finding it cannot judge is resolved to a verdict (e.g. contrast on a gradient is measured from rendered pixels) or dropped.
+- **issues**: violations the scanner stands behind. A finding the engines cannot decide is resolved to a verdict — contrast on a gradient is measured from rendered pixels, and an AI judge (vision + markup, when configured) turns the rest into a violation with a fix or a recorded pass (\`judged[]\`, with the reason). What neither can settle is dropped, never guessed.
 - **summary**: counts by severity
 
 ## Structured fixes (since v1.6.0)
@@ -473,7 +477,7 @@ const REMOTE_LOCALHOST_CAVEAT =
 const ALL_TOOLS = [
     {
       name: 'scan_page',
-      description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns `issues` (violations the scanner stands behind; uncertain findings are judged or dropped, never listed for review) and a `summary`. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
+      description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns `issues` (violations the scanner stands behind; findings the engines cannot decide are settled by the AI judge — a violation with a fix, or a pass recorded in `judged[]` with its reason — and anything unsettled is dropped, never listed for review) and a `summary`. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1079,6 +1083,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
         level: scanLevel(controls),
+        judge: judgeFor(opts),
       }
       const { result, pointers, framework } = await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, Boolean(opts.remote))
 
@@ -1191,6 +1196,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         issuesReturned: capIssues.length,
         issueEntries,
         issuesTotal,
+        // Verdicts the AI judge reached on findings the engines could not decide
+        // (violations are already in issues[]; passes are listed here with the reason).
+        ...(result.judged?.length ? { judged: result.judged } : {}),
         ...(collapsedGroups > 0
           ? { counts: 'summary.* and issuesTotal count every element. issues[] holds issueEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`). issuesReturned counts entries.' }
           : {}),
@@ -1311,6 +1319,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
+        judge: judgeFor(opts),
       }
       const result = tunnel
         ? await withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(args?.viewport as any), (page) => scan(page, verifyOptions), !!opts.remote)
@@ -1421,6 +1430,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
         level: scanLevel(diffControls),
+        judge: judgeFor(opts),
       }
       const t = parseTunnelTarget(target, String((args as any)?.tunnel_secret ?? ''))
       const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote))
@@ -1715,7 +1725,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           scannedFinalUrls.add(finalUrl)
 
           try {
-            const r = await scan(page, { includeAxe: true, dismissModals: true, mainStatus, level: scanLevel(flowControls) })
+            const r = await scan(page, { includeAxe: true, dismissModals: true, mainStatus, level: scanLevel(flowControls), judge: judgeFor(opts) })
             // Bot-challenge / interstitial guard — scan() sets `blocked` when the
             // DOM is a Cloudflare/PerimeterX/error page, not the real site. Record
             // it as NOT scanned (with the reason) so its empty issue list never
@@ -2173,7 +2183,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
 
     if (engine === 'in-process') {
       try {
-        const r = await fastScanHtml(html, { wcagTags: tags, level: scanLevel(htmlControls, tags) })
+        const r = await fastScanHtml(html, { wcagTags: tags, level: scanLevel(htmlControls, tags), judge: judgeFor(opts) })
         const issues = filterIssues(r.issues, htmlControls)
         const htmlFiltered = isFiltered(htmlControls)
         const shown = htmlFiltered ? recountSummary(issues) : r.summary
@@ -2185,6 +2195,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           ...(htmlFiltered ? { pageSummary: r.summary, filters: controlsList(htmlControls) } : {}),
           skippedVisual: r.skippedVisual,
           ...(r.engineWarnings ? { engineWarnings: r.engineWarnings } : {}),
+          ...(r.judged?.length ? { judged: r.judged } : {}),
           issues,
         }
         const text =

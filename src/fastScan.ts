@@ -15,6 +15,7 @@
  * is dropped and counted in `skippedVisual`. Use engine:"browser" for those.
  */
 import { createRequire } from 'module'
+import type { JudgeOptions, JudgedEntry } from '@webability/core'
 import { enrichIssue, type Fixability } from './fixOps.js'
 
 const require = createRequire(import.meta.url)
@@ -37,6 +38,8 @@ export interface FastScanResult {
   fragment: boolean
   issues: FastScanIssue[]
   summary: { total: number; critical: number; serious: number; moderate: number; minor: number }
+  /** AI-judge verdicts on findings the engines could not decide (text-only here). */
+  judged?: JudgedEntry[]
   skippedVisual: number
   engineWarnings?: string[]
   durationMs: number
@@ -100,7 +103,13 @@ function sharedWindow() {
   return shared
 }
 
-export async function fastScanHtml(html: string, opts: { wcagTags?: string[]; level?: 'A' | 'AA' | 'AAA' } = {}): Promise<FastScanResult> {
+export interface FastScanOptions {
+  wcagTags?: string[]
+  level?: 'A' | 'AA' | 'AAA'
+  judge?: JudgeOptions
+}
+
+export async function fastScanHtml(html: string, opts: FastScanOptions = {}): Promise<FastScanResult> {
   // The detector kernel and axe read the ambient `window`/`document`; scans
   // must not interleave. Serialise on a module-level chain.
   const run = scanning.then(() => fastScanHtmlSerial(html, opts))
@@ -108,7 +117,7 @@ export async function fastScanHtml(html: string, opts: { wcagTags?: string[]; le
   return run
 }
 
-async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[]; level?: 'A' | 'AA' | 'AAA' }): Promise<FastScanResult> {
+async function fastScanHtmlSerial(html: string, opts: FastScanOptions): Promise<FastScanResult> {
   const started = Date.now()
   const fragment = !looksLikeDocument(html)
   const doc = fragment ? `<!doctype html><html lang="en"><head><title>snippet</title></head><body><main><h1>Snippet</h1>${html}</main></body></html>` : html
@@ -118,7 +127,7 @@ async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[]; lev
   win.document.close()
 
   const { scanDocument } = await import('@webability/core/dom')
-  const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags, level: opts.level })
+  const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags, level: opts.level, judge: opts.judge })
   let skippedVisual = 0
   const project = (list: any[]) => {
     const out: FastScanIssue[] = []
@@ -138,6 +147,7 @@ async function fastScanHtmlSerial(html: string, opts: { wcagTags?: string[]; lev
     issues,
     summary: { total: issues.length, critical: count('critical'), serious: count('serious'), moderate: count('moderate'), minor: count('minor') },
     skippedVisual,
+    ...(result.judged?.length ? { judged: result.judged } : {}),
     ...(warnings.length ? { engineWarnings: warnings } : {}),
     durationMs: Date.now() - started,
   }
