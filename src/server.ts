@@ -39,6 +39,16 @@ import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } 
 /** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
 export const HOSTED_URL_ARG_KEYS: string[] = [...new Set(['url', 'startUrl', 'baselineUrl', ...VERIFY_FIX_URL_KEYS])]
 
+/** Bare domains ("webability.io") get https://. Anything that already names a scheme
+ *  (http:example.com, file://, javascript:) is left alone, so the SSRF guard still judges
+ *  and refuses it. "host:8080" is a port, not a scheme. Blank stays blank, so verify_fix
+ *  can fall through from an empty `url` to its `pageUrl` alias. */
+export function normalizeUrlArg(raw: string): string {
+  const u = raw.trim()
+  if (!u) return ''
+  return /^[a-z][a-z0-9+.-]*:(?!\d)/i.test(u) ? u : `https://${u}`
+}
+
 const execFileAsync = promisify(execFile)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
 
@@ -268,7 +278,7 @@ async function scanWithSourcePointers(
   scanOptions: Record<string, unknown>,
   remote: boolean,
 ): Promise<{ result: Awaited<ReturnType<typeof scan>>; pointers: Record<string, SourcePointer>; framework?: PageStack }> {
-  const url = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`
+  const url = normalizeUrlArg(rawUrl)
   const scanOpenPage = async (page: any, mainStatus?: number) => {
     const result = await scan(page, { ...scanOptions, mainStatus } as any)
     if (result.blocked) return { result, pointers: {} }
@@ -1047,6 +1057,15 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
 
   // Hardening for the hosted/remote (HTTP) transport: the server is internet-reachable,
   // so block local-filesystem tools and validate every outbound URL (SSRF) before any fetch.
+  // Normalise every URL arg once, before the guard, so the guard and the
+  // handler see the same value. A bare domain used to fail `new URL()` in the
+  // guard and come back as "invalid URL".
+  if (args) {
+    const a = args as Record<string, unknown>
+    for (const k of HOSTED_URL_ARG_KEYS) if (typeof a[k] === 'string' && a[k]) a[k] = normalizeUrlArg(a[k] as string)
+    if (Array.isArray(a.autoNavigate)) a.autoNavigate = a.autoNavigate.map((v) => (typeof v === 'string' && v ? normalizeUrlArg(v) : v))
+  }
+
   if (opts.remote) {
     if (name === 'find_source') {
       return toolError('find_source is disabled on the hosted MCP server — it searches a local project, which does not exist server-side.')
@@ -1671,8 +1690,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       issues?: any[]
     }
 
-    const normalize = (u: string) => (u.startsWith('http') ? u : `https://${u}`)
-    const requested = [startUrl, ...autoNav].map(normalize)
+    const requested = [startUrl, ...autoNav].map(normalizeUrlArg)
     const outcomes: PageOutcome[] = []
 
     try {
