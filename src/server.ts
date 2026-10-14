@@ -775,7 +775,7 @@ const TOOL_ANNOTATIONS: Record<string, Hints> = {
   diff_scan: read('Compare two accessibility scans', true),
   start_audit: { title: 'Start a full accessibility audit', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   get_audit: read('Get audit status and report', true),
-  add_site: { title: 'Add a site to the account', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  add_site: { title: 'Add a site to the account', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   list_sites: read('List the account sites and plans', false),
   get_install_snippet: read('Get the widget install tag', false),
   create_upgrade_link: { title: 'Get a WebAbility Pro payment link', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

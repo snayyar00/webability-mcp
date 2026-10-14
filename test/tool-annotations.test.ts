@@ -36,6 +36,9 @@ for (const remote of [false, true]) {
       // same-day report for a host, and posts findings to our API.
       assert.equal(a.destructiveHint, tool.name === 'generate_report_pdf', `${tool.name}: destructiveHint`)
       if (tool.name === 'generate_report_pdf') assert.equal(a.openWorldHint, true, 'generate_report_pdf: openWorldHint')
+      // Every tool that writes reaches our API or a third party (OpenAI's plugin
+      // review flags a write tool marked closed-world, e.g. add_site).
+      if (a.readOnlyHint === false) assert.equal(a.openWorldHint, true, `${tool.name}: a write tool must be openWorldHint: true`)
     }
   })
 }
