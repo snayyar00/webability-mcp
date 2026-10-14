@@ -74,6 +74,7 @@ test('classify: stable codes', () => {
   assert.equal(classifyToolError('Visual audit failed (502): <html>page body</html>'), 'fetch_failed: 502')
   assert.equal(classifyToolError('start_audit is rate-limited (too many audits queued). Wait and retry.'), 'rate_limited')
   assert.match(classifyToolError('Scan failed: page.goto: Timeout 30000ms exceeded.'), /^timeout/)
+  assert.match(classifyToolError("https://slow.test/ took longer than 25s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites."), /^timeout/)
   assert.match(classifyToolError('Scan failed: page.goto: net::ERR_NAME_NOT_RESOLVED at https://nope.test/?a=1'), /^navigation_failed: .*ERR_NAME_NOT_RESOLVED/)
   assert.doesNotMatch(classifyToolError('Scan failed: page.goto: net::ERR_NAME_NOT_RESOLVED at https://nope.test/?a=1'), /a=1/)
   assert.match(classifyToolError('BLOCKED: https://x.test/ was not actually scanned. Cloudflare challenge.'), /^blocked: /)

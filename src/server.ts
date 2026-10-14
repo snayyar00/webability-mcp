@@ -5,7 +5,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolRequest } f
 import { aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
-import { scan, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES } from '@webability/core'
+import { scan, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
 import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
 import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelHeadersFor } from './tunnelAuth'
@@ -149,7 +149,29 @@ export interface ServerOptions {
    *  resolveAuthToken(), which on the hosted deploy is the operator's own key
    *  and would run anonymous traffic on the operator's account. */
   anonymous?: boolean
+  /** Hosted scan_page time budget. Tests set it low; production uses SCAN_PAGE_HOSTED_DEADLINE_MS. */
+  scanPageDeadlineMs?: number
 }
+
+/** The judge stops this long before the hosted deadline, leaving time to build the reply. */
+const JUDGE_DEADLINE_MARGIN_MS = 2_000
+
+/**
+ * Cap the AI judge so it ends by `endsAt`. scan() spreads opts.judge when the
+ * judge starts (after the engines), so timeoutMs is a getter: the judge gets
+ * the time left at that moment, never more than its own budget. Without this
+ * the scan deadline fires mid-judge and discards engine findings already made.
+ */
+export function judgeWithin(judge: JudgeOptions | undefined, endsAt: number): JudgeOptions | undefined {
+  if (!judge) return undefined
+  const budget = judge.timeoutMs ?? JUDGE_DEFAULT_TIMEOUT_MS
+  const capped = { ...judge }
+  Object.defineProperty(capped, 'timeoutMs', { enumerable: true, get: () => Math.max(1, Math.min(budget, endsAt - Date.now())) })
+  return capped
+}
+
+/** Hosted scan_page stops here so the answer reaches Zapier (30s action limit) as a message, not a 504. */
+export const SCAN_PAGE_HOSTED_DEADLINE_MS = 25_000
 
 /** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT. */
 function isBlockedAddress(addr: string): boolean {
@@ -170,6 +192,9 @@ function isBlockedAddress(addr: string): boolean {
   return false
 }
 
+/** A DNS lookup that hangs would hold a hosted request past the caller's 30s limit. */
+const DNS_LOOKUP_DEADLINE_MS = 5_000
+
 /** SSRF guard: only http(s) to public, externally-resolvable addresses.
  *  NOTE residual risk: Chromium follows redirects, so a 302 to a metadata IP can re-introduce
  *  SSRF after this check. Pair with an egress proxy/allowlist in production for full coverage. */
@@ -186,7 +211,7 @@ async function assertSafeUrl(raw: string): Promise<void> {
     addrs = [u.hostname]
   } else {
     try {
-      addrs = (await dnsPromises.lookup(u.hostname, { all: true })).map((r) => r.address)
+      addrs = (await withDeadline(() => dnsPromises.lookup(u.hostname, { all: true }), DNS_LOOKUP_DEADLINE_MS, 'dns lookup')).map((r) => r.address)
     } catch {
       throw new Error(`cannot resolve host "${u.hostname}"`)
     }
@@ -247,7 +272,7 @@ function VIEWPORT_FOR_TUNNEL(preset: unknown): { width: number; height: number }
   return { width: 1280, height: 800 }
 }
 
-async function withTunnelPage<T>(url: string, tunnel: TunnelTarget | null, viewport: { width: number; height: number }, fn: (page: any, status?: number) => Promise<T>, remote: boolean): Promise<T> {
+async function withTunnelPage<T>(url: string, tunnel: TunnelTarget | null, viewport: { width: number; height: number }, fn: (page: any, status?: number) => Promise<T>, remote: boolean, signal?: AbortSignal): Promise<T> {
   const session = await openSession({
     remote,
     contextOptions: { viewport },
@@ -255,12 +280,27 @@ async function withTunnelPage<T>(url: string, tunnel: TunnelTarget | null, viewp
     // the hosted SSRF block, so a local run must not install it (localhost).
     setupContext: (context) => (tunnel || remote ? installSsrfRoute(context, tunnel) : undefined),
   })
+  if (closeOnAbort(session, signal)) throw new Error('aborted')
   try {
     const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
     return await fn(session.page, typeof response?.status === 'function' ? response.status() : undefined)
   } finally {
     await session.close()
   }
+}
+
+/**
+ * Close the browser when a deadline aborts the work, so a scan nobody is
+ * waiting for stops. True if it had already aborted (session closed now).
+ */
+function closeOnAbort(session: { close(): Promise<void> }, signal?: AbortSignal): boolean {
+  if (!signal) return false
+  if (signal.aborted) {
+    void session.close()
+    return true
+  }
+  signal.addEventListener('abort', () => void session.close(), { once: true })
+  return false
 }
 
 /**
@@ -277,6 +317,7 @@ async function scanWithSourcePointers(
   viewportPreset: unknown,
   scanOptions: Record<string, unknown>,
   remote: boolean,
+  signal?: AbortSignal,
 ): Promise<{ result: Awaited<ReturnType<typeof scan>>; pointers: Record<string, SourcePointer>; framework?: PageStack }> {
   const url = normalizeUrlArg(rawUrl)
   const scanOpenPage = async (page: any, mainStatus?: number) => {
@@ -295,7 +336,7 @@ async function scanWithSourcePointers(
   }
   // Tunnelled: the existing driver already installs the relay route before
   // the first navigation — reuse it rather than duplicate that invariant.
-  if (tunnel) return withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(viewportPreset), (page) => scanOpenPage(page), remote)
+  if (tunnel) return withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(viewportPreset), (page) => scanOpenPage(page), remote, signal)
 
   const viewport = (VIEWPORT_SIZES as Record<string, { width: number; height: number }>)[String(viewportPreset || 'desktop')] ?? VIEWPORT_SIZES.desktop
   const session = await openSession({
@@ -303,6 +344,7 @@ async function scanWithSourcePointers(
     contextOptions: { viewport },
     setupContext: (context) => (remote ? installSsrfRoute(context, null) : undefined),
   })
+  if (closeOnAbort(session, signal)) throw new Error('aborted')
   try {
     const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
     return await scanOpenPage(session.page, typeof response?.status === 'function' ? response.status() : undefined)
@@ -941,6 +983,9 @@ const handleCallTool = async (request: CallToolRequest, opts: ServerOptions = {}
 // Explicit: flow_scan re-enters dispatchTool for the single-page case.
 type ToolResponse = { content: Array<{ type: string; text?: string; [k: string]: unknown }>; isError?: boolean; [k: string]: unknown }
 const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}): Promise<ToolResponse> => {
+  // Hosted scan deadlines count from here, so URL checks (DNS) share the budget.
+  const startedAt = Date.now()
+  const scanBudgetLeft = (budget: number) => Math.max(1, budget - (Date.now() - startedAt))
   const name = request.params.name
   const args = stripAnalyticsArgs(name, request.params.arguments as Record<string, unknown> | undefined)
 
@@ -1102,9 +1147,24 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
         level: scanLevel(controls),
-        judge: judgeFor(opts),
+        // Hosted: the judge must finish inside the scan deadline (see judgeWithin).
+        judge: opts.remote ? judgeWithin(judgeFor(opts), startedAt + (opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) - JUDGE_DEADLINE_MARGIN_MS) : judgeFor(opts),
       }
-      const { result, pointers, framework } = await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, Boolean(opts.remote))
+      // Hosted only: Zapier and other HTTP callers give up at 30s and show a
+      // bare 504. Stop first and say what to do. Local stdio has no such limit.
+      const deadlineMs = opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS
+      let scanned: Awaited<ReturnType<typeof scanWithSourcePointers>>
+      try {
+        scanned = opts.remote
+          ? await withDeadline((signal) => scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, true, signal), scanBudgetLeft(deadlineMs), 'scan_page')
+          : await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, false)
+      } catch (err) {
+        if (err instanceof DeadlineError) {
+          return toolError(`${url} took longer than ${deadlineMs / 1000}s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites.`)
+        }
+        throw err
+      }
+      const { result, pointers, framework } = scanned
 
       // Blocked / bot-challenge guard — the target served a Cloudflare/Akamai/
       // PerimeterX interstitial or an HTTP error instead of the real page, so

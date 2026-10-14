@@ -157,7 +157,7 @@ export function classifyToolError(text: string): string {
   const status = first.match(/(?:failed|error|authenticate|unavailable|returned HTTP)\s*\(?(\d{3})\b/i) ?? first.match(/\bHTTP (\d{3})\b/)
   if (status) return `fetch_failed: ${status[1]}`
   if (/^Blocked URL\b|\bBlocked URL:|private (address|network)|resolves to|SSRF|not a public/i.test(first)) return `blocked_url: ${msg}`.slice(0, MAX_ERROR_CHARS)
-  if (/timeout|timed out|did not finish within/i.test(first)) return `timeout: ${msg}`.slice(0, MAX_ERROR_CHARS)
+  if (/timeout|timed out|did not finish within|took longer than/i.test(first)) return `timeout: ${msg}`.slice(0, MAX_ERROR_CHARS)
   const errno = first.match(/\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|EHOSTUNREACH|CERT_[A-Z_]+)\b/)
   if (errno) return `fetch_failed: ${errno[1]}`
   if (/net::ERR_|page\.goto|navigation|Navigation/.test(first)) return `navigation_failed: ${msg}`.slice(0, MAX_ERROR_CHARS)

@@ -112,3 +112,20 @@ test('setupContext (SSRF/relay guard) runs before the first goto, and again befo
   await s.goto('https://accesio.ro/')
   assert.deepEqual(events, ['guard0', 'goto0', 'guard1', 'goto1'])
 })
+
+test('close() during the HTTP/2 retry launch also closes the replacement browser', async () => {
+  let releaseRetry!: () => void
+  const retryGate = new Promise<void>((r) => (releaseRetry = r))
+  const w = world([[H2], [{ ok: true }]])
+  const gatedLaunch = async (o: any) => {
+    if (w.launches.length === 1) await retryGate // hold the retry launch
+    return w.launch(o)
+  }
+  const s = await createSessionOpener(gatedLaunch)({ remote: true })
+  const pending = s.goto('https://accesio.ro/')
+  await new Promise((r) => setTimeout(r, 10))
+  await s.close() // a deadline fired while the retry browser was launching
+  releaseRetry()
+  await assert.rejects(pending)
+  assert.deepEqual([...w.closed].sort(), [0, 1], 'the retry browser must not keep scanning after close()')
+})

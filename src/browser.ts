@@ -192,16 +192,25 @@ export function createSessionOpener(launch: (o: LaunchOptions) => Promise<any>) 
           if (!isHttp2ProtocolError(err) || http2Disabled) throw err
           http2Disabled = true
           const old = session.browser
-          Object.assign(session, await build(['--disable-http2']))
+          const retry = await build(['--disable-http2'])
+          // close() ran while the retry browser launched (a deadline fired):
+          // nobody is waiting, so do not scan on in the new browser.
+          if (closed) {
+            await retry.browser.close().catch(() => {})
+            throw err
+          }
+          Object.assign(session, retry)
           await old.close().catch(() => {})
           return await session.page.goto(url, gotoOpts)
         }
       },
       close: async () => {
+        closed = true
         await session.browser.close().catch(() => {})
       },
     }
     let http2Disabled = false
+    let closed = false
     return session
   }
 }
