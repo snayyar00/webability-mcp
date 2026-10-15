@@ -149,7 +149,7 @@ export interface ServerOptions {
    *  resolveAuthToken(), which on the hosted deploy is the operator's own key
    *  and would run anonymous traffic on the operator's account. */
   anonymous?: boolean
-  /** Hosted scan_page time budget. Tests set it low; production uses SCAN_PAGE_HOSTED_DEADLINE_MS. */
+  /** Hosted scan_page / diff_scan time budget. Tests set it low; production uses SCAN_PAGE_HOSTED_DEADLINE_MS. */
   scanPageDeadlineMs?: number
 }
 
@@ -170,7 +170,7 @@ export function judgeWithin(judge: JudgeOptions | undefined, endsAt: number): Ju
   return capped
 }
 
-/** Hosted scan_page stops here so the answer reaches Zapier (30s action limit) as a message, not a 504. */
+/** Hosted scan_page (and diff_scan, for both scans together) stops here so the answer reaches Zapier (30s action limit) as a message, not a 504. */
 export const SCAN_PAGE_HOSTED_DEADLINE_MS = 25_000
 
 /** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT. */
@@ -1502,17 +1502,20 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     try { diffControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
 
     type Projected = ReturnType<typeof enrichIssue> & { id: string; impact?: string }
-    const live = async (target: string): Promise<{ issues: Projected[]; blocked?: unknown }> => {
+    const live = async (target: string, signal?: AbortSignal): Promise<{ issues: Projected[]; blocked?: unknown }> => {
       const scanOptions = {
         rootSelector: args?.rootSelector as string | undefined,
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
         browser: { headless: true, timeout: 30000 },
         level: scanLevel(diffControls),
+        // Not capped (unlike scan_page): both sides share one deadline, so a
+        // "time left" cap would judge the current side less than the baseline
+        // and skew fixed/new. If the judge overruns, the deadline message wins.
         judge: judgeFor(opts),
       }
       const t = parseTunnelTarget(target, String((args as any)?.tunnel_secret ?? ''))
-      const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote))
+      const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal)
       if (result.blocked) return { issues: [], blocked: result.blocked }
       const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}) })
       return { issues: mergeSameElement(result.issues.map(project)) }
@@ -1534,10 +1537,18 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     }
 
     try {
-      const baseline = baselineId ? stored(baselineId) : await live(baselineUrl!)
-      if ((baseline as any).blocked) throw new Error(`baseline ${baselineUrl} was BLOCKED (${(baseline as any).blocked.reason}) — not scanned, cannot diff`)
-      const current = currentId ? stored(currentId) : await live(url!)
-      if ((current as any).blocked) throw new Error(`current ${url} was BLOCKED (${(current as any).blocked.reason}) — not scanned, cannot diff`)
+      const scanBoth = async (signal?: AbortSignal) => {
+        const baseline = baselineId ? stored(baselineId) : await live(baselineUrl!, signal)
+        if ((baseline as any).blocked) throw new Error(`baseline ${baselineUrl} was BLOCKED (${(baseline as any).blocked.reason}) — not scanned, cannot diff`)
+        const current = currentId ? stored(currentId) : await live(url!, signal)
+        if ((current as any).blocked) throw new Error(`current ${url} was BLOCKED (${(current as any).blocked.reason}) — not scanned, cannot diff`)
+        return { baseline, current }
+      }
+      // Hosted only, as scan_page: one budget covers both live scans so the
+      // HTTP caller gets this answer before its 30s limit, not a 504.
+      const { baseline, current } = opts.remote
+        ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS), 'diff_scan')
+        : await scanBoth()
 
       // Match key. WebAbility/axe ids are `<engine>-<rule>-<selector hash>` and
       // stable across scans. HTML_CodeSniffer / deep ids embed the result INDEX
@@ -1602,6 +1613,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         ],
       }
     } catch (err) {
+      if (err instanceof DeadlineError) {
+        return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites.`)
+      }
       return toolError(`diff_scan failed: ${(err as Error).message}`)
     }
   }

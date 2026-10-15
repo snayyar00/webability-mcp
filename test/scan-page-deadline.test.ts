@@ -20,6 +20,30 @@ test('hosted scan_page deadline sits under the 30s Zapier limit', () => {
   assert.ok(SCAN_PAGE_HOSTED_DEADLINE_MS <= 25_000)
 })
 
+async function slowClient() {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  // 1 ms: the deadline fires while the browser is still launching.
+  const server = createServer({ remote: true, authToken: 'test-token', scanPageDeadlineMs: 1 })
+  const client = new Client({ name: 'test', version: '1' }, { capabilities: {} })
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+  return client
+}
+
+test('hosted diff_scan (two live scans) stops at the same deadline', async () => {
+  const client = await slowClient()
+  const started = Date.now()
+  const res: any = await client.callTool({
+    name: 'diff_scan',
+    arguments: { baselineUrl: 'https://1.1.1.1/', url: 'https://1.0.0.1/', context: 'Checking the hosted diff deadline stops slow scans.' },
+  })
+  const text = textOf(res)
+  assert.equal(res.isError, true)
+  assert.match(text, /took longer than 0\.001s to scan/)
+  assert.match(text, /start_audit/)
+  assert.ok(Date.now() - started < 10_000, 'must return at the deadline, not after both scans')
+  await client.close()
+})
+
 test('hosted scan_page that runs past its deadline returns a clear error, not a hang', async () => {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   // 1 ms: the deadline fires while the browser is still launching.
@@ -76,4 +100,16 @@ test('hosted judge budget shrinks to the time left, read when the judge starts',
   assert.equal({ ...judgeWithin({ timeoutMs: 20_000 }, Date.now() + 60_000)! }.timeoutMs, 20_000)
   // Judge off stays off.
   assert.equal(judgeWithin(undefined, endsAt), undefined)
+})
+
+test('hosted diff_scan does not cap the judge: a cut judge on one side would skew the diff', async () => {
+  // Both live scans share one deadline. Capping the judge to "time left" gives
+  // the baseline its full budget and the current side the remainder, so judge
+  // findings would show as fixed / never as new. Better a timeout message than
+  // a wrong diff: the judge keeps its own equal budget on both sides.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8')
+  const diff = src.slice(src.indexOf("if (name === 'diff_scan') {"), src.indexOf('const stored = (id: string)'))
+  assert.ok(diff.includes('judge: judgeFor(opts)'), 'diff_scan must pass the uncapped judge')
+  assert.ok(!diff.includes('judgeWithin('), 'diff_scan must not cap the judge per side')
 })
