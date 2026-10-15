@@ -383,7 +383,16 @@ const renderFindings = renderFindingsBlock
 export function tunnelTargetForCall(name: string, args: Record<string, unknown> | undefined): TunnelTarget | null {
   const a = (args ?? {}) as any
   const raw = name !== 'verify_fix' ? a.url ?? a.startUrl ?? '' : verifyFixTargetUrl(args) ?? ''
-  return parseTunnelTarget(String(raw), String(a.tunnel_secret ?? ''))
+  return tunnelTargetFor(String(raw), a.tunnel_secret)
+}
+
+/** Pair a URL with a secret the way the handlers will see them. dispatchTool
+ *  normalises URL args (bare domain -> https://...) AFTER it derives the tunnel,
+ *  so the raw value is normalised here too: a scheme-less tunnel URL used to
+ *  parse as "not a tunnel" and then be refused as "no tunnel_secret passed". A
+ *  secret pasted with a trailing newline is trimmed for the same reason. */
+export function tunnelTargetFor(rawUrl: string, secret: unknown): TunnelTarget | null {
+  return parseTunnelTarget(normalizeUrlArg(rawUrl), String(secret ?? '').trim())
 }
 
 /** Exported for palette-ssrf.e2e.ts: the guard's BEHAVIOUR needs a real
@@ -1514,7 +1523,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         // and skew fixed/new. If the judge overruns, the deadline message wins.
         judge: judgeFor(opts),
       }
-      const t = parseTunnelTarget(target, String((args as any)?.tunnel_secret ?? ''))
+      const t = tunnelTargetFor(target, (args as any)?.tunnel_secret)
       const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal)
       if (result.blocked) return { issues: [], blocked: result.blocked }
       const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}) })
