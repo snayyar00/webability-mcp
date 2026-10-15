@@ -70,7 +70,15 @@ for (const remote of [false, true]) {
     assert.equal(item.uri, CARD_RESOURCE_URI)
     assert.equal(item.mimeType, CARD_MIME_TYPE)
     assert.equal(item.text, cardHtml())
-    assert.equal(item._meta?.ui?.prefersBorder, true)
+    // The same _meta on the listing and the read result: a host takes the
+    // read result's _meta.ui whole, so a key missing there is lost.
+    for (const [where, meta] of [['list', (card as any)._meta], ['read', item._meta]] as const) {
+      assert.equal(meta?.ui?.prefersBorder, true, `${where}: prefersBorder`)
+      assert.deepEqual(meta?.ui?.csp, { connectDomains: [], resourceDomains: [] }, `${where}: empty CSP declared`)
+      assert.deepEqual(meta?.['openai/widgetCSP'], { connect_domains: [], resource_domains: [], redirect_domains: ['https://www.webability.io'] }, `${where}: ChatGPT CSP mirror`)
+      assert.equal(meta?.['openai/widgetPrefersBorder'], true, `${where}: ChatGPT border mirror`)
+      assert.match(String(meta?.['openai/widgetDescription']), /Do not repeat/, `${where}: model told the card shows the result`)
+    }
   })
 }
 

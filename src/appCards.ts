@@ -28,6 +28,23 @@ export const cardExtension = () => ({ 'io.modelcontextprotocol/ui': { mimeTypes:
 /** Tool `_meta` that points an Apps host at the card. */
 export const cardToolMeta = () => ({ ui: { resourceUri: CARD_RESOURCE_URI } })
 
+/**
+ * Resource `_meta`, on both the listing and the read result (a host takes the
+ * read result's `_meta.ui` whole, with no merge). The card is fully inline, so
+ * its CSP is declared empty: no fetches, no remote assets. Declaring it, even
+ * empty, is what lets ChatGPT apply a CSP; with none it labels the card
+ * "CSP off". The `openai/*` keys mirror the same policy for ChatGPT, plus the
+ * one place the card sends the user (the report link) and a description that
+ * stops the model restating what the card already shows.
+ */
+export const cardResourceMeta = () => ({
+  ui: { prefersBorder: true, csp: { connectDomains: [] as string[], resourceDomains: [] as string[] } },
+  'openai/widgetPrefersBorder': true,
+  'openai/widgetCSP': { connect_domains: [] as string[], resource_domains: [] as string[], redirect_domains: [new URL(REPORT_PAGE).origin] },
+  'openai/widgetDescription':
+    'Shows the result to the user: the page URL, the WCAG level, the issue count by impact, the top issues with their WCAG criteria and elements, and a link to the full report. Do not repeat these details; answer in one or two sentences with what to do next.',
+})
+
 /** resources/list entry. */
 export const cardResource = () => ({
   uri: CARD_RESOURCE_URI,
@@ -35,11 +52,12 @@ export const cardResource = () => ({
   title: 'WebAbility result card',
   description: 'Renders scan_page and verify_fix results as a card.',
   mimeType: CARD_MIME_TYPE,
+  _meta: cardResourceMeta(),
 })
 
-/** resources/read contents. Fully inline, so no CSP domains are declared. */
+/** resources/read contents. */
 export const cardResourceContents = () => ({
-  contents: [{ uri: CARD_RESOURCE_URI, mimeType: CARD_MIME_TYPE, text: cardHtml(), _meta: { ui: { prefersBorder: true } } }],
+  contents: [{ uri: CARD_RESOURCE_URI, mimeType: CARD_MIME_TYPE, text: cardHtml(), _meta: cardResourceMeta() }],
 })
 
 type Summary = { total: number; critical: number; serious: number; moderate: number; minor: number }
