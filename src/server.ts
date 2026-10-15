@@ -1,7 +1,8 @@
 // Side-effect-free server module: builds a configured MCP Server with all tools.
 // Both entry points (index.ts = stdio, http.ts = Streamable HTTP) import createServer from here.
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, ErrorCode, ListResourcesRequestSchema, ListToolsRequestSchema, McpError, ReadResourceRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js'
+import { CARD_RESOURCE_URI, CARD_TOOLS, cardExtension, cardResource, cardResourceContents, cardToolMeta, scanCard, verifyCard } from './appCards.js'
 import { aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
@@ -898,6 +899,8 @@ function handleListTools(opts: ServerOptions = {}) {
       return tool
     })
     .map(withAnnotations)
+    // MCP Apps hosts render these two results as a card (see appCards.ts).
+    .map((tool) => (CARD_TOOLS.has(tool.name) ? { ...tool, _meta: cardToolMeta() } : tool))
   return { tools }
 }
 
@@ -1301,7 +1304,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         scanHeadline({ url, shown: shownSummary, ...(filtered ? { page: mergedSummary, filters: controlsList(controls) } : {}), issueEntries, collapsedGroups }) +
         note
 
-      const response = {
+      const response: ToolResponse = {
+        structuredContent: scanCard({ url, summary: shownSummary, issues: sortedIssues, issuesTotal, framework: payload.framework, level: scanLevel(controls), ...(filtered ? { filters: controlsList(controls), pageSummary: mergedSummary } : {}), at: new Date().toISOString() }),
         content: [
           { type: 'text', text: summary },
           renderFindings(
@@ -1445,6 +1449,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
             ? `UNVERIFIED: \`${selector}\` matches no element at ${url}, so nothing was checked. If your fix changed the element's class/id, pass its current selector. If the fix removed the element, a selector cannot verify it — re-run scan_page and confirm the issue is no longer listed.`
             : `UNVERIFIED: \`${selector}\` is not a valid CSS selector, so the check could not be scoped to an element. Pass a valid selector (scan_page returns one per issue).`
         return {
+          structuredContent: verifyCard({ url, selector, wcag, verified: false, reason, remainingCount: null, remainingIssues: [], at: new Date().toISOString() }),
           content: [
             { type: 'text', text },
             { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, remainingCount: null, remainingIssues: [] }, null, 2) + '\n```' },
@@ -1489,6 +1494,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         : `NOT RESOLVED: ${remaining.length} ${wcag ? `${wcag} ` : ''}violation(s) still present on \`${selector}\` at ${url}. The fix did not clear them — see remainingIssues[] for what remains.`
 
       return {
+        structuredContent: verifyCard({ url, selector, wcag, verified: resolved, remainingCount: remaining.length, remainingIssues: evidence, at: new Date().toISOString() }),
         content: [
           { type: 'text', text },
           { type: 'text', text: '```json\n' + JSON.stringify(payload, null, 2) + '\n```' },
@@ -2775,9 +2781,14 @@ export function createServer(opts: ServerOptions = {}) {
   const isLite = !opts.remote
   const server = new Server(
     { name: isLite ? 'webability-lite' : 'webability', version: MCP_VERSION },
-    { capabilities: { tools: {} }, instructions: buildInstructions(isLite) },
+    { capabilities: { tools: {}, resources: {}, extensions: cardExtension() }, instructions: buildInstructions(isLite) },
   )
   server.setRequestHandler(ListToolsRequestSchema, () => handleListTools(opts))
+  server.setRequestHandler(ListResourcesRequestSchema, () => ({ resources: [cardResource()] }))
+  server.setRequestHandler(ReadResourceRequestSchema, (req) => {
+    if (req.params.uri !== CARD_RESOURCE_URI) throw new McpError(ErrorCode.InvalidParams, `Unknown resource: ${req.params.uri}`)
+    return cardResourceContents()
+  })
   server.setRequestHandler(CallToolRequestSchema, (req) => handleCallTool(req, opts))
   enablePostHogMcpAnalytics(server, opts)
   keepAnalyticsArgsOptional(server)
