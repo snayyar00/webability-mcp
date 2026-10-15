@@ -114,6 +114,7 @@ const WEBABILITY_RULE_META: Record<string, RuleFixMeta> = {
   combobox_name_missing: { op: 'add-attribute', attribute: 'aria-label', fixability: 'contextual' },
   label_in_name: { op: 'set-attribute', attribute: 'aria-label', fixability: 'contextual' },
   missing_semantic_role: { op: 'add-attribute', attribute: 'role', fixability: 'contextual' },
+  missing_document_language: { op: 'add-attribute', attribute: 'lang', fixability: 'contextual' },
   missing_landmark: { op: 'add-attribute', attribute: 'role', fixability: 'contextual' },
   nested_landmark: { op: 'remove-attribute', attribute: 'role', fixability: 'contextual' },
   landmark_duplicate_unlabeled: { op: 'add-attribute', attribute: 'aria-label', fixability: 'contextual' },

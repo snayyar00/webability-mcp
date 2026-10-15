@@ -25,7 +25,9 @@ const RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, min
 /** Rule ids that all mean "this element has no accessible name", across engines. */
 const NAME_RULES = new Set([
   // form controls
-  'missing_label', 'label', 'select-name', 'aria-input-field-name',
+  // f68 is HTML_CodeSniffer's "form field is not labelled" (WCAG failure F68),
+  // reported next to h91_*_name on the same field (AU before page #captcha).
+  'missing_label', 'label', 'select-name', 'aria-input-field-name', 'f68',
   // links
   'empty_link', 'link-name',
   // images

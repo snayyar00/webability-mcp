@@ -207,3 +207,20 @@ test('merge leaves a group alone when any rule appears more than once on the sel
   assert.equal(out.length, 3)
   assert.equal(recountSummary(out, []).critical, 2)
 })
+
+// AU before page (washington.edu/accesscomputing/AU/before.html, 2026-10-14):
+// the captcha field came back as h91_inputtext_name (4.1.2) AND f68 (1.3.1) —
+// both HTML_CodeSniffer, both "this field has no label". F68 is the WCAG
+// failure technique for an unlabelled form control: one problem, one fix.
+test('merge: f68 + h91_inputtext_name on one field become one issue', () => {
+  const out = mergeSameElement([
+    { id: 'htmlcs-27-2vej3z', impact: 'moderate', wcag: '4.1.2', type: 'h91_inputtext_name', selector: '#captcha > input', fix: { op: 'suggest' } },
+    { id: 'htmlcs-28-2vej3z', impact: 'moderate', wcag: '1.3.1', type: 'f68', selector: '#captcha > input', fix: { op: 'suggest' } },
+    { id: 'wa-missing_alt-n237ns', impact: 'serious', wcag: '1.1.1', type: 'missing_alt', selector: '#captcha > img', fix: { op: 'add-attribute', attribute: 'alt' } },
+  ])
+  assert.equal(out.length, 2)
+  const field = out.find((i) => i.selector === '#captcha > input')!
+  assert.equal(field.wcag, '1.3.1,4.1.2')
+  assert.deepEqual([...field.rules!].sort(), ['f68', 'h91_inputtext_name'])
+  assert.equal(nameFamilyKey({ type: 'f68', selector: '#captcha > input' }), 'name|#captcha > input')
+})
