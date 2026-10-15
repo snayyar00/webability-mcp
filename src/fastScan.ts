@@ -15,7 +15,7 @@
  * is dropped and counted in `skippedVisual`. Use engine:"browser" for those.
  */
 import { createRequire } from 'module'
-import type { JudgeOptions, JudgedEntry } from '@webability/core'
+import type { InternalBug, JudgeOptions, JudgedEntry } from '@webability/core'
 import { enrichIssue, type Fixability } from './fixOps.js'
 
 const require = createRequire(import.meta.url)
@@ -42,6 +42,7 @@ export interface FastScanResult {
   judged?: JudgedEntry[]
   skippedVisual: number
   engineWarnings?: string[]
+  internal_bugs?: InternalBug[]
   durationMs: number
 }
 
@@ -149,6 +150,7 @@ async function fastScanHtmlSerial(html: string, opts: FastScanOptions): Promise<
     skippedVisual,
     ...(result.judged?.length ? { judged: result.judged } : {}),
     ...(warnings.length ? { engineWarnings: warnings } : {}),
+    internal_bugs: result.internal_bugs ?? [],
     durationMs: Date.now() - started,
   }
 }

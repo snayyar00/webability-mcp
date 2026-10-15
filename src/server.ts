@@ -1287,6 +1287,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         // Verdicts the AI judge reached on findings the engines could not decide
         // (violations are already in issues[]; passes are listed here with the reason).
         ...(result.judged?.length ? { judged: result.judged } : {}),
+        // Invariant P gate metric (bar 0): findings / page changes our own tooling caused.
+        internal_bugs: result.internal_bugs ?? [],
         ...(collapsedGroups > 0
           ? { counts: 'summary.* and issuesTotal count every element. issues[] holds issueEntries entries: an entry with `count` stands for that many elements of one rule with one fix (see `examples`, `expand`). issuesReturned counts entries.' }
           : {}),
@@ -2297,6 +2299,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           skippedVisual: r.skippedVisual,
           ...(r.engineWarnings ? { engineWarnings: r.engineWarnings } : {}),
           ...(r.judged?.length ? { judged: r.judged } : {}),
+          internal_bugs: r.internal_bugs ?? [],
           issues,
         }
         const text =
