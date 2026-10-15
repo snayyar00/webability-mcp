@@ -1406,9 +1406,11 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       // Re-scan scoped to the fixed element only — a focused, fast check rather
       // than a whole-page scan. Same engine and options as scan_page.
       const verifyOptions = {
-        // The caller named one rule/criterion; check it whatever its level
-        // (an AAA criterion would otherwise be gated out and read as fixed).
-        level: 'AAA' as const,
+        // A named rule/criterion is checked whatever its level (an AAA
+        // criterion would otherwise be gated out and read as fixed). With no
+        // criterion the element must be clean at AA, the conformance level —
+        // at AAA a 5.3:1 fix read as NOT RESOLVED over the 7:1 rule.
+        level: (wcag ? 'AAA' : 'AA') as 'AAA' | 'AA',
         rootSelector: selector,
         viewport: (args?.viewport as any) || 'desktop',
         dismissModals: true,
