@@ -1,6 +1,6 @@
 # WebAbility MCP
 
-Accessibility checks your coding agent can act on: scan a page with three engines, get a structured fix for each issue, then re-check that the fix landed.
+Accessibility checks your coding agent can act on: scan a page with two engines, get a structured fix for each issue, then re-check that the fix landed.
 
 Free. Hosted at `https://mcp.webability.io/mcp`. No API key for scans. MIT.
 
@@ -119,13 +119,12 @@ Optional env:
 
 ## Scan engines
 
-`scan_page` runs three engines in parallel and deduplicates the results:
+`scan_page` runs two engines in parallel and deduplicates the results:
 
 | Engine | Rules | What it covers |
 |--------|-------|----------------|
 | WebAbility detectors | 60+ | Gradient-aware contrast, weak names, decorative icons, landmark hierarchy, ARIA correctness, link consistency, target size, keyboard traps |
 | axe-core | 104 | Industry-standard WCAG 2.2 baseline |
-| HTML_CodeSniffer | 200+ | Section 508 + WCAG techniques cross-reference |
 
 ## Three-tier output (since v1.2.1)
 
@@ -187,7 +186,7 @@ Filters apply before the 50-item cap, so `minImpact: "serious"` returns every se
 
 | Tool | Edition | What it does |
 |------|---------|--------------|
-| `scan_page` | Lite + Full | Scan a URL for WCAG accessibility issues (3 engines). `source` pointers on dev builds; `minImpact` / `rules` / `wcag` / `format` output controls |
+| `scan_page` | Lite + Full | Scan a URL for WCAG accessibility issues (2 engines). `source` pointers on dev builds; `minImpact` / `rules` / `wcag` / `format` output controls |
 | `flow_scan` | Lite + Full | Multi-page journey scan with deduplicated issues across pages |
 | `scan_html` | Lite + Full | Scan a raw HTML snippet or fragment in-process (jsdom, ms, no browser); `engine: "browser"` for contrast |
 | `detect_framework` | Lite + Full | Detect Tailwind / MUI / Bootstrap / Next.js / WP / plain CSS |
@@ -208,7 +207,7 @@ Filters apply before the 50-item cap, so `minImpact: "serious"` returns every se
 
 - Building a new component and want it accessible from day one
 - Auditing a localhost / staging build before pushing
-- Triaging a Lighthouse / axe report — `scan_page` consolidates all three engines
+- Triaging a Lighthouse / axe report — `scan_page` consolidates both engines
 - Generating fix suggestions that match the framework you're already using
 - Checking color contrast against the user's actual brand palette (not generic suggestions)
 

@@ -483,8 +483,7 @@ ${edition}
 ## Engines used by scan_page
 - WebAbility detectors (60+ rules — gradient-aware contrast, weak names, decorative-icon detection, etc.)
 - axe-core (104 rules)
-- HTML_CodeSniffer (200+ rules)
-Results from all three are deduplicated into one issue list.
+Results from both are deduplicated into one issue list.
 
 ## Output (the scanner judges uncertain findings itself)
 \`scan_page\` and \`flow_scan\` return:
@@ -1570,11 +1569,12 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         : await scanBoth()
 
       // Match key. WebAbility/axe ids are `<engine>-<rule>-<selector hash>` and
-      // stable across scans. HTML_CodeSniffer / deep ids embed the result INDEX
-      // (`htmlcs-3-<hash>`), which shifts whenever any earlier finding changes
-      // — keyed by id they would read as one fixed + one new. Key those by
-      // rule + criterion + selector instead.
-      // Two things make an id useless as a diff key: HTML_CodeSniffer / deep
+      // stable across scans. Legacy ids from archived scans (the removed
+      // HTML_CodeSniffer engine, `htmlcs-3-<hash>`) and deep ids embed the
+      // result INDEX, which shifts whenever any earlier finding changes — keyed
+      // by id they would read as one fixed + one new. Key those by rule +
+      // criterion + selector instead.
+      // Two things make an id useless as a diff key: legacy htmlcs / deep
       // ids carry the result INDEX, and any engine's hash covers the selector —
       // which changes every load when a framework mints the element id
       // (Google Sign-In `gsi_<n>_<n>`, Radix / Headless UI / MUI counters,
@@ -1870,7 +1870,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         selector: i.selector,
         html: i.html?.slice(0, 400),
         fix: i.fix,
-        // core's `source` is the ENGINE name ('webability' | 'axe' | 'htmlcs');
+        // core's `source` is the ENGINE name ('webability' | 'axe');
         // only the pointer object attached above is a source pointer.
         ...(i.source && typeof i.source === 'object' ? { source: i.source } : {}),
       })

@@ -124,6 +124,8 @@ const WEBABILITY_RULE_META: Record<string, RuleFixMeta> = {
   multiple_h1: { op: 'suggest', fixability: 'contextual' },
   skip_link: { op: 'add-element', fixability: 'contextual' },
   broken_anchor: { op: 'set-attribute', attribute: 'href', fixability: 'contextual' },
+  form_missing_submit: { op: 'suggest', fixability: 'contextual' },
+  decorative_image_with_title: { op: 'suggest', fixability: 'contextual' },
   adjacent_redundant_link: { op: 'suggest', fixability: 'contextual' },
   new_window_link: { op: 'set-attribute', attribute: 'aria-label', fixability: 'contextual' },
   external_link_warning: { op: 'set-attribute', attribute: 'aria-label', fixability: 'contextual' },

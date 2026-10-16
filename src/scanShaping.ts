@@ -1,7 +1,7 @@
 /**
  * Response shaping for scan_page / flow_scan / diff_scan (wave 4).
  *
- * 1. mergeSameElement — three engines (WebAbility, axe-core, HTML_CodeSniffer)
+ * 1. mergeSameElement — two engines (WebAbility, axe-core)
  *    report the same "no accessible name" problem on one element under
  *    different rule ids and criteria. demo.vercel.store's search input came
  *    back as wa-missing_label (1.3.1 serious, add aria-label) AND
@@ -25,8 +25,8 @@ const RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, min
 /** Rule ids that all mean "this element has no accessible name", across engines. */
 const NAME_RULES = new Set([
   // form controls
-  // f68 is HTML_CodeSniffer's "form field is not labelled" (WCAG failure F68),
-  // reported next to h91_*_name on the same field (AU before page #captcha).
+  // f68 / h37 / h91_*_name are legacy HTML_CodeSniffer types (engine removed);
+  // kept so archived scans still merge and diff_scan baselines still line up.
   'missing_label', 'label', 'select-name', 'aria-input-field-name', 'f68',
   // links
   'empty_link', 'link-name',
@@ -205,8 +205,8 @@ const onlyParsing = (wcag: string | undefined) => {
 }
 
 /**
- * Drop findings whose only criterion is 4.1.1 (duplicate_id, HTML_CodeSniffer
- * f77, axe duplicate-id / duplicate-id-active). WCAG 4.1.1 Parsing is obsolete
+ * Drop findings whose only criterion is 4.1.1 (duplicate_id, legacy
+ * HTML_CodeSniffer f77 in archived scans, axe duplicate-id / duplicate-id-active). WCAG 4.1.1 Parsing is obsolete
  * in WCAG 2.2 and always satisfied for HTML; a duplicate id only harms users
  * when a label/aria reference resolves to the wrong element, and those cases
  * are reported under 1.3.1 / 4.1.2. axe duplicate-id-aria is tagged 4.1.2 and
