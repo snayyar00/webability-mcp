@@ -15,8 +15,8 @@ importers:
         specifier: 0.17.0
         version: 0.17.0(@modelcontextprotocol/sdk@1.32.0(zod@4.6.5))(posthog-node@5.55.0)
       '@webability/core':
-        specifier: 1.8.0
-        version: 1.8.0(playwright-core@1.59.1)(playwright@1.59.1)
+        specifier: 1.9.0
+        version: 1.9.0(playwright-core@1.59.1)(playwright@1.59.1)
       axe-core:
         specifier: ^4.11.3
         version: 4.13.0
@@ -643,8 +643,8 @@ packages:
   '@types/ws@8.18.2':
     resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
-  '@webability/core@1.8.0':
-    resolution: {integrity: sha512-biIN8zA0bKr5xwNOY7Q1PbHoON1lLGibcv4ksQJfqIHBGSPhkHagWuQelB0bkBvI9qo9OIVGTCuNd9Qbb9/3ZA==}
+  '@webability/core@1.9.0':
+    resolution: {integrity: sha512-xxZULjlVllujN02f4fl74r/FPR0OUqdKO+nFoZnB2CiR3h9JJaTQN6WXZQURSJPdQNqx5Qi+sN2kbRAgdCMWeA==}
     engines: {node: '>=18'}
     peerDependencies:
       playwright: ^1.40.0
@@ -754,6 +754,10 @@ packages:
   css-tree@3.2.1:
     resolution: {integrity: sha512-X7sjQzceUhu1u7Y/ylrRZFU2FS6LRiFVp6rKLPg23y3x3c3DOKAwuXGDp+PAGjh6CSnCjYeAul8pcT8bAl+lSA==}
     engines: {node: ^10 || ^12.20.0 || ^14.13.0 || >=15.0.0}
+
+  css-what@6.2.2:
+    resolution: {integrity: sha512-u/O3vwbptzhMs3L1fQE82ZSLHQQfto5gyZzwteVIEyeaY5Fc7R4dapF/BvRoSYFeqfBk4m0V1Vafq5Pjv25wvA==}
+    engines: {node: '>= 6'}
 
   data-urls@7.0.0:
     resolution: {integrity: sha512-23XHcCF+coGYevirZceTVD7NdJOqVn+49IHyxgszm+JIiHLoB2TkmPtsYkNWT1pvRSGkc35L6NHs0yHkN2SumA==}
@@ -1713,9 +1717,10 @@ snapshots:
     dependencies:
       '@types/node': 25.9.9
 
-  '@webability/core@1.8.0(playwright-core@1.59.1)(playwright@1.59.1)':
+  '@webability/core@1.9.0(playwright-core@1.59.1)(playwright@1.59.1)':
     dependencies:
       '@axe-core/playwright': 4.13.0(playwright-core@1.59.1)
+      css-what: 6.2.2
     optionalDependencies:
       playwright: 1.59.1
     transitivePeerDependencies:
@@ -1815,6 +1820,8 @@ snapshots:
     dependencies:
       mdn-data: 2.27.1
       source-map-js: 1.2.2
+
+  css-what@6.2.2: {}
 
   data-urls@7.0.0:
     dependencies:
