@@ -50,6 +50,11 @@ const looksLikeDocument = (html: string) => /<html[\s>]|<!doctype/i.test(html)
 
 function installLayoutShims(win: any) {
   const Element = win.Element
+  // jsdom's getComputedStyle reads the element's inline style and throws on
+  // elements that have none (a MathML root: <math lang="en">). Such an element
+  // gets an empty declaration, as an unstyled element would.
+  const computed = win.getComputedStyle.bind(win)
+  win.getComputedStyle = (el: any, pseudo?: string) => (el && el.style === undefined ? win.document.createElement('div').style : computed(el, pseudo))
   const rect = (el: any) => {
     const style = win.getComputedStyle(el)
     if (style && style.display === 'none') return null
@@ -76,6 +81,26 @@ function installLayoutShims(win: any) {
   if (win.HTMLCanvasElement) {
     win.HTMLCanvasElement.prototype.getContext = () => null
   }
+  // No layout means no hit testing: nothing is at any point.
+  win.Document.prototype.elementFromPoint = () => null
+  win.Document.prototype.elementsFromPoint = () => []
+  // jsdom has no CSS namespace; the kernel builds selectors with CSS.escape.
+  if (!win.CSS) win.CSS = { escape: cssEscape }
+}
+
+/** CSS.escape per CSSOM §2.1.1 (serialize an identifier). */
+function cssEscape(value: unknown): string {
+  const s = String(value)
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c === 0) out += '\uFFFD'
+    else if ((c >= 0x1 && c <= 0x1f) || c === 0x7f || (i === 0 && c >= 0x30 && c <= 0x39) || (i === 1 && c >= 0x30 && c <= 0x39 && s.charCodeAt(0) === 0x2d)) out += '\\' + c.toString(16) + ' '
+    else if (i === 0 && c === 0x2d && s.length === 1) out += '\\' + s[i]
+    else if (c >= 0x80 || c === 0x2d || c === 0x5f || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) out += s[i]
+    else out += '\\' + s[i]
+  }
+  return out
 }
 
 let scanning: Promise<unknown> = Promise.resolve()
@@ -99,7 +124,14 @@ function sharedWindow() {
   const win = dom.window as any
   installLayoutShims(win)
   const g = globalThis as any
-  g.window = win; g.document = win.document; g.Node = win.Node; g.Element = win.Element; g.HTMLElement = win.HTMLElement; g.getComputedStyle = win.getComputedStyle
+  // Detectors run in Node's realm and read DOM globals (NodeFilter, CSS,
+  // HTMLInputElement...) as free identifiers: expose every jsdom global Node
+  // lacks. Lazy getters, so a throwing accessor (localStorage on an opaque
+  // origin) throws only if a detector reads it.
+  for (const k of Object.getOwnPropertyNames(win)) {
+    if (k in g) continue
+    Object.defineProperty(g, k, { configurable: true, get: () => win[k] })
+  }
   shared = { dom, win }
   return shared
 }
@@ -127,7 +159,12 @@ async function fastScanHtmlSerial(html: string, opts: FastScanOptions): Promise<
   win.document.write(doc)
   win.document.close()
 
-  const { scanDocument } = await import('@webability/core/dom')
+  const { scanDocument, installDomKernel } = await import('@webability/core/dom')
+  // Detector functions run in Node's realm and read the kernel helpers
+  // (isVisible, uniqueSel, isHiddenFromAT...) as free identifiers: install them
+  // on Node's globalThis (scanDocument installs them on the jsdom window only),
+  // or every detector throws and scan_html runs axe alone. Idempotent.
+  installDomKernel(globalThis)
   const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags, level: opts.level, judge: opts.judge })
   let skippedVisual = 0
   const project = (list: any[]) => {
