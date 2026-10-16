@@ -3,7 +3,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ErrorCode, ListResourcesRequestSchema, ListToolsRequestSchema, McpError, ReadResourceRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js'
 import { CARD_RESOURCE_URI, CARD_TOOLS, cardExtension, cardResource, cardResourceContents, cardToolMeta, scanCard, verifyCard } from './appCards.js'
-import { aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
+import { AI_FIX_FRAMEWORKS, aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
 import { scan, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
@@ -28,7 +28,7 @@ import { enablePostHogMcpAnalytics } from './posthog.js'
 import { MCP_VERSION } from './version.js'
 import { generateReportPdf, type PdfIssue } from './reportPdf.js'
 import { axeRuleFixMeta, enrichIssue, webabilityRuleFixMeta, FIXABILITY_TIERS, type Fixability } from './fixOps.js'
-import { INLINE_BUDGET, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
+import { IMPACT_RANK, INLINE_BUDGET, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote } from './scanShaping.js'
 import { fastScanHtml } from './fastScan.js'
@@ -56,17 +56,7 @@ const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 
 /** AI-judge options for this request (see judgeConfig.ts). Undefined = judge skipped. */
 const judgeFor = (opts: ServerOptions) => judgeOptionsFromEnv({ remote: opts.remote, anonymous: opts.anonymous, authToken: opts.authToken, apiUrl: API_URL })
 
-/**
- * Severity ordering for the axe-style impact taxonomy (`critical > serious >
- * moderate > minor`, matching `IssueImpact` in @webability/core). Used to sort
- * issue lists by severity BEFORE they are capped to RESULT_CAP — otherwise a
- * page with more findings than the cap can silently drop every critical issue
- * just because lower-severity findings happened to come first in the unsorted
- * detector output.
- */
-const IMPACT_RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, minor: 1 }
-
-/** Descending severity sort (highest-impact first). Stable, non-mutating. */
+/** Descending severity sort (highest-impact first). Stable, non-mutating. Runs BEFORE the RESULT_CAP so a cap never drops criticals. */
 function bySeverityDesc<T extends { impact?: string }>(list: readonly T[]): T[] {
   return [...list].sort((a, b) => (IMPACT_RANK[b.impact ?? ''] ?? 0) - (IMPACT_RANK[a.impact ?? ''] ?? 0))
 }
@@ -2132,11 +2122,10 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       // is how an aria-label fix ended up shaped like a CSS rule — `.x[aria-label='…'] {}` —
       // which is not something a developer can apply. So for web attribute fixes we
       // deterministically render `attribute="value"` and ignore the CSS-shaped snippet.
-      const WEB_FRAMEWORKS = new Set(['tailwind', 'bootstrap', 'mui', 'wordpress', 'nextjs', 'plain-css'])
       const isStylingAttribute = (attr: string) => attr === 'style' || attr === 'class' || attr === 'className'
       const renderFixCode = (a: any) => {
         const attributeHtml = `${a.attribute}="${a.value}"`
-        const isWebAttributeFix = WEB_FRAMEWORKS.has(framework) && a.attribute && !isStylingAttribute(a.attribute)
+        const isWebAttributeFix = AI_FIX_FRAMEWORKS.has(framework) && a.attribute && !isStylingAttribute(a.attribute)
         // Web attribute fix → always the HTML attribute. Styling / native fixes → keep the
         // framework snippet, falling back to the attribute form when the AI omitted it.
         return isWebAttributeFix ? attributeHtml : (a.frameworkCode || attributeHtml)

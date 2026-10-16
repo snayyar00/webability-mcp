@@ -18,9 +18,7 @@
  * 3. truncationNote — the hosted server keeps no scan history, so its note
  *    must point at the narrowing controls, never at scan_history.
  */
-import type { IssueRow, OutputControls } from './outputControls.js'
-
-const RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, minor: 1 }
+import { IMPACT_RANK as RANK, type IssueRow, type OutputControls } from './outputControls.js'
 
 /** Rule ids that all mean "this element has no accessible name", across engines. */
 const NAME_RULES = new Set([

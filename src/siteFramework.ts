@@ -164,7 +164,7 @@ export async function detectSiteFramework(page: PageWithEvaluate): Promise<SiteF
  * frameworks. The toolkit decides class names, so it wins unless the page has
  * none and the app framework is one the enum knows.
  */
-const AI_FIX_FRAMEWORKS = new Set(['tailwind', 'bootstrap', 'mui', 'wordpress', 'nextjs', 'plain-css'])
+export const AI_FIX_FRAMEWORKS = new Set(['tailwind', 'bootstrap', 'mui', 'wordpress', 'nextjs', 'plain-css'])
 export function aiFixFramework(stack: Pick<PageStack, 'framework' | 'cssToolkit'>): string {
   if ((stack.cssToolkit === 'plain-css' || stack.cssToolkit === 'unknown') && AI_FIX_FRAMEWORKS.has(stack.framework)) return stack.framework
   return AI_FIX_FRAMEWORKS.has(stack.cssToolkit) ? stack.cssToolkit : 'plain-css'

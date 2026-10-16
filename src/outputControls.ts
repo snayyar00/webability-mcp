@@ -15,7 +15,9 @@ import { getWcagLevel, issueLevel } from '@webability/core'
 
 export type Impact = 'critical' | 'serious' | 'moderate' | 'minor'
 const IMPACTS: Impact[] = ['critical', 'serious', 'moderate', 'minor']
-const RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, minor: 1 }
+/** Axe impact rank, highest first. The one copy in mcp (the published core 1.8.0 the mirror pins does not export it). */
+export const IMPACT_RANK: Record<string, number> = { critical: 4, serious: 3, moderate: 2, minor: 1 }
+const RANK = IMPACT_RANK
 
 export type Level = 'A' | 'AA' | 'AAA'
 const LEVELS: Level[] = ['A', 'AA', 'AAA']
