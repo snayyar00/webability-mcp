@@ -221,7 +221,7 @@ button:focus-visible,a:focus-visible{outline:3px solid var(--brand);outline-offs
 
   function verify(d){
     var pill = d.verified ? '<span class="pill good">Verified</span>' : d.reason ? '<span class="pill warn">Not checked</span>' : '<span class="pill bad">Not resolved</span>';
-    var why = { 'not-found': 'No element matches this selector.', 'invalid-selector': 'The selector is not valid CSS.' }[d.reason];
+    var why = { 'not-found': 'No element matches this selector.', 'invalid-selector': 'The selector is not valid CSS.', 'not-verifiable': 'No WebAbility check can confirm this fix.', 'unsupported-selector': 'Selectors that cross a shadow root or iframe cannot be checked.', 'unknown_rule': 'Not a known rule id.' }[d.reason];
     var h = head('Fix verification') +
       '<div class="top"><div><div class="sub">' + esc(short(d.url)) + '</div><div class="big"><code style="font-size:20px">' + esc(d.selector) + '</code></div>' +
       (why ? '<div class="sub">' + esc(why) + '</div>' : '') + '</div>' + pill + '</div>' +

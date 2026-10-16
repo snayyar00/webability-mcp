@@ -6,7 +6,7 @@ import { CARD_RESOURCE_URI, CARD_TOOLS, cardExtension, cardResource, cardResourc
 import { AI_FIX_FRAMEWORKS, aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
-import { scan, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
+import { scan, verifyFixRefusal, REASON_TEXT, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
 import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
 import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelHeadersFor } from './tunnelAuth'
@@ -477,7 +477,7 @@ Results from both are deduplicated into one issue list.
 
 ## Output (the scanner judges uncertain findings itself)
 \`scan_page\` and \`flow_scan\` return:
-- **issues**: violations the scanner stands behind. A finding the engines cannot decide is resolved to a verdict — contrast on a gradient is measured from rendered pixels, and an AI judge (vision + markup, when configured) turns the rest into a violation with a fix or a recorded pass (\`judged[]\`, with the reason). What neither can settle is dropped, never guessed.
+- **issues**: violations the scanner stands behind. A finding the engines cannot decide is resolved to a verdict — contrast on a gradient is measured from rendered pixels, model-free rules settle clear cases (a measured pass, a decorative pixel), and an AI judge (vision + markup, when configured) turns the rest into a violation with a fix or a recorded pass. Every verdict is in \`judged[]\` with its reason. What neither can settle is dropped, never guessed.
 - **summary**: counts by severity
 
 ## Structured fixes (since v1.6.0)
@@ -543,7 +543,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'verify_fix',
-      description: 'Re-scan a specific element after applying an accessibility fix and confirm the violation is gone. After you edit the code and serve it (deployed, staging, or http://localhost:3000), call this with the URL and the selector you fixed to get a machine-checked verified: true|false (DOM engines only — visual_audit findings are out of scope). Pass the WCAG criterion (e.g. "1.1.1") or axe rule id (e.g. "color-contrast") to check just that criterion; omit it to require the element be clean of ALL violations. A blocked page (bot-challenge / HTTP error) is reported as unverified, never a pass — verification fails closed. If the selector matches no element, the result is verified: false with reason "not-found" — pass the element\'s current selector, or re-run scan_page if your fix removed the element. Pair with scan_page → generate_ai_fix → verify_fix for a full find-fix-verify cycle.',
+      description: 'Re-scan a specific element after applying an accessibility fix and confirm the violation is gone. After you edit the code and serve it (deployed, staging, or http://localhost:3000), call this with the URL and the selector you fixed to get a machine-checked verified: true|false (DOM engines only — visual_audit findings are out of scope). Pass the WCAG criterion (e.g. "1.1.1") or axe rule id (e.g. "color-contrast") to check just that criterion; omit it to require the element be clean of ALL violations. A blocked page (bot-challenge / HTTP error) is reported as unverified, never a pass — verification fails closed. verified: true is only returned when the selector matched at least one element AND the criterion is one the DOM engines check; if the selector matches no element the result is verified: false with reason "not-found" ("selector matched no elements"), a criterion outside the coverage set returns reason "not-verifiable" ("not checked by any WebAbility tool"); a finding in scope that only the AI judge can settle, when the judge did not run or gave no verdict, also returns "not-verifiable", and shadow-DOM (>>>) / iframe selectors return "unsupported-selector" — pass the element\'s current selector, or re-run scan_page if your fix removed the element. Pair with scan_page → generate_ai_fix → verify_fix for a full find-fix-verify cycle.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1276,8 +1276,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         issuesReturned: capIssues.length,
         issueEntries,
         issuesTotal,
-        // Verdicts the AI judge reached on findings the engines could not decide
-        // (violations are already in issues[]; passes are listed here with the reason).
+        // Verdicts on findings the engines could not decide, from model-free rules
+        // or the AI judge (violations are already in issues[]; passes are listed here with the reason).
         ...(result.judged?.length ? { judged: result.judged } : {}),
         // Invariant P gate metric (bar 0): findings / page changes our own tooling caused.
         internal_bugs: result.internal_bugs ?? [],
@@ -1357,39 +1357,24 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     const wcag = resolvedVf.wcag
     if (!url || !selector) return toolError('Error: url and selector are required')
 
-    // An unrecognized rule id matches NOTHING, so the old filter returned an
-    // empty list and reported VERIFIED on an UNFIXED element — fail-closed
-    // broken in the dangerous direction (persona P058 F5: wcag:"label" on a
-    // still-labelled-less input verified true; the same after reverting a real
-    // fix). Validate non-criterion ids against the real rule registries BEFORE
-    // scanning and refuse to certify anything we cannot check.
+    // Refusals before any scan: an unknown rule id (matches nothing, so it would
+    // read as VERIFIED), a criterion no engine can fail, a piercing selector.
     const isCriterion = (s: string) => /^\d+(\.\d+)*$/.test(s.trim())
     const normRule = (s: string) => s.trim().toLowerCase().replace(/-/g, '_')
-    if (wcag && !isCriterion(wcag)) {
-      const known = new Set<string>()
-      try {
-        const { WCAG_BY_ISSUE } = await import('@webability/core')
-        for (const ruleId of Object.keys(WCAG_BY_ISSUE)) known.add(normRule(ruleId))
-      } catch { /* registry unavailable — axe list below still applies */ }
-      try {
-        const axe = (await import('axe-core')).default as any
-        for (const r of axe.getRules() as Array<{ ruleId: string }>) known.add(normRule(r.ruleId))
-      } catch { /* axe unavailable — webability ids above still apply */ }
-      if (known.size > 0 && !known.has(normRule(wcag))) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text:
-                `UNVERIFIED: "${wcag}" is not a known rule id, so nothing was checked. ` +
-                `Pass a WCAG criterion (e.g. "1.1.1", "1.4.3") or a rule id from get_rules (e.g. "image-alt", "missing_alt", "color-contrast").`,
-            },
-            { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, wcag, verified: false, reason: 'unknown_rule' }, null, 2) + '\n```' },
-          ],
-          isError: true,
-        }
+    const unverified = (reason: keyof typeof REASON_TEXT, text: string, opts2: { reasonText?: string; isError?: boolean } = {}) => {
+      const reasonText = opts2.reasonText ?? REASON_TEXT[reason]
+      return {
+        structuredContent: verifyCard({ url, selector, wcag, verified: false, reason, remainingCount: null, remainingIssues: [], at: new Date().toISOString() }),
+        content: [
+          { type: 'text', text },
+          { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, reasonText, remainingCount: null, remainingIssues: [] }, null, 2) + '\n```' },
+        ],
+        ...(opts2.isError ? { isError: true } : {}),
       }
     }
+
+    const refusal = await verifyFixRefusal(wcag, selector)
+    if (refusal) return unverified(refusal.reason, refusal.text, { isError: refusal.isError })
 
     try {
       // Re-scan scoped to the fixed element only — a focused, fast check rather
@@ -1437,13 +1422,13 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         const reason = scopeWarning.startsWith('scope:root-miss') ? 'not-found' : 'invalid-selector'
         const text =
           reason === 'not-found'
-            ? `UNVERIFIED: \`${selector}\` matches no element at ${url}, so nothing was checked. If your fix changed the element's class/id, pass its current selector. If the fix removed the element, a selector cannot verify it — re-run scan_page and confirm the issue is no longer listed.`
+            ? `UNVERIFIED: \`${selector}\` matches no element at ${url} (${REASON_TEXT['not-found']}), so nothing was checked. The selector is resolved in the main document only: an element inside an iframe or shadow root is not reachable. If your fix changed the element's class/id, pass its current selector. If the fix removed the element, a selector cannot verify it — re-run scan_page and confirm the issue is no longer listed.`
             : `UNVERIFIED: \`${selector}\` is not a valid CSS selector, so the check could not be scoped to an element. Pass a valid selector (scan_page returns one per issue).`
         return {
           structuredContent: verifyCard({ url, selector, wcag, verified: false, reason, remainingCount: null, remainingIssues: [], at: new Date().toISOString() }),
           content: [
             { type: 'text', text },
-            { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, remainingCount: null, remainingIssues: [] }, null, 2) + '\n```' },
+            { type: 'text', text: '```json\n' + JSON.stringify({ url, selector, ...(wcag ? { wcag } : {}), verified: false, reason, ...(reason === 'not-found' ? { reasonText: REASON_TEXT['not-found'] } : {}), remainingCount: null, remainingIssues: [] }, null, 2) + '\n```' },
           ],
         }
       }
@@ -1460,6 +1445,20 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       }
       const remaining = result.issues.filter(matchesWcag)
       const resolved = remaining.length === 0
+
+      // A finding the engines could not settle is dropped unless the AI judge
+      // rules on it. If the judge did not run (no key, WEBABILITY_JUDGE=off), failed,
+      // or stayed silent, absence of findings proves nothing: refuse.
+      const unsettled: string[] = result.unsettled?.wcag ?? []
+      if (resolved && unsettled.length) {
+        if (!wcag || !isCriterion(wcag) || unsettled.some((sc: string) => sc.includes(wcag.trim()))) {
+          return unverified(
+            'not-verifiable',
+            `UNVERIFIED: \`${selector}\` has a finding${wcag ? ` for WCAG ${wcag}` : ''} that only the AI judge can settle, and no verdict was reached (judge off, unreachable or silent). A clean result would prove nothing. Re-run with the AI judge on (a local install needs OPENROUTER_API_KEY).`,
+            { reasonText: 'a finding in scope needed the AI judge and got no verdict' },
+          )
+        }
+      }
 
       const evidence = remaining.slice(0, 10).map((i: any) => ({
         id: i.id,

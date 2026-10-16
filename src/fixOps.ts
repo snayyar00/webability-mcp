@@ -151,7 +151,6 @@ const WEBABILITY_RULE_META: Record<string, RuleFixMeta> = {
   pointer_cancellation: { op: 'suggest', fixability: 'contextual' },
   motion_actuation: { op: 'suggest', fixability: 'contextual' },
   error_prevention_missing: { op: 'suggest', fixability: 'contextual' },
-  insufficient_navigation: { op: 'suggest', fixability: 'contextual' },
   inconsistent_navigation: { op: 'suggest', fixability: 'contextual' },
   // Visual — needs eyes.
   contrast_insufficient: { op: 'set-attribute', attribute: 'style', fixability: 'visual' },
