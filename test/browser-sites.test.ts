@@ -50,7 +50,8 @@ test('scan_html and check_aria close their session in a finally, never a bare br
 
 test('every openSession call in server.ts installs the SSRF guard in remote mode via setupContext', () => {
   const src = readFileSync(path.join(SRC, 'server.ts'), 'utf8')
-  const parts = src.split(/await openSession\(\{/).slice(1)
+  // scanPageOnEngine takes its opener as `open` (default openSession) so a test can wrap the session.
+  const parts = src.split(/await (?:openSession|open)\(\{/).slice(1)
   assert.ok(parts.length >= 8, `expected 8+ call sites, found ${parts.length}`)
   for (const part of parts) {
     const opts = part.slice(0, part.indexOf('\n      })') > 0 ? part.search(/\}\)\n/) : 400)

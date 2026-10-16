@@ -6,6 +6,8 @@ import { CARD_RESOURCE_URI, CARD_TOOLS, cardExtension, cardResource, cardResourc
 import { AI_FIX_FRAMEWORKS, aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
+import { runEngine, type EngineResult } from '@webability/core/engine'
+import { sessionPage } from './enginePage.js'
 import { scan, verifyFixRefusal, REASON_TEXT, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
 import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
@@ -294,51 +296,70 @@ function closeOnAbort(session: { close(): Promise<void> }, signal?: AbortSignal)
   return false
 }
 
+/** What scan_page / diff_scan hand the engine's deterministic layer. */
+export interface PageScanOptions {
+  level: 'A' | 'AA' | 'AAA'
+  rootSelector?: string
+  judge?: JudgeOptions
+}
+
 /**
- * scan_page / diff_scan page driver. Navigates the page HERE (instead of
- * handing core a URL) so the live DOM is still open after the engines run —
- * that is where React/Vue dev builds keep the component tree, and one
+ * scan_page / diff_scan on the one engine (@webability/core/engine). The MCP
+ * owns the browser session: viewport, the hosted SSRF guard and the tunnel
+ * header are installed on the context BEFORE the engine's first navigation,
+ * so the engine's own goto carries them. The page stays open after the
+ * engine, which is where React/Vue dev builds keep the component tree: one
  * `collectSourcePointers` evaluate turns every finding into `file:line
- * (Component)`. Mirrors core's URL path: same goto, same viewport presets,
- * main-document status threaded into scan() for error-page detection.
+ * (Component)`. No Model is injected: the engine's agent stage does not run
+ * (0 model calls); core's in-scan judge runs only when `judge` is set.
  */
-async function scanWithSourcePointers(
+export async function scanPageOnEngine(
   rawUrl: string,
   tunnel: TunnelTarget | null,
   viewportPreset: unknown,
-  scanOptions: Record<string, unknown>,
+  scanOptions: PageScanOptions,
   remote: boolean,
   signal?: AbortSignal,
-): Promise<{ result: Awaited<ReturnType<typeof scan>>; pointers: Record<string, SourcePointer>; framework?: PageStack }> {
+  open: typeof openSession = openSession,
+): Promise<{ result: EngineResult; pointers: Record<string, SourcePointer>; framework?: PageStack }> {
   const url = normalizeUrlArg(rawUrl)
-  const scanOpenPage = async (page: any, mainStatus?: number) => {
-    const result = await scan(page, { ...scanOptions, mainStatus } as any)
+  const viewport = tunnel
+    ? VIEWPORT_FOR_TUNNEL(viewportPreset)
+    : ((VIEWPORT_SIZES as Record<string, { width: number; height: number }>)[String(viewportPreset || 'desktop')] ?? VIEWPORT_SIZES.desktop)
+  const session = await open({
+    remote,
+    contextOptions: { viewport },
+    // A tunnel always installs the relay guard; with no tunnel the guard is
+    // the hosted SSRF block, so a local run must not install it (localhost).
+    setupContext: (context) => (tunnel || remote ? installSsrfRoute(context, tunnel) : undefined),
+  })
+  if (closeOnAbort(session, signal)) throw new Error('aborted')
+  try {
+    const result = await runEngine({
+      page: sessionPage(session),
+      input: { url },
+      opts: { level: scanOptions.level, scan: { dismissModals: true, ...(scanOptions.rootSelector ? { rootSelector: scanOptions.rootSelector } : {}), ...(scanOptions.judge ? { judge: scanOptions.judge } : {}) } },
+    })
+    // The page never loaded: an error, as before the engine (never "0 issues").
+    const loadError = result.stats.errors.find((e) => e.startsWith('load: '))
+    if (loadError) throw new Error(loadError.slice('load: '.length))
+    // scan() threw after a good load: the engine returns 0 issues plus an
+    // engine:scan bug. A tool error, as before the engine (diff_scan would
+    // otherwise mark every baseline finding fixed).
+    const scanBug = result.internal_bugs.find((b) => b.tool === 'engine:scan')
+    // The first line only: detail carries the stack (install paths), and the tool returns this text.
+    if (scanBug) throw new Error(scanBug.detail.split('\n')[0])
     if (result.blocked) return { result, pointers: {} }
-    const pointers = await collectSourcePointers(page, result.issues.map((i) => i.selector))
+    const pointers = await collectSourcePointers(session.page, result.issues.map((i) => i.selector))
     // The SAME function detect_framework calls, read from the page the scan
     // just used, so the two tools cannot disagree.
     let framework: PageStack | undefined
     try {
-      framework = await detectPageStack(page)
+      framework = await detectPageStack(session.page)
     } catch {
       framework = undefined
     }
     return { result, pointers, framework }
-  }
-  // Tunnelled: the existing driver already installs the relay route before
-  // the first navigation — reuse it rather than duplicate that invariant.
-  if (tunnel) return withTunnelPage(url, tunnel, VIEWPORT_FOR_TUNNEL(viewportPreset), (page) => scanOpenPage(page), remote, signal)
-
-  const viewport = (VIEWPORT_SIZES as Record<string, { width: number; height: number }>)[String(viewportPreset || 'desktop')] ?? VIEWPORT_SIZES.desktop
-  const session = await openSession({
-    remote,
-    contextOptions: { viewport },
-    setupContext: (context) => (remote ? installSsrfRoute(context, null) : undefined),
-  })
-  if (closeOnAbort(session, signal)) throw new Error('aborted')
-  try {
-    const response = await session.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-    return await scanOpenPage(session.page, typeof response?.status === 'function' ? response.status() : undefined)
   } finally {
     await session.close()
   }
@@ -1142,11 +1163,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     try { controls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
 
     try {
-      const scanOptions = {
+      const scanOptions: PageScanOptions = {
         rootSelector: args?.rootSelector as string | undefined,
-        viewport: (args?.viewport as any) || 'desktop',
-        dismissModals: true,
-        browser: { headless: true, timeout: 30000 },
         level: scanLevel(controls),
         // Hosted: the judge must finish inside the scan deadline (see judgeWithin).
         judge: opts.remote ? judgeWithin(judgeFor(opts), startedAt + (opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) - JUDGE_DEADLINE_MARGIN_MS) : judgeFor(opts),
@@ -1154,11 +1172,11 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       // Hosted only: Zapier and other HTTP callers give up at 30s and show a
       // bare 504. Stop first and say what to do. Local stdio has no such limit.
       const deadlineMs = opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS
-      let scanned: Awaited<ReturnType<typeof scanWithSourcePointers>>
+      let scanned: Awaited<ReturnType<typeof scanPageOnEngine>>
       try {
         scanned = opts.remote
-          ? await withDeadline((signal) => scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, true, signal), scanBudgetLeft(deadlineMs), 'scan_page')
-          : await scanWithSourcePointers(url, tunnel, args?.viewport, scanOptions, false)
+          ? await withDeadline((signal) => scanPageOnEngine(url, tunnel, args?.viewport, scanOptions, true, signal), scanBudgetLeft(deadlineMs), 'scan_page')
+          : await scanPageOnEngine(url, tunnel, args?.viewport, scanOptions, false)
       } catch (err) {
         if (err instanceof DeadlineError) {
           return toolError(`${url} took longer than ${deadlineMs / 1000}s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites.`)
@@ -1181,7 +1199,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           ...(b.vendor ? { vendor: b.vendor } : {}),
           ...(typeof b.status === 'number' ? { status: b.status } : {}),
           ...(b.signal ? { signal: b.signal } : {}),
-          summary: result.summary,
+          // The scan() summary shape (incomplete is always 0).
+          summary: { ...recountSummary([]), incomplete: 0 },
           issues: [],
         }
         return {
@@ -1510,11 +1529,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
 
     type Projected = ReturnType<typeof enrichIssue> & { id: string; impact?: string }
     const live = async (target: string, signal?: AbortSignal): Promise<{ issues: Projected[]; blocked?: unknown }> => {
-      const scanOptions = {
+      const scanOptions: PageScanOptions = {
         rootSelector: args?.rootSelector as string | undefined,
-        viewport: (args?.viewport as any) || 'desktop',
-        dismissModals: true,
-        browser: { headless: true, timeout: 30000 },
         level: scanLevel(diffControls),
         // Not capped (unlike scan_page): both sides share one deadline, so a
         // "time left" cap would judge the current side less than the baseline
@@ -1522,7 +1538,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         judge: judgeFor(opts),
       }
       const t = tunnelTargetFor(target, (args as any)?.tunnel_secret)
-      const { result, pointers } = await scanWithSourcePointers(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal)
+      const { result, pointers } = await scanPageOnEngine(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal)
       if (result.blocked) return { issues: [], blocked: result.blocked }
       const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}) })
       return { issues: mergeSameElement(result.issues.map(project)) }

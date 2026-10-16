@@ -30,13 +30,15 @@ test('scan_page and verify_fix scan a page WE opened when tunnelling', () => {
   // gets attached. scan(page) scans what we hand it.
   // verify_fix hands scan() a page from withTunnelPage directly.
   assert.match(SRC, /tunnel\s*\n?\s*\? await withTunnelPage\(url, tunnel/, 'verify_fix must route through withTunnelPage')
-  // scan_page (and diff_scan) go through scanWithSourcePointers — which keeps
-  // the DOM open for the framework source pointers — and THAT must still hand
-  // the tunnelled case to withTunnelPage rather than open its own context.
-  const helper = SRC.slice(SRC.indexOf('async function scanWithSourcePointers'), SRC.indexOf('async function attachSourceCandidates'))
-  assert.match(helper, /if \(tunnel\) return withTunnelPage\(url, tunnel, VIEWPORT_FOR_TUNNEL\(viewportPreset\)/, 'scanWithSourcePointers must route tunnelled scans through withTunnelPage')
+  // scan_page (and diff_scan) go through scanPageOnEngine, which opens the
+  // session with the relay route on its context and hands that page to the
+  // engine. Behaviour is pinned in scan-on-engine.test.ts (the secret reaches
+  // the main document through the engine's own navigation).
+  const helper = SRC.slice(SRC.indexOf('export async function scanPageOnEngine'), SRC.indexOf('async function attachSourceCandidates'))
+  assert.ok(helper.indexOf('installSsrfRoute(context, tunnel)') > 0, 'scanPageOnEngine must install the relay route')
+  assert.ok(helper.indexOf('installSsrfRoute(context, tunnel)') < helper.indexOf('runEngine('), 'the route must be on the context before the engine navigates')
   const scanPage = SRC.slice(SRC.indexOf("name === 'scan_page'"), SRC.indexOf("name === 'verify_fix'"))
-  assert.match(scanPage, /await scanWithSourcePointers\(url, tunnel,/, 'scan_page must pass its tunnel target to scanWithSourcePointers')
+  assert.match(scanPage, /scanPageOnEngine\(url, tunnel,/, 'scan_page must pass its tunnel target to scanPageOnEngine')
 })
 
 test('withTunnelPage installs the route before navigating', () => {
@@ -66,7 +68,7 @@ test('every tool advertising tunnel_secret can actually send it', () => {
   for (const tool of tools) {
     const handler = SRC.slice(SRC.indexOf(`name === '${tool}'`))
     const body = handler.slice(0, 4000)
-    const wired = /withTunnelPage|scanWithSourcePointers\(\w+, (tunnel|t),|installSsrfRoute\(context, tunnel\)|extractBrandPaletteFromUrl\(url, !!opts\.remote, tunnel\)/.test(body)
+    const wired = /withTunnelPage|scanPageOnEngine\(\w+, (tunnel|t),|installSsrfRoute\(context, tunnel\)|extractBrandPaletteFromUrl\(url, !!opts\.remote, tunnel\)/.test(body)
     assert.ok(wired, `${tool} advertises tunnel_secret but nothing in its handler attaches the header`)
   }
 })
