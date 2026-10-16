@@ -144,7 +144,6 @@ const WEBABILITY_RULE_META: Record<string, RuleFixMeta> = {
   auto_refresh: { op: 'remove-element', fixability: 'contextual' },
   meaningful_sequence: { op: 'suggest', fixability: 'contextual' },
   sensory_characteristic: { op: 'suggest', fixability: 'contextual' },
-  orientation_lock: { op: 'suggest', fixability: 'contextual' },
   character_key_shortcut: { op: 'suggest', fixability: 'contextual' },
   pointer_gesture: { op: 'suggest', fixability: 'contextual' },
   pointer_cancellation: { op: 'suggest', fixability: 'contextual' },
