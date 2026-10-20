@@ -128,10 +128,15 @@ test('selector inside an iframe -> verified:false, never a silent true', async (
   assert.match(text, /iframe/)
 })
 
-test('2.1.2: no engine checks it (axe has no rule, no native detector maps to it) -> not-verifiable, never a pass by absence', async () => {
-  const { text, json } = await verify({ selector: '#fixed', wcag: '2.1.2' })
+test('1.4.13: no engine checks it (axe has no rule, no native detector maps to it) -> not-verifiable, never a pass by absence', async () => {
+  const { text, json } = await verify({ selector: '#fixed', wcag: '1.4.13' })
   assert.equal(json.verified, false, text)
   assert.equal(json.reason, 'not-verifiable')
+})
+
+test('2.1.2 is checked natively since keyboard_trap_self_focus (core 6fb32e87): never "not-verifiable"', async () => {
+  const { json } = await verify({ selector: '#fixed', wcag: '2.1.2' })
+  assert.notEqual(json.reason, 'not-verifiable')
 })
 
 test('criteria no engine can fail (3.2.3, 3.2.4, 1.2.5, 2.4.9, 2.4.5) -> not-verifiable', async () => {
