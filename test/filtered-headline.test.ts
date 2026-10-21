@@ -73,11 +73,11 @@ test('scan_html (in-process): filters narrow summary and headline the same way',
   const all = await call({})
   assert.ok(all.json.summary.total >= 3, `fixture yields ${all.json.summary.total}`)
   assert.equal(all.json.pageSummary, undefined)
-  const one = await call({ rules: ['image-alt'] })
+  const one = await call({ rules: ['missing_alt'] })
   assert.equal(one.json.summary.total, one.json.issues.length)
   assert.ok(one.json.summary.total > 0 && one.json.summary.total < all.json.summary.total, 'the filter must narrow')
   assert.equal(one.json.pageSummary.total, all.json.summary.total)
-  assert.match(one.headline, new RegExp(`^Found ${one.json.summary.total} issue\\(s\\) matching the filters \\(rules=\\[image-alt\\]\\)`))
+  assert.match(one.headline, new RegExp(`^Found ${one.json.summary.total} issue\\(s\\) matching the filters \\(rules=\\[missing_alt\\]\\)`))
   assert.match(one.headline, new RegExp(`before filters: ${all.json.summary.total} issue`))
 })
 

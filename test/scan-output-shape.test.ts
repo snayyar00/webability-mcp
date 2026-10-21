@@ -65,5 +65,5 @@ test('scan_html in-process: same top-level and issue fields', { timeout: 60_000 
   assert.deepEqual(issueKeys(r.json.issues), ['fix', 'fixability', 'html', 'id', 'impact', 'level', 'message', 'selector', 'type', 'wcag'])
   // The WebAbility detectors run in jsdom too, so the empty button and link are
   // reported under the detector type (axe's button-name/link-name dedupe into it).
-  assert.deepEqual(r.json.issues.map((i: any) => i.type).sort(), ['empty_link', 'image-alt', 'unlabeled_button'])
+  assert.deepEqual(r.json.issues.map((i: any) => i.type).sort(), ['empty_link', 'missing_alt', 'unlabeled_button'])
 })
