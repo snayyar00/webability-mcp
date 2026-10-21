@@ -7,7 +7,7 @@
     "source": "github"
   },
   "version": "1.9.0",
-  "websiteUrl": "https://webability.io",
+  "websiteUrl": "https://www.webability.io/mcp",
   "packages": [
     {
       "registryType": "npm",

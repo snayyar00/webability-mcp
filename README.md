@@ -237,8 +237,8 @@ Two tools — `generate_ai_fix` and `visual_audit` — additionally send page co
 
 ## Links
 
-- [WebAbility](https://webability.io) — platform, widget, dashboard
-- [Documentation](https://webability.io/docs)
+- [WebAbility](https://www.webability.io) — platform, widget, dashboard
+- [Documentation](https://www.webability.io/docs)
 - [GitHub](https://github.com/snayyar00/webability-mcp)
 
 ## License

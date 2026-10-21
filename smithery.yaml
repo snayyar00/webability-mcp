@@ -3,7 +3,7 @@
 # WebAbility MCP — find and fix web accessibility (WCAG) issues from your coding agent.
 # Runs locally over stdio from the published npm package @webability/mcp (bin: webability-mcp).
 # DOM scan/fix tools work with no account; visual_audit + start_audit/get_audit use an
-# optional WEBABILITY_API_KEY. Docs: https://webability.io/docs/mcp
+# optional WEBABILITY_API_KEY. Docs: https://www.webability.io/docs/mcp
 
 startCommand:
   type: stdio
