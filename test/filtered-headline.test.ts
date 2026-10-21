@@ -52,8 +52,9 @@ test('minImpact compact: heading count equals the filtered total', async () => {
   const r = await scanPage({ minImpact: 'serious', format: 'compact' })
   const m = r.headline.match(/^Found (\d+) high-confidence issues matching/)
   assert.ok(m, r.headline)
-  assert.equal(Number(m[1]), 8)
-  assert.deepEqual(headingCounts(r.body), [8])
+  // 6 missing_alt + 2 unlabeled_button + 2 axe target-size (serious); the low-contrast text is moderate.
+  assert.equal(Number(m[1]), 10)
+  assert.deepEqual(headingCounts(r.body), [10])
 })
 
 test('scan_html (in-process): filters narrow summary and headline the same way', async () => {

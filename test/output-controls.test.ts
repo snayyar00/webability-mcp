@@ -47,18 +47,18 @@ test('compact: one header per rule with shared metadata, one line per element', 
   const list = [
     mk({ id: 'a', selector: 'img.a' }),
     mk({ id: 'b', selector: 'img.b', source: { file: 'src/Hero.tsx', line: 12, component: 'Hero' } }),
-    mk({ id: 'c', type: 'missing_button_type', wcag: '3.2.2', impact: 'minor', message: 'Button has no type', selector: 'button.x', fixability: 'mechanical', fix: { op: 'add-attribute', attribute: 'type', value: 'button', currentValue: '', needsManualReview: false } }),
+    mk({ id: 'c', type: 'missing_autocomplete', wcag: '1.3.5', impact: 'minor', message: 'Input has no autocomplete', selector: 'input.x', fixability: 'mechanical', fix: { op: 'add-attribute', attribute: 'autocomplete', value: 'email', currentValue: '', needsManualReview: false } }),
   ]
   const text = compactText(list)
   const lines = text.split('\n')
   // Rule header carries wcag / impact / fixability / op and the message ONCE.
   assert.equal(lines.filter((l) => l.includes('Image has no alt')).length, 1)
   assert.match(text, /missing_alt .*1\.1\.1.*moderate.*contextual.*add-attribute alt/)
-  assert.match(text, /missing_button_type .*3\.2\.2.*minor.*mechanical.*add-attribute type="button"/)
+  assert.match(text, /missing_autocomplete .*1\.3\.5.*minor.*mechanical.*add-attribute autocomplete="email"/)
   // Element lines: selector, and the source pointer when known.
   assert.match(text, /^\s+img\.a$/m)
   assert.match(text, /^\s+img\.b\s+→ src\/Hero\.tsx:12 \(Hero\)$/m)
-  assert.match(text, /^\s+button\.x$/m)
+  assert.match(text, /^\s+input\.x$/m)
   assert.equal(compactText([]), '(no findings)')
 })
 

@@ -109,6 +109,7 @@ export function filterIssues<T extends IssueRow>(list: readonly T[], c: OutputCo
     // Level gate: above the asked level is out, except an AAA criterion the
     // caller named in wcag[] (that request is the opt-in for it).
     const lvl = issueLevel({ wcag: i.wcag ?? '', level: (i as { level?: Level }).level })
+    if (!lvl) return false // names only criteria outside WCAG 2.2
     if (LEVEL_RANK[lvl] > max && !(lvl === 'AAA' && String(i.wcag ?? '').split(/[,\s]+/).some((w) => aaaNamed.has(w)))) return false
     if (c.minImpact && (RANK[i.impact ?? ''] ?? 0) < RANK[c.minImpact]) return false
     if (c.rules && !c.rules.has(String(i.type ?? '')) && !(i.rules ?? []).some((r) => c.rules!.has(r))) return false

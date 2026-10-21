@@ -34,11 +34,9 @@ const SHADOW_PAGE = `<!doctype html><html lang="en"><head><title>S</title></head
 const FRAME_PAGE = `<!doctype html><html lang="en"><head><title>F</title></head><body><main><h1>F</h1>
 <iframe id="frame" title="inner" srcdoc="<img id='inframe' src='data:image/gif;base64,R0lGODlhAQABAAAAACw=' width='40' height='40'>"></iframe></main></body></html>`
 
-// Elements whose only finding is needsReview (broken skip link 2.4.1, decorative image with a title 1.1.1).
+// An element whose only finding is needsReview (a vague link, 2.4.4 judged in context).
 const UNDECIDED_PAGE = `<!doctype html><html lang="en"><head><title>U</title></head><body>
-<a id="skip" href="#nowhere">Skip to content</a>
-<nav><a href="/a">A</a> <a href="/b">B</a> <a href="/c">C</a> <a href="/d">D</a></nav>
-<main><h1>U</h1><img id="deco" alt="" title="Company logo" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="40" height="40"></main></body></html>`
+<main><h1>U</h1><p><a id="vague" href="/article">click here</a></p></main></body></html>`
 
 // White text on a dark gradient: the pixel resolver measures it as a pass. No
 // judge is needed for that verdict, so verify_fix must not refuse it.
@@ -134,6 +132,24 @@ test('1.4.13: no engine checks it (axe has no rule, no native detector maps to i
   assert.equal(json.reason, 'not-verifiable')
 })
 
+test('4.1.1 has no WCAG 2.2 level: withinLevel drops every finding, so verify_fix refuses it, never a pass by absence', async () => {
+  const { text, json } = await verify({ selector: '#fixed', wcag: '4.1.1' })
+  assert.equal(json.verified, false, text)
+  assert.equal(json.reason, 'not-verifiable')
+})
+
+test('experimental rule ids (missing_button_type, nested_landmark, adjacent_redundant_link, decorative_image_with_title) refuse: the verification scan never enables them', async () => {
+  for (const wcag of ['missing_button_type', 'nested-landmark', 'adjacent_redundant_link', 'decorative_image_with_title']) {
+    const { text, json } = await verify({ selector: '#fixed', wcag })
+    assert.equal(json.verified, false, text)
+    assert.equal(json.reason, 'not-verifiable', text)
+    assert.match(text, /experimental/)
+  }
+  // A live rule id on a fixed element still verifies.
+  const ok = await verify({ selector: '#fixed', wcag: 'missing_alt' })
+  assert.equal(ok.json.verified, true, ok.text)
+})
+
 test('2.1.2 is checked natively since keyboard_trap_self_focus (core 6fb32e87): never "not-verifiable"', async () => {
   const { json } = await verify({ selector: '#fixed', wcag: '2.1.2' })
   assert.notEqual(json.reason, 'not-verifiable')
@@ -176,22 +192,16 @@ test('mcp uses the core coverage function (no local copy)', async () => {
   assert.equal(existsSync(new URL('../src/verifyCoverage.ts', import.meta.url)), false)
 })
 
-test('judge did not run: a needsReview-only skip link in scope is not-verifiable, never VERIFIED (2.4.1)', async () => {
-  const { text, json } = await verifyOnce({ url: url + 'undecided', selector: '#skip', wcag: '2.4.1' })
+test('judge did not run: a needsReview-only vague link in scope is not-verifiable, never VERIFIED (2.4.4)', async () => {
+  const { text, json } = await verifyOnce({ url: url + 'undecided', selector: '#vague', wcag: '2.4.4' })
   assert.equal(json.verified, false, text)
   assert.equal(json.reason, 'not-verifiable')
   assert.match(json.reasonText, /judge/i)
   assert.doesNotMatch(text, /^VERIFIED/m)
 })
 
-test('judge did not run: a decorative image with a title in scope is not-verifiable (1.1.1)', async () => {
-  const { text, json } = await verifyOnce({ url: url + 'undecided', selector: '#deco', wcag: '1.1.1' })
-  assert.equal(json.verified, false, text)
-  assert.equal(json.reason, 'not-verifiable')
-})
-
 test('judge did not run, but the undecided element is for another criterion: still verifies', async () => {
-  const { text, json } = await verifyOnce({ url: url + 'undecided', selector: '#deco', wcag: '4.1.2' })
+  const { text, json } = await verifyOnce({ url: url + 'undecided', selector: '#vague', wcag: '4.1.2' })
   assert.equal(json.verified, true, text)
 })
 
@@ -199,7 +209,7 @@ test('every refusal carries a verify card (structuredContent), not just not-foun
   for (const [args, reason] of [
     [{ selector: '#fixed', wcag: '3.1.3' }, 'not-verifiable'],
     [{ selector: '#host >>> #x', wcag: '1.1.1' }, 'unsupported-selector'],
-    [{ url: url + 'undecided', selector: '#skip', wcag: '2.4.1' }, 'not-verifiable'],
+    [{ url: url + 'undecided', selector: '#vague', wcag: '2.4.4' }, 'not-verifiable'],
   ] as const) {
     const { structured, json } = await verifyOnce(args)
     assert.equal(structured?.kind, 'verify', JSON.stringify(json))

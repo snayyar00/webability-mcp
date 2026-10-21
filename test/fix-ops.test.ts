@@ -23,8 +23,8 @@ test('closed sets are exactly the seven ops and three tiers', () => {
 })
 
 test('known value on a missing attribute → add-attribute, mechanical', () => {
-  const fix = structuredFix({ ...base, type: 'missing_button_type', fix: { attribute: 'type', currentValue: '', suggestedValue: 'button', needsManualReview: false } })
-  assert.deepEqual(fix, { op: 'add-attribute', attribute: 'type', value: 'button', fixability: 'mechanical' })
+  const fix = structuredFix({ ...base, type: 'missing_autocomplete', fix: { attribute: 'autocomplete', currentValue: '', suggestedValue: 'email', needsManualReview: false } })
+  assert.deepEqual(fix, { op: 'add-attribute', attribute: 'autocomplete', value: 'email', fixability: 'mechanical' })
 })
 
 test('known value on an existing attribute → set-attribute, mechanical', () => {
@@ -71,13 +71,13 @@ test('contrast and other render-dependent rules are visual even with a value', (
   const fix = structuredFix({ ...base, type: 'contrast_insufficient', fix: { attribute: 'style', currentValue: 'color:#999', suggestedValue: 'color:#595959;', needsManualReview: true } })
   assert.equal(fix.fixability, 'visual')
   assert.equal(fix.op, 'set-attribute')
-  for (const type of ['focus_not_visible', 'target_too_small', 'non_text_contrast_insufficient', 'image_of_text', 'reflow_overflow']) {
+  for (const type of ['focus_not_visible', 'non_text_contrast_insufficient', 'image_of_text', 'reflow_overflow']) {
     assert.equal(webabilityRuleFixMeta(type).fixability, 'visual', type)
   }
 })
 
 test('needs_review confidence never yields mechanical', () => {
-  const fix = structuredFix({ ...base, type: 'missing_button_type', confidence: 'needs_review', fix: { attribute: 'type', currentValue: '', suggestedValue: 'button', needsManualReview: true } })
+  const fix = structuredFix({ ...base, type: 'missing_autocomplete', confidence: 'needs_review', fix: { attribute: 'autocomplete', currentValue: '', suggestedValue: 'email', needsManualReview: true } })
   assert.notEqual(fix.fixability, 'mechanical')
 })
 
@@ -88,11 +88,11 @@ test('an issue without a fix object still gets op=suggest + a tier', () => {
 })
 
 test('enrichIssue keeps the legacy fix fields and adds op/value/fixability on it', () => {
-  const out = enrichIssue({ ...base, type: 'missing_button_type', fix: { attribute: 'type', currentValue: '', suggestedValue: 'button', needsManualReview: false } })
-  assert.equal(out.fix.attribute, 'type')
-  assert.equal(out.fix.suggestedValue, 'button')
+  const out = enrichIssue({ ...base, type: 'missing_autocomplete', fix: { attribute: 'autocomplete', currentValue: '', suggestedValue: 'email', needsManualReview: false } })
+  assert.equal(out.fix.attribute, 'autocomplete')
+  assert.equal(out.fix.suggestedValue, 'email')
   assert.equal(out.fix.op, 'add-attribute')
-  assert.equal(out.fix.value, 'button')
+  assert.equal(out.fix.value, 'email')
   assert.equal(out.fixability, 'mechanical')
 })
 
