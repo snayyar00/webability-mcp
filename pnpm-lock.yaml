@@ -15,8 +15,8 @@ importers:
         specifier: 0.17.0
         version: 0.17.0(@modelcontextprotocol/sdk@1.32.0(zod@4.6.5))(posthog-node@5.55.0)
       '@webability/core':
-        specifier: 1.13.0
-        version: 1.13.0(playwright-core@1.59.1)(playwright@1.59.1)
+        specifier: 1.14.0
+        version: 1.14.0(playwright-core@1.59.1)(playwright@1.59.1)
       axe-core:
         specifier: ^4.11.3
         version: 4.13.0
@@ -643,8 +643,8 @@ packages:
   '@types/ws@8.18.2':
     resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
-  '@webability/core@1.13.0':
-    resolution: {integrity: sha512-r0SdZuZmyerP6u9iL1GQ3k7tcflOywa6BImUboD4L/KoMPdaxSvL0YjAOWvqnCeAe27pID+ab9/FNIdirsJyCg==}
+  '@webability/core@1.14.0':
+    resolution: {integrity: sha512-gp5ukHvdaTUkPXOYspI9p9CV8y0uhU8vXZwxCpBY3SUUOLgVzEbjcryCenMDPzwYl/2g8CD2UYZX3/95eYeGMA==}
     engines: {node: '>=18'}
     peerDependencies:
       playwright: ^1.40.0
@@ -1717,7 +1717,7 @@ snapshots:
     dependencies:
       '@types/node': 25.9.9
 
-  '@webability/core@1.13.0(playwright-core@1.59.1)(playwright@1.59.1)':
+  '@webability/core@1.14.0(playwright-core@1.59.1)(playwright@1.59.1)':
     dependencies:
       '@axe-core/playwright': 4.13.0(playwright-core@1.59.1)
       css-what: 6.2.2
