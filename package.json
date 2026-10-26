@@ -1,7 +1,7 @@
 {
   "name": "@webability/mcp",
   "mcpName": "io.github.snayyar00/webability",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "WebAbility MCP server — WCAG 2.2 / ADA / EAA accessibility scanning with three-tier confidence output (issues + incomplete + summary), framework-aware AI fix suggestions, and brand-palette contrast checks. For Cursor, Claude Code, and other IDEs.",
   "type": "module",
   "bin": {
