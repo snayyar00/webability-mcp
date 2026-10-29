@@ -43,7 +43,7 @@ verify_fix input.text-md.w-full.rounded-lg wcag=4.1.2
 
 - **`fix.op`** is one of `add-attribute`, `set-attribute`, `remove-attribute`, `add-element`, `remove-element`, `add-text-content`, `suggest`.
 - **`fixability`**: `mechanical` = apply as given. `contextual` = the op is known, the value (alt text, a label) needs judgment. `visual` = needs rendered output; propose, do not auto-apply.
-- **`incomplete[]`** holds findings that need a person (contrast over images, marketing alt text). Agents are told not to fix them.
+- **`judged[]`** lists findings the scanner settled itself, each with a verdict and a reason (see Output below). Anything it cannot settle is dropped.
 - **`source`**: on React ≤18 and Vue dev builds, each issue carries `{file, line, column, component}` from the live component tree.
 - **`verify_fix`** re-scans one element and fails closed. **`diff_scan`** reports `fixed[]`, `new[]`, `remaining[]` for a page.
 
@@ -66,6 +66,7 @@ It cannot judge if alt text is meaningful or if a custom widget makes sense with
 |---|---|---|
 | Account | None | None for scan tools; free account (OAuth sign-in) for visual and full audits |
 | Scan / fix / verify | Yes (on your machine) | Yes |
+| AI judge for uncertain findings | Off until you set `OPENROUTER_API_KEY` (your key) | On, nothing to set (our key) |
 | `find_source` | Yes | No |
 | `scan_history` / `generate_report_pdf` | Yes | No |
 | `visual_audit` / `start_audit` / `get_audit` | Listed as stubs → connect Full (still free) | Yes — free with your account |
@@ -126,15 +127,18 @@ Optional env:
 | WebAbility detectors | 60+ | Gradient-aware contrast, weak names, decorative icons, landmark hierarchy, ARIA correctness, link consistency, target size, keyboard traps |
 | axe-core | 104 | Industry-standard WCAG 2.2 baseline |
 
-## Three-tier output (since v1.2.1)
+## Output
 
 Every scan returns:
 
-- **`issues`** — high-confidence violations, safe to surface as bugs
-- **`incomplete`** — findings that need human review (contrast against gradients, marketing imagery, framer-motion pre-animation states, axe-incomplete). **Never auto-fix these.**
-- **`summary`** — counts by severity + an `incomplete` count
+- **`issues`** — violations the scanner stands behind, safe to surface as bugs
+- **`summary`** — counts by severity
 
-This mirrors axe-core's `violations` / `incomplete` / `passes` split and prevents agents from "fixing" false positives in destructive ways.
+The scanner judges uncertain findings itself. Text on a gradient or image background is measured from rendered pixels. What the engines still cannot decide goes to an AI judge, which returns a violation with a concrete fix (alt text, a colour that meets the ratio) or a pass with its reason (listed in `judged[]`). Anything neither can settle is dropped — nothing is left for a human to review. Each judge call sends the page URL, the finding's markup and nearby text, and, when the page can take one, a PNG crop of the element.
+
+**Hosted (`https://mcp.webability.io/mcp`): nothing to set.** The judge runs on our side with our models, for anonymous and signed-in callers alike: the server posts each uncertain finding to WebAbility's API. If our judge is unreachable, the findings it would have settled are dropped, never guessed.
+
+**Local (`npx` / `webability-mcp`): the judge is off until you give it a key.** It is not local inference: your machine calls the model endpoint with your key (OpenRouter, or the `WEBABILITY_JUDGE_BASE_URL` you set). Set `OPENROUTER_API_KEY` to turn it on (vision `anthropic/claude-haiku-4.5`, text-only `deepseek/deepseek-v4-flash`; override with `WEBABILITY_JUDGE_BASE_URL`, `WEBABILITY_JUDGE_VISION_MODEL`, `WEBABILITY_JUDGE_TEXT_MODEL`, budget `WEBABILITY_JUDGE_TIMEOUT_MS`, default 20 s). `WEBABILITY_JUDGE=off` disables it in both modes. Without a key, the model-free verdicts still run (a measured contrast pass, a decorative or 1x1 image, a reduced-motion rule) and land in `judged[]`; findings they cannot settle are dropped.
 
 ## Structured fixes (since v1.6.0)
 
@@ -180,7 +184,7 @@ Filters apply before the 50-item cap, so `minImpact: "serious"` returns every se
 
 ## In-process `scan_html` (since v1.6.0)
 
-`scan_html` no longer launches a browser by default. It runs the WebAbility detectors and axe-core inside jsdom in the MCP process — milliseconds, no network — and returns the same three-tier `issues` / `incomplete` / `summary` shape as `scan_page`, with `fix.op` on every finding. Fragments are wrapped into a document automatically. jsdom has no layout, so visual-tier rules (contrast, target size, focus ring) are skipped and counted in `skippedVisual`; pass `engine: "browser"` for the previous headless-Chromium axe path.
+`scan_html` no longer launches a browser by default. It runs the WebAbility detectors and axe-core inside jsdom in the MCP process — milliseconds, no network — and returns the same `issues` / `judged` / `summary` shape as `scan_page`, with `fix.op` on every finding. Fragments are wrapped into a document automatically. jsdom has no layout, so visual-tier rules (contrast, target size, focus ring) are skipped and counted in `skippedVisual`; pass `engine: "browser"` for the previous headless-Chromium axe path.
 
 ## Tools
 
@@ -233,7 +237,7 @@ The server also reports one small **telemetry event** per tool call (every tool,
 
 If `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` is configured, the server additionally enables PostHog MCP Analytics. This captures MCP usage metadata such as initialize, tools/list, tool name, duration, client name/version, and success/failure. WebAbility strips PostHog's `$mcp_parameters` and `$mcp_response` fields before send, so raw HTML snippets, screenshots, scan responses, and generated code are not sent to PostHog by this integration.
 
-Two tools — `generate_ai_fix` and `visual_audit` — additionally send page content (an HTML snippet or a screenshot) to WebAbility's API so it can call a third-party LLM on your behalf; WebAbility doesn't store that content, but the LLM provider sees it in transit. See [PRIVACY.md](./PRIVACY.md) for the full per-tool breakdown and WebAbility's [privacy policy](https://www.webability.io/privacy-policy).
+Two tools — `generate_ai_fix` and `visual_audit` — additionally send page content (an HTML snippet or a screenshot) to WebAbility's API so it can call a third-party LLM on your behalf; WebAbility doesn't store that content, but the LLM provider sees it in transit. `generate_report_pdf` (local only) sends the findings you pass it, with their HTML snippets, selectors and the page URL, to WebAbility's API to render the PDF. The AI judge (see Output above) also sends page content for uncertain findings: the page URL, the finding's markup and nearby text, and an element crop. Hosted, it goes to WebAbility's API; local, it goes only to the model endpoint you configured with your own key, and only once you set one. See [PRIVACY.md](./PRIVACY.md) for the full per-tool breakdown and WebAbility's [privacy policy](https://www.webability.io/privacy-policy).
 
 ## Links
 
