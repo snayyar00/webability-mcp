@@ -21,6 +21,7 @@
 import type { IncomingMessage, ServerResponse } from 'http'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
 import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
+import { OAUTH_MAX_BODY_BYTES, readBodyCapped } from './bodyLimit.js'
 
 const ISSUER = PUBLIC_URL
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
@@ -140,10 +141,9 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body))
 }
 
+/** Throws BodyTooLargeError past OAUTH_MAX_BODY_BYTES; http.ts answers 413 (#199). */
 async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  return Buffer.concat(chunks).toString('utf8')
+  return (await readBodyCapped(req, OAUTH_MAX_BODY_BYTES)).toString('utf8')
 }
 
 /** /token accepts application/x-www-form-urlencoded (the OAuth default) or JSON. */
@@ -390,8 +390,9 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
 
   if (path === '/register' && req.method === 'POST') {
     let body: any
+    const raw = await readBody(req)
     try {
-      body = JSON.parse((await readBody(req)) || '{}')
+      body = JSON.parse(raw || '{}')
     } catch {
       json(res, 400, { error: 'invalid_client_metadata', error_description: 'body must be JSON' })
       return true

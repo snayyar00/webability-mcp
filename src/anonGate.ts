@@ -103,6 +103,13 @@ export function createAnonLimiter(now: () => number = Date.now) {
       b.n += 1
       return { ok: b.n <= limit, retryAfterS: Math.max(0, Math.ceil((b.resetAt - t) / 1000)), resetAt: b.resetAt }
     },
+    /** Would the NEXT allow() for this key be refused? Counts nothing. */
+    full(key: string, limit: number): AnonGateResult {
+      const t = now()
+      const b = buckets.get(key)
+      if (!b || b.resetAt <= t) return { ok: true, retryAfterS: 0, resetAt: t + WINDOW_MS }
+      return { ok: b.n < limit, retryAfterS: Math.max(0, Math.ceil((b.resetAt - t) / 1000)), resetAt: b.resetAt }
+    },
   }
 }
 

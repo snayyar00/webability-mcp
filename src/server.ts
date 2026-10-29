@@ -35,6 +35,7 @@ import { collectSourcePointers, findSourceCandidates, type SourcePointer } from 
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote } from './scanShaping.js'
 import { fastScanHtml } from './fastScan.js'
 import { openSession } from './browser.js'
+import { isBlockedAddress } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
@@ -163,34 +164,28 @@ export function judgeWithin(judge: JudgeOptions | undefined, endsAt: number): Ju
   return capped
 }
 
+/** Hosted flow_scan: pages scanned per call (maxPages is clamped to this) and
+ *  URLs accepted per call (startUrl + autoNavigate). One call is one unit of
+ *  the anonymous rate limit but one browser load per page (#201). */
+export const HOSTED_FLOW_MAX_PAGES = 10
+export const HOSTED_FLOW_MAX_URLS = 50
+
+/** flow_scan's page budget: default 10; clamped on the hosted server only. */
+export function flowScanMaxPages(raw: unknown, remote: boolean): number {
+  const asked = typeof raw === 'number' && raw >= 1 ? Math.floor(raw) : 10
+  return remote ? Math.min(asked, HOSTED_FLOW_MAX_PAGES) : asked
+}
+
 /** Hosted scan_page (and diff_scan, for both scans together) stops here so the answer reaches Zapier (30s action limit) as a message, not a 504. */
 export const SCAN_PAGE_HOSTED_DEADLINE_MS = 25_000
-
-/** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT. */
-function isBlockedAddress(addr: string): boolean {
-  const a = addr.toLowerCase()
-  if (a === '::1' || a === '::' || a.startsWith('fe80') || a.startsWith('fc') || a.startsWith('fd')) return true
-  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
-  const ipv4 = mapped ? mapped[1] : a
-  const m = ipv4.match(/^(\d+)\.(\d+)\.\d+\.\d+$/)
-  if (m) {
-    const o1 = parseInt(m[1], 10)
-    const o2 = parseInt(m[2], 10)
-    if (o1 === 0 || o1 === 127 || o1 === 10) return true          // this-host / loopback / private
-    if (o1 === 169 && o2 === 254) return true                     // link-local + cloud metadata (169.254.169.254)
-    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true           // private
-    if (o1 === 192 && o2 === 168) return true                     // private
-    if (o1 === 100 && o2 >= 64 && o2 <= 127) return true          // CGNAT (often internal)
-  }
-  return false
-}
 
 /** A DNS lookup that hangs would hold a hosted request past the caller's 30s limit. */
 const DNS_LOOKUP_DEADLINE_MS = 5_000
 
 /** SSRF guard: only http(s) to public, externally-resolvable addresses.
- *  NOTE residual risk: Chromium follows redirects, so a 302 to a metadata IP can re-introduce
- *  SSRF after this check. Pair with an egress proxy/allowlist in production for full coverage. */
+ *  Checks one URL. Redirect hops never reach a route handler, so hosted
+ *  contexts also send every connection through the egress proxy
+ *  (egressProxy.ts, wired in browser.ts openSession), which checks each hop. */
 async function assertSafeUrl(raw: string): Promise<void> {
   let u: URL
   try {
@@ -213,9 +208,10 @@ async function assertSafeUrl(raw: string): Promise<void> {
   for (const a of addrs) if (isBlockedAddress(a)) throw new Error(`"${u.hostname}" resolves to blocked internal address ${a}`)
 }
 
-/** Install an SSRF guard on a Playwright context: every request — top-level navigations,
- *  redirect targets, AND sub-resources (e.g. <img>/<script> in attacker-supplied HTML) — is
- *  validated; anything resolving to an internal/private address is aborted. Used in remote mode. */
+/** Install an SSRF guard on a Playwright context: every request the page makes — top-level
+ *  navigations AND sub-resources (e.g. <img>/<script> in attacker-supplied HTML) — is
+ *  validated; anything resolving to an internal/private address is aborted. Used in remote mode.
+ *  Playwright does NOT call this for redirect hops: the egress proxy covers those (#198). */
 async function installSsrfRoute(context: BrowserContext, tunnel: TunnelTarget | null = null): Promise<void> {
   await context.route('**/*', async (route) => {
     try {
@@ -659,7 +655,7 @@ const ALL_TOOLS = [
         type: 'object' as const,
         properties: {
           startUrl: { type: 'string', description: 'Starting URL of the journey' },
-          maxPages: { type: 'number', description: 'Max pages to scan (default 10)' },
+          maxPages: { type: 'number', description: 'Max pages to scan (default 10; at most 10 on the hosted server)' },
           autoNavigate: { type: 'array', items: { type: 'string' }, description: 'The URLs to walk after startUrl, in order (the MCP server is headless and cannot discover a journey interactively). Omit or pass [] to scan only startUrl as a single page.' },
           sourceRoot: { type: 'string', description: 'Local project root (local installs only) for `sourceCandidates[]` on issues without a framework `source` pointer.' },
           ...OUTPUT_CONTROL_PROPERTIES,
@@ -1136,6 +1132,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   if (opts.remote) {
     if (name === 'find_source') {
       return toolError('find_source is disabled on the hosted MCP server — it searches a local project, which does not exist server-side.')
+    }
+    if (name === 'flow_scan' && Array.isArray(args?.autoNavigate) && 1 + (args!.autoNavigate as unknown[]).length > HOSTED_FLOW_MAX_URLS) {
+      return toolError(`flow_scan on the hosted server takes at most ${HOSTED_FLOW_MAX_URLS} URLs per call (startUrl + autoNavigate) and scans at most ${HOSTED_FLOW_MAX_PAGES} pages. Split the journey into several calls, or run the MCP server locally for longer journeys.`)
     }
     const candidateUrls = [
       ...HOSTED_URL_ARG_KEYS.map((k) => (args as Record<string, unknown> | undefined)?.[k]),
@@ -1748,7 +1747,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     let flowControls: OutputControls
     try { flowControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
     if (!startUrl) return toolError('Error: startUrl is required')
-    const maxPages = (args?.maxPages as number) || 10
+    const maxPages = flowScanMaxPages(args?.maxPages, !!opts.remote)
     const autoNav = (args?.autoNavigate as string[]) || []
 
     if (autoNav.length === 0) {

@@ -30,6 +30,7 @@ import { handleOAuth, wwwAuthenticate } from './oauth.js'
 import { anonLimitClass, anonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
 import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH } from './signIn.js'
 import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
+import { BodyTooLargeError, MCP_MAX_BODY_BYTES, declaredTooLarge, readBodyCapped } from './bodyLimit.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
@@ -121,12 +122,37 @@ const ANON_AI_PER_HOUR = Number(process.env.ANON_AI_PER_HOUR || 10)
 
 const anonLimiter = createAnonLimiter()
 
+// Sign-in flood limits (#201), per client IP. Each POST /authorize/start mints
+// a device code on the platform API, and each unknown bearer token costs a
+// platform whoami call; neither needs an account. Only FAILED token checks
+// count, so valid tokens never use this budget.
+const ANON_AUTH_START_PER_HOUR = Number(process.env.ANON_AUTH_START_PER_HOUR || 20)
+const BAD_TOKEN_PER_HOUR = Number(process.env.BAD_TOKEN_PER_HOUR || 30)
+const signInLimiter = createAnonLimiter()
+
+class JsonParseError extends Error {}
+
+/** The JSON-RPC body, capped at MCP_MAX_BODY_BYTES (#199). */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  if (chunks.length === 0) return undefined
-  const raw = Buffer.concat(chunks).toString('utf8')
-  return raw ? JSON.parse(raw) : undefined
+  const raw = (await readBodyCapped(req, MCP_MAX_BODY_BYTES)).toString('utf8')
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new JsonParseError('request body is not valid JSON')
+  }
+}
+
+/** 413, then close: the rest of the oversized body is never read. */
+function sendTooLarge(res: ServerResponse, limit: number, jsonRpc: boolean) {
+  res.setHeader('Connection', 'close')
+  sendJson(
+    res,
+    413,
+    jsonRpc
+      ? { jsonrpc: '2.0', error: { code: -32600, message: `Request body is larger than ${limit} bytes.` }, id: null }
+      : { error: 'invalid_request', error_description: `request body is larger than ${limit} bytes` },
+  )
 }
 
 const httpServer = createHttpServer(async (req, res) => {
@@ -143,10 +169,23 @@ const httpServer = createHttpServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'POST' && url.pathname === '/authorize/start') {
+    const gate = signInLimiter.allow(`${clientIp(req.headers, req.socket.remoteAddress)}:authstart`, ANON_AUTH_START_PER_HOUR)
+    if (!gate.ok) {
+      res.setHeader('Retry-After', String(gate.retryAfterS))
+      sendJson(res, 429, { error: 'rate_limited', error_description: `Too many sign-in attempts from this network. Try again in ${Math.ceil(gate.retryAfterS / 60)} min.` })
+      return
+    }
+  }
+
   // OAuth front door (metadata, DCR, authorize, token) — see oauth.ts.
   try {
     if (await handleOAuth(req, res, url)) return
   } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendTooLarge(res, err.limit, false)
+      return
+    }
     console.error('[oauth] request error:', err)
     if (!res.headersSent) sendJson(res, 500, { error: 'server_error' })
     return
@@ -201,6 +240,13 @@ const httpServer = createHttpServer(async (req, res) => {
   }
   const mcpPath = url.pathname
 
+  // Refuse an oversized body before the token check and before reading it
+  // (#199). A chunked body has no Content-Length: readJsonBody counts it.
+  if (req.method === 'POST' && declaredTooLarge(req, MCP_MAX_BODY_BYTES)) {
+    sendTooLarge(res, MCP_MAX_BODY_BYTES, true)
+    return
+  }
+
   // Auth is PARTIAL on /mcp. Anyone can initialize, list tools, and call the
   // free (DOM/scanner) tools anonymously — rate-limited per IP. A valid
   // per-user token lifts the limits and unlocks the account tools, which run
@@ -211,6 +257,8 @@ const httpServer = createHttpServer(async (req, res) => {
   // to anonymous; the MCP spec requires 401 for an invalid token). The shared
   // operator token is accepted too.
   const token = bearer(req)
+  const ip = clientIp(req.headers, req.socket.remoteAddress)
+  const badTokenKey = `${ip}:badtoken`
   let authToken: string | undefined
   let anonymous = false
   let tokenCheck: TokenCheck = { state: 'invalid' }
@@ -231,6 +279,17 @@ const httpServer = createHttpServer(async (req, res) => {
     anonymous = true
   } else if (matchesShared(token)) {
     authToken = undefined // operator mode: account tools use the deploy's WEBABILITY_API_KEY
+  } else if (!tokenCache.has(token) && !signInLimiter.full(badTokenKey, BAD_TOKEN_PER_HOUR).ok) {
+    // Too many failed token checks from this IP: refuse an unknown token
+    // without asking the platform. A token already verified skips this.
+    const gate = signInLimiter.full(badTokenKey, BAD_TOKEN_PER_HOUR)
+    res.setHeader('Retry-After', String(gate.retryAfterS))
+    sendJson(res, 429, {
+      jsonrpc: '2.0',
+      error: { code: -32001, message: `Too many invalid tokens from this network. Try again in ${Math.ceil(gate.retryAfterS / 60)} min, or drop the Authorization header: the free scanning tools work without an account.` },
+      id: null,
+    })
+    return
   } else if ((tokenCheck = await checkUserToken(token)).state === 'valid') {
     authToken = token // per-user mode: account tools use the caller's key
   } else if (tokenCheck.state === 'unavailable') {
@@ -242,6 +301,7 @@ const httpServer = createHttpServer(async (req, res) => {
     })
     return
   } else {
+    signInLimiter.allow(badTokenKey, BAD_TOKEN_PER_HOUR)
     res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
     sendJson(res, 401, {
       jsonrpc: '2.0',
@@ -260,7 +320,6 @@ const httpServer = createHttpServer(async (req, res) => {
   try {
     const body = req.method === 'POST' ? await readJsonBody(req) : undefined
 
-    const ip = clientIp(req.headers, req.socket.remoteAddress)
 
     if (anonymous) {
       // Every tool the body calls — a JSON-RPC batch must not slip past the
@@ -298,6 +357,14 @@ const httpServer = createHttpServer(async (req, res) => {
     await server.connect(transport)
     await transport.handleRequest(req, res, body)
   } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      if (!res.headersSent) sendTooLarge(res, err.limit, true)
+      return
+    }
+    if (err instanceof JsonParseError) {
+      if (!res.headersSent) sendJson(res, 400, { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error: request body is not valid JSON' }, id: null })
+      return
+    }
     console.error('[mcp-http] request error:', err)
     if (!res.headersSent) {
       sendJson(res, 500, { jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null })

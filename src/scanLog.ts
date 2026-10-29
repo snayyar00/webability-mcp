@@ -20,7 +20,7 @@
  * multi-tenant traffic — callers decide whether to enable it there.
  */
 import { verifyFixTargetUrl } from './verifyFixArgs.js'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -60,17 +60,24 @@ export function recordScan(entry: Omit<ScanLogEntry, 'file'>, fullResponse: unkn
   if (!scanLogEnabled()) return
   try {
     const dir = scanLogDir()
-    mkdirSync(dir, { recursive: true })
+    // Owner-only: responses and target URLs (query strings included) live
+    // here. chmod too, so a directory an older version made 0755 is tightened.
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    try {
+      chmodSync(dir, 0o700)
+    } catch {
+      // A directory the user can write but does not own: still log.
+    }
 
     let file: string | undefined
     try {
       file = `${entry.id}.json`
-      writeFileSync(join(dir, file), JSON.stringify({ ...entry, response: fullResponse }, null, 2))
+      writeFileSync(join(dir, file), JSON.stringify({ ...entry, response: fullResponse }, null, 2), { mode: 0o600 })
     } catch {
       file = undefined
     }
 
-    appendFileSync(join(dir, 'index.jsonl'), JSON.stringify({ ...entry, ...(file ? { file } : {}) }) + '\n')
+    appendFileSync(join(dir, 'index.jsonl'), JSON.stringify({ ...entry, ...(file ? { file } : {}) }) + '\n', { mode: 0o600 })
     pruneOldResults(dir)
   } catch {
     // Best-effort by contract.

@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { anonLimitClass, calledTools, clientIp } from '../src/anonGate.ts'
+import { anonLimitClass, calledTools, clientIp, createAnonLimiter } from '../src/anonGate.ts'
 
 const call = (name: string, id = 1) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: {} } })
 
@@ -51,4 +51,19 @@ test('calledTools keeps each call\'s arguments, single and batch', () => {
   assert.deepEqual(calledTools(withArgs('check_color_contrast', { url: 'https://a.test' })), [{ name: 'check_color_contrast', args: { url: 'https://a.test' } }])
   const batch = calledTools([withArgs('check_color_contrast', { foreground: '#000' }, 1), withArgs('check_color_contrast', { url: 'https://a.test' }, 2)])
   assert.deepEqual(batch.map((c) => anonLimitClass(c)), [null, 'heavy'])
+})
+
+test('limiter.full() reports a spent bucket without counting (#201 bad-token gate)', () => {
+  let t = 1_000
+  const l = createAnonLimiter(() => t)
+  for (let i = 0; i < 5; i++) assert.equal(l.full('ip:badtoken', 2).ok, true, 'peeking must not use the budget')
+  l.allow('ip:badtoken', 2)
+  assert.equal(l.full('ip:badtoken', 2).ok, true)
+  l.allow('ip:badtoken', 2)
+  const g = l.full('ip:badtoken', 2)
+  assert.equal(g.ok, false)
+  assert.ok(g.retryAfterS > 0)
+  assert.equal(l.full('other-ip:badtoken', 2).ok, true)
+  t += 60 * 60 * 1000 + 1
+  assert.equal(l.full('ip:badtoken', 2).ok, true, 'the window resets')
 })

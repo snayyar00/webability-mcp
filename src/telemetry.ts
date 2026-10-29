@@ -111,9 +111,9 @@ export function scrubTelemetryTarget(label: string): string {
     return `${u.origin}${u.pathname}` + tail
   } catch {
     // Unparseable but URL-shaped: cut at the first query/hash marker rather
-    // than shipping it whole.
+    // than shipping it whole, and drop any "user:pass@" after a "//".
     const cut = head.search(/[?#]/)
-    return (cut === -1 ? head : head.slice(0, cut)) + tail
+    return (cut === -1 ? head : head.slice(0, cut)).replace(/\/\/[^/\s@]*@/g, '//') + tail
   }
 }
 

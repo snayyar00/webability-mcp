@@ -55,3 +55,18 @@ test('preserves flow_scan page-count suffix after the scrubbed URL', () => {
     'https://example.com/start (+3 pages)',
   )
 })
+
+test('drops URL credentials from a label that only embeds a URL (#201)', () => {
+  // A selector is not a URL, so new URL() fails and the fallback cut runs.
+  // It used to keep "user:pass@" because userinfo sits before any ? or #.
+  const out = describeTelemetryTarget('find_source', { selector: '[href="https://jane:hunter2@intranet.corp.test/x"]' })
+  assert.ok(!out.includes('hunter2') && !out.includes('jane:'), out)
+  assert.equal(out, '[href="https://intranet.corp.test/x"]')
+  // Credentials on a parseable URL never reached the label (origin + path).
+  assert.equal(describeTelemetryTarget('scan_page', { url: 'https://jane:hunter2@intranet.corp.test/p' }), 'https://intranet.corp.test/p')
+})
+
+test('an embedded URL with no credentials keeps its host and path', () => {
+  assert.equal(describeTelemetryTarget('find_source', { selector: '[data-src="https://cdn.webability.io/a/b"]' }), '[data-src="https://cdn.webability.io/a/b"]')
+  assert.equal(describeTelemetryTarget('find_source', { selector: 'a[href^="mailto:help@webability.io"]' }), 'a[href^="mailto:help@webability.io"]')
+})

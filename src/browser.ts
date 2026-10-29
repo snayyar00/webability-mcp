@@ -7,6 +7,8 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
+import { startEgressProxy, type EgressProxy, type EgressProxySettings } from './egressProxy.js'
+
 export interface LaunchOptions {
   /** Hosted/remote mode: never touches the filesystem to install anything. */
   remote?: boolean
@@ -153,12 +155,28 @@ export function normalizeScanUrl(url: string): string {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`
 }
 
-export function createSessionOpener(launch: (o: LaunchOptions) => Promise<any>) {
+/** One egress proxy per hosted process, started on first use. */
+let hostedEgress: Promise<EgressProxy> | null = null
+function hostedEgressProxy(): Promise<EgressProxySettings> {
+  hostedEgress ??= startEgressProxy().catch((err) => {
+    hostedEgress = null
+    throw err
+  })
+  return hostedEgress.then((p) => p.settings)
+}
+
+/**
+ * `egress` gives a hosted (remote) context its proxy. Every connection the
+ * hosted browser makes goes through it, so a redirect hop into a private
+ * address is refused (#198); the route-level guard cannot see redirect hops.
+ */
+export function createSessionOpener(launch: (o: LaunchOptions) => Promise<any>, egress: () => Promise<EgressProxySettings> = hostedEgressProxy) {
   return async function openSession(opts: OpenSessionOptions = {}): Promise<BrowserSession> {
+    const contextOptions = opts.remote ? { ...opts.contextOptions, proxy: await egress() } : opts.contextOptions
     const buildOnce = async (args?: string[]) => {
       const browser = await launch({ remote: opts.remote, ...(args ? { args } : {}) })
       try {
-        const context = await browser.newContext(opts.contextOptions)
+        const context = await browser.newContext(contextOptions)
         await opts.setupContext?.(context)
         const page = await context.newPage()
         return { browser, context, page }
