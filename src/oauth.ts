@@ -6,9 +6,12 @@
  * metadata, register with RFC 7591 dynamic client registration, and run an
  * authorization-code + PKCE flow. We have no first-party OAuth provider, so
  * /authorize bridges to the platform's existing device-code login: the page
- * starts a device session against the API, sends the user to the same
- * verification page `webability login` uses, and turns the resulting WebAbility
- * token into the OAuth access token. /mcp then validates it exactly as before
+ * starts a device session against the API and sends the user, in the same
+ * window, to the verification page `webability login` uses. That page shows a
+ * consent screen for the named client and returns to /authorize/complete, which
+ * turns the resulting WebAbility token into the OAuth access token. Everything
+ * happens in one window: app reviewers (OpenAI rejected a two-tab flow) and
+ * popup-based clients never have to find their way back to another tab. /mcp then validates it exactly as before
  * (per-user token, so account tools run as that caller), so nothing about the
  * transport or account model changes — this is purely a front door.
  *
@@ -44,6 +47,8 @@ interface AuthParams {
 }
 interface Session extends AuthParams {
   deviceCode: string
+  /** platform consent page, with the return_to that brings the user back */
+  continueUrl: string
   exp: number
 }
 interface IssuedCode {
@@ -244,8 +249,20 @@ function escapeJsonForHtml(value: unknown): string {
   return JSON.stringify(value).replace(/</g, '\\u003c')
 }
 
-/** The /authorize page: starts the device-code session, sends the user to the
- * platform sign-in, polls until approved, then bounces back to the client. */
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/** A plain status page for /authorize/complete outcomes that do not redirect. */
+function messagePage(res: ServerResponse, status: number, title: string, message: string, link?: { href: string; label: string }) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+  res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>
+<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1115;color:#e8eaed;display:grid;place-items:center;min-height:100vh}main{max-width:26rem;padding:2rem;text-align:center}p{color:#9aa0a6;line-height:1.5}a{display:inline-block;margin-top:1rem;padding:.6rem 1.4rem;border-radius:.5rem;background:#2563eb;color:#fff;text-decoration:none;font-weight:600}</style></head>
+<body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${link ? `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>` : ''}</main></body></html>`)
+}
+
+/** The /authorize page: starts the device-code session, then sends this same
+ * window to the platform sign-in and consent page. */
 export function authorizePage(params: AuthParams): string {
   return `<!doctype html>
 <html lang="en">
@@ -259,10 +276,6 @@ export function authorizePage(params: AuthParams): string {
   main { max-width: 26rem; padding: 2rem; text-align: center; }
   h1 { font-size: 1.25rem; font-weight: 600; }
   p { color: #9aa0a6; line-height: 1.5; }
-  a.button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.4rem; border-radius: 0.5rem;
-             background: #2563eb; color: #fff; text-decoration: none; font-weight: 600; }
-  code { display: inline-block; margin-top: 0.75rem; padding: 0.35rem 0.8rem; border-radius: 0.4rem;
-         background: #1c1f26; font-size: 1.1rem; letter-spacing: 0.1em; }
   #status { margin-top: 1.5rem; font-size: 0.9rem; color: #9aa0a6; }
   .err { color: #f28b82; }
   .agent { margin-top: 2rem; font-size: 0.85rem; }
@@ -272,7 +285,7 @@ export function authorizePage(params: AuthParams): string {
 <main>
   <h1>Connect to WebAbility</h1>
   <p id="intro">Sign in with your WebAbility account.</p>
-  <div id="action"><p id="status" role="status">Starting sign-in…</p></div>
+  <p id="status" role="status">Starting sign-in…</p>
   <p class="agent">AI agent with its own AgentMail inbox? Choose <strong>Sign in with AgentID</strong> on the sign-in page. A new agent gets its own WebAbility account.</p>
 </main>
 <script>
@@ -289,25 +302,11 @@ async function post(path, body) {
   try {
     const start = await post('/authorize/start', AUTH);
     if (!start.sid) throw new Error(start.error || 'could not start sign-in');
-    if (!/^https?:\\/\\//.test(start.verificationUrl)) throw new Error('bad verification URL');
-    const action = document.getElementById('action');
-    action.textContent = '';
-    const link = document.createElement('a');
-    link.className = 'button'; link.target = '_blank'; link.rel = 'opener';
-    link.href = start.verificationUrl; link.textContent = 'Sign in to WebAbility';
-    const hint = document.createElement('p');
-    hint.textContent = 'Your code (shown pre-filled on the sign-in page):';
-    const codeEl = document.createElement('code');
-    codeEl.textContent = start.userCode;
-    const status = document.createElement('p');
-    status.id = 'status'; status.setAttribute('role', 'status'); status.textContent = 'Waiting for you to approve in the other tab…';
-    action.append(link, hint, codeEl, status);
-    for (;;) {
-      await new Promise(r => setTimeout(r, 2500));
-      const poll = await post('/authorize/poll', { sid: start.sid });
-      if (poll.status === 'complete') { statusEl().textContent = 'Connected — sending you back…'; location.href = poll.redirect; return; }
-      if (poll.status === 'error') throw new Error(poll.error === 'expired' ? 'Sign-in expired. Close this tab and try connecting again.' : poll.error);
-    }
+    if (!/^https:\\/\\//.test(start.continueUrl)) throw new Error('bad sign-in URL');
+    statusEl().textContent = 'Opening WebAbility sign-in…';
+    // replace(): Back from the platform page must not re-run this script
+    // and mint another device code.
+    location.replace(start.continueUrl);
   } catch (err) {
     statusEl().className = 'err';
     statusEl().textContent = String(err && err.message || err);
@@ -445,8 +444,11 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       const { deviceCode, userCode, verificationUrl } = (await apiRes.json()) as any
       if (!deviceCode || !verificationUrl) throw new Error('device-code response incomplete')
       const sid = randomBytes(16).toString('hex')
-      sessions.set(sid, { ...checked.params, deviceCode, exp: Date.now() + SESSION_TTL_MS })
-      json(res, 200, { sid, verificationUrl, userCode })
+      const continueUrl = new URL(verificationUrl)
+      continueUrl.searchParams.set('return_to', `${ISSUER}/authorize/complete?sid=${sid}`)
+      continueUrl.searchParams.set('client', checked.params.client_label)
+      sessions.set(sid, { ...checked.params, deviceCode, continueUrl: continueUrl.toString(), exp: Date.now() + SESSION_TTL_MS })
+      json(res, 200, { sid, continueUrl: continueUrl.toString(), userCode })
     } catch (err) {
       console.error('[oauth] device-code start failed:', err)
       json(res, 502, { error: 'Could not reach the WebAbility sign-in service. Try again in a moment.' })
@@ -454,51 +456,60 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     return true
   }
 
-  if (path === '/authorize/poll' && req.method === 'POST') {
-    const { sid } = await readParams(req)
-    const session = sid ? sessions.get(sid) : undefined
+  if (path === '/authorize/complete' && req.method === 'GET') {
+    const sid = url.searchParams.get('sid') || ''
+    const session = sessions.get(sid)
     if (!session || session.exp < Date.now()) {
-      json(res, 200, { status: 'error', error: 'expired' })
+      if (session) sessions.delete(sid)
+      messagePage(res, 400, 'Sign-in expired', 'This sign-in link has expired. Go back to the app and connect WebAbility again.')
       return true
     }
+    let payload: any = {}
+    let approved = false
     try {
       const apiRes = await fetch(`${API_URL}/cli/device-token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ deviceCode: session.deviceCode }),
       })
+      // A rate limit or outage says nothing about approval: keep the session
+      // so a reload of the 503 page below completes it.
+      if (apiRes.status === 429 || apiRes.status >= 500) throw new Error(`device-token returned ${apiRes.status}`)
       // Approval is "2xx AND a token in the body": the platform answers
       // pending with HTTP 202 + {error: "authorization_pending"}, and 202 is
       // ok:true to fetch — status alone says nothing.
-      const payload = (await apiRes.json().catch(() => ({}))) as any
-      if (apiRes.ok && typeof payload.token === 'string' && payload.token) {
-        const { token } = payload
-        sessions.delete(sid!)
-        const code = b64url(randomBytes(32))
-        codes.set(code, {
-          token,
-          refresh_token: typeof payload.refreshToken === 'string' && payload.refreshToken ? payload.refreshToken : undefined,
-          code_challenge: session.code_challenge,
-          redirect_uri: session.redirect_uri,
-          client_id: session.client_id,
-          exp: Date.now() + CODE_TTL_MS,
-        })
-        const redirect = new URL(session.redirect_uri)
-        redirect.searchParams.set('code', code)
-        if (session.state) redirect.searchParams.set('state', session.state)
-        json(res, 200, { status: 'complete', redirect: redirect.toString() })
-        return true
-      }
-      if (payload?.error === 'expired') {
-        sessions.delete(sid!)
-        json(res, 200, { status: 'error', error: 'expired' })
-      } else {
-        json(res, 200, { status: 'pending' })
-      }
-    } catch {
-      // transient API hiccup — keep the page polling
-      json(res, 200, { status: 'pending' })
+      payload = (await apiRes.json().catch(() => ({}))) as any
+      approved = apiRes.ok && typeof payload.token === 'string' && !!payload.token
+    } catch (err) {
+      console.error('[oauth] device-token request failed:', err)
+      messagePage(res, 503, 'Sign-in service unavailable', 'Could not reach the WebAbility sign-in service. Reload this page in a moment.')
+      return true
     }
+    if (approved) {
+      sessions.delete(sid)
+      const code = b64url(randomBytes(32))
+      codes.set(code, {
+        token: payload.token,
+        refresh_token: typeof payload.refreshToken === 'string' && payload.refreshToken ? payload.refreshToken : undefined,
+        code_challenge: session.code_challenge,
+        redirect_uri: session.redirect_uri,
+        client_id: session.client_id,
+        exp: Date.now() + CODE_TTL_MS,
+      })
+      const redirect = new URL(session.redirect_uri)
+      redirect.searchParams.set('code', code)
+      if (session.state) redirect.searchParams.set('state', session.state)
+      res.writeHead(302, { Location: redirect.toString(), 'Cache-Control': 'no-store' })
+      res.end()
+      return true
+    }
+    if (payload?.error === 'expired') {
+      sessions.delete(sid)
+      messagePage(res, 400, 'Sign-in expired', 'This sign-in link has expired. Go back to the app and connect WebAbility again.')
+      return true
+    }
+    // Back button or a skipped consent click: send them to approve again.
+    messagePage(res, 200, 'Not connected yet', 'You have not allowed access yet.', { href: session.continueUrl, label: 'Continue to WebAbility' })
     return true
   }
 

@@ -29,6 +29,8 @@ function check(name, cond, detail = '') {
 // Approval is simulated: a device code becomes "approved" once the test calls
 // approve(). Until then /cli/device-token returns authorization_pending.
 const devices = new Map() // deviceCode -> { approved: boolean }
+// When set, /cli/device-token answers with this HTTP status (rate limit / outage).
+let deviceTokenFailStatus = 0
 const USER_TOKEN = 'wa_live_test_token_abc123'
 const REFRESH_TOKEN = 'wa_refresh_test_token_r1'
 const USER_TOKEN_2 = 'wa_live_test_token_rotated'
@@ -50,6 +52,7 @@ const mockApi = createServer((req, res) => {
       return
     }
     if (req.url === '/cli/device-token' && req.method === 'POST') {
+      if (deviceTokenFailStatus) { res.statusCode = deviceTokenFailStatus; res.end(JSON.stringify({ error: 'Too many requests' })); return }
       const { deviceCode } = JSON.parse(body || '{}')
       const d = devices.get(deviceCode)
       if (!d) { res.statusCode = 400; res.end(JSON.stringify({ error: 'expired' })); return }
@@ -177,26 +180,44 @@ try {
     }),
   })
   const start = await startRes.json().catch(() => ({}))
-  check('authorize/start → 200 with session + verification url', startRes.status === 200 && !!start.sid && !!start.verificationUrl && !!start.userCode, JSON.stringify(start))
+  check('authorize/start → 200 with session + continue url', startRes.status === 200 && !!start.sid && !!start.continueUrl && !!start.userCode, JSON.stringify(start))
+  const cont = new URL(start.continueUrl)
+  const returnTo = cont.searchParams.get('return_to') || ''
+  check('continue url is the platform consent page with the user code', cont.origin === 'https://app.webability.io' && cont.searchParams.get('code') === 'ABCD-1234', start.continueUrl)
+  check('continue url returns to /authorize/complete for this session', returnTo === `${BASE}/authorize/complete?sid=${start.sid}`, returnTo)
+  check('continue url names the client for the consent screen', cont.searchParams.get('client') === 'Claude (claude.ai)', cont.searchParams.get('client'))
 
-  const pending = await (await fetch(`${BASE}/authorize/poll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sid: start.sid }) })).json()
-  check('poll is pending before approval', pending.status === 'pending', JSON.stringify(pending))
+  // The platform page sends the user back to return_to after consent.
+  const complete = (sid) => fetch(`${BASE}/authorize/complete?sid=${encodeURIComponent(sid)}`, { redirect: 'manual' })
+  const pending = await complete(start.sid)
+  const pendingHtml = await pending.text()
+  check('complete before approval → 200 page linking back to consent', pending.status === 200 && pendingHtml.includes('Not connected yet') && pendingHtml.includes('return_to='), `${pending.status} ${pendingHtml.slice(0, 200)}`)
+  const unknown = await complete('nope')
+  check('complete with an unknown session → 400 expired page', unknown.status === 400 && (await unknown.text()).includes('expired'), unknown.status)
 
-  // user approves in the platform tab
+  // user approves on the platform consent page
   for (const d of devices.values()) d.approved = true
 
-  let done
-  for (let i = 0; i < 20; i++) {
-    done = await (await fetch(`${BASE}/authorize/poll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sid: start.sid }) })).json()
-    if (done.status === 'complete') break
-    await new Promise((r) => setTimeout(r, 250))
+  // A platform rate limit or outage at return time is not "not approved":
+  // show a reload page and keep the session so the reload completes.
+  for (const status of [429, 500, 503]) {
+    deviceTokenFailStatus = status
+    const busy = await complete(start.sid)
+    const busyHtml = await busy.text()
+    check(`complete when the platform answers ${status} → 503 reload page`, busy.status === 503 && busyHtml.includes('Reload') && !busyHtml.includes('Not connected yet'), `${busy.status} ${busyHtml.slice(0, 160)}`)
   }
-  check('poll completes after approval', done && done.status === 'complete', JSON.stringify(done))
-  const redirect = new URL(done.redirect)
-  check('redirect goes to the registered redirect_uri', done.redirect.startsWith(redirectUri), done.redirect)
+  deviceTokenFailStatus = 0
+
+  const done = await complete(start.sid)
+  const location = done.headers.get('location') || ''
+  check('complete after approval → 302 to the client', done.status === 302, done.status)
+  const redirect = new URL(location)
+  check('redirect goes to the registered redirect_uri', location.startsWith(redirectUri), location)
   check('redirect carries state', redirect.searchParams.get('state') === 'xyzstate')
   const code = redirect.searchParams.get('code')
   check('redirect carries a code', !!code && code.length > 10)
+  const replay = await complete(start.sid)
+  check('a used session cannot complete twice', replay.status === 400, replay.status)
 
   // 7. token exchange (PKCE)
   const form = (o) => new URLSearchParams(o).toString()
@@ -218,13 +239,8 @@ try {
     body: JSON.stringify({ client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate2', code_challenge: challenge, code_challenge_method: 'S256' }),
   })).json()
   for (const d of devices.values()) d.approved = true
-  let done2
-  for (let i = 0; i < 20; i++) {
-    done2 = await (await fetch(`${BASE}/authorize/poll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sid: start2.sid }) })).json()
-    if (done2.status === 'complete') break
-    await new Promise((r) => setTimeout(r, 250))
-  }
-  const code2 = new URL(done2.redirect).searchParams.get('code')
+  const done2 = await complete(start2.sid)
+  const code2 = new URL(done2.headers.get('location')).searchParams.get('code')
   check('second sign-in yields a fresh code', !!code2 && code2 !== code)
 
   const tokRes = await fetch(as.token_endpoint, {
