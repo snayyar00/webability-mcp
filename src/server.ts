@@ -39,6 +39,7 @@ import { isBlockedAddress } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
+import { checkInstall } from './installCheck.js'
 
 /** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
 export const HOSTED_URL_ARG_KEYS: string[] = [...new Set(['url', 'startUrl', 'baselineUrl', ...VERIFY_FIX_URL_KEYS])]
@@ -544,6 +545,17 @@ const REMOTE_LOCALHOST_CAVEAT =
 
 const ALL_TOOLS = [
     {
+      name: 'check_install',
+      description: 'Check whether the WebAbility embed script is present, blocked by an enforced security policy, failing with an error, or not installed, with evidence. Skeleton only: detection is not implemented yet and calls return an explicit tool error. This is not an accessibility-conformance check. Local HTTP(S) URLs are accepted locally; hosted calls retain the standard private-address restrictions.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          url: { type: 'string', description: 'Website URL to inspect (HTTP or HTTPS; bare domains default to HTTPS).' },
+        },
+        required: ['url'],
+      },
+    },
+    {
       name: 'scan_page',
       description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns `issues` (violations the scanner stands behind; findings the engines cannot decide are settled by the AI judge — a violation with a fix, or a pass recorded in `judged[]` with its reason — and anything unsettled is dropped, never listed for review) and a `summary`. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
       inputSchema: {
@@ -828,6 +840,7 @@ const ALL_TOOLS = [
 type Hints = { title: string; readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean }
 const read = (title: string, openWorldHint: boolean): Hints => ({ title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint })
 const TOOL_ANNOTATIONS: Record<string, Hints> = {
+  check_install: read('Check the WebAbility installation', true),
   scan_page: read('Scan a page for accessibility issues', true),
   verify_fix: read('Verify an accessibility fix', true),
   diff_scan: read('Compare two accessibility scans', true),
@@ -1152,6 +1165,26 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         const detail = (e as Error).message
         return toolError(blockedUrlMessage(detail, resolvedAddressFrom(detail)))
       }
+    }
+  }
+
+  if (name === 'check_install') {
+    const url = args?.url
+    if (typeof url !== 'string' || !url) return toolError('Error: url is required and must be a string')
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsupported protocol')
+    } catch {
+      return toolError('Error: url must be a valid HTTP or HTTPS URL')
+    }
+    try {
+      const result = await checkInstall(url)
+      return {
+        structuredContent: result,
+        content: [{ type: 'text', text: '```json\n' + JSON.stringify(result, null, 2) + '\n```' }],
+      }
+    } catch (err) {
+      return toolError(`check_install failed: ${(err as Error).message}`)
     }
   }
 
