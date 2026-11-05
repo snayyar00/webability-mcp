@@ -323,7 +323,7 @@ export function wwwAuthenticate(mcpPath: string = MCP_PATH): string {
 }
 
 /** refresh_token grant: the platform verifies the refresh token and rotates both tokens. */
-async function refreshGrant(boundToken: string | undefined, clientId: string | undefined, res: ServerResponse): Promise<void> {
+async function refreshGrant(boundToken: string | undefined, clientId: string | undefined, res: ServerResponse, onTokenIssued?: (token: string) => void): Promise<void> {
   if (!boundToken) {
     json(res, 400, { error: 'invalid_request', error_description: 'refresh_token is required' })
     return
@@ -355,6 +355,7 @@ async function refreshGrant(boundToken: string | undefined, clientId: string | u
     json(res, 503, { error: 'temporarily_unavailable', error_description: 'The WebAbility sign-in service returned an error.' })
     return
   }
+  onTokenIssued?.(payload.token)
   json(res, 200, {
     access_token: payload.token,
     token_type: 'Bearer',
@@ -365,7 +366,7 @@ async function refreshGrant(boundToken: string | undefined, clientId: string | u
 
 /** Route OAuth endpoints. Returns true when the request was handled here. */
 
-export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL, onTokenIssued?: (token: string) => void): Promise<boolean> {
   sweep()
   const path = url.pathname
 
@@ -516,7 +517,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
   if (path === '/token' && req.method === 'POST') {
     const p = await readParams(req)
     if (p.grant_type === 'refresh_token') {
-      await refreshGrant(p.refresh_token, p.client_id, res)
+      await refreshGrant(p.refresh_token, p.client_id, res, onTokenIssued)
       return true
     }
     if (p.grant_type !== 'authorization_code') {
@@ -544,6 +545,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     }
     // The access token is a 30-day WebAbility JWT. No expires_in: the client
     // learns it expired from a 401 on /mcp/auth, then uses refresh_token.
+    onTokenIssued?.(issued.token)
     json(res, 200, { access_token: issued.token, token_type: 'Bearer', scope: 'mcp', ...(issued.refresh_token ? { refresh_token: bindRefreshToken(issued.refresh_token, issued.client_id) } : {}) })
     return true
   }

@@ -23,7 +23,7 @@
  * (operator mode → account tools fall back to the deploy's WEBABILITY_API_KEY).
  */
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
-import { timingSafeEqual } from 'crypto'
+import { createHash, timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
 import { handleOAuth, wwwAuthenticate } from './oauth.js'
@@ -44,13 +44,48 @@ const SHARED_TOKEN = process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.le
 const tokenCache = new Map<string, number>()
 const TOKEN_TTL_MS = 5 * 60 * 1000
 
-function bearer(req: IncomingMessage): string {
-  // Prefer the standard Authorization header (direct clients, the CLI, the
-  // operator token). Fall back to x-webability-token: gateways like Smithery
-  // reserve Authorization for their own hop and refuse to forward it upstream,
-  // so they carry the user's token in a non-reserved custom header instead.
-  const raw = (req.headers['x-webability-token'] as string) || req.headers.authorization || ''
-  return raw.replace(/^Bearer\s+/i, '').trim()
+// Tokens the platform refused, by hash. A client retrying one dead token gets
+// the same 401 without a platform call and without spending the IP's bad-token
+// budget, so one expired token can never lock a network out. Same TTL as
+// tokenCache, so a platform answer is never trusted for long.
+const rejectedTokens = new Map<string, number>()
+const REJECTED_TOKENS_MAX = 10_000
+
+const tokenKey = (token: string) => createHash('sha256').update(token).digest('base64url')
+
+function isRejected(token: string): boolean {
+  const key = tokenKey(token)
+  const exp = rejectedTokens.get(key)
+  if (exp === undefined) return false
+  if (exp > Date.now()) return true
+  rejectedTokens.delete(key)
+  return false
+}
+
+function rememberRejected(token: string): void {
+  if (rejectedTokens.size >= REJECTED_TOKENS_MAX) {
+    const oldest = rejectedTokens.keys().next().value
+    if (oldest !== undefined) rejectedTokens.delete(oldest)
+  }
+  rejectedTokens.set(tokenKey(token), Date.now() + TOKEN_TTL_MS)
+  tokenCache.delete(token)
+}
+
+/** A token the OAuth endpoints just got from the platform is known good. */
+function rememberIssued(token: string): void {
+  tokenCache.set(token, Date.now() + TOKEN_TTL_MS)
+}
+
+function bearerCandidates(req: IncomingMessage): string[] {
+  // Authorization first (direct clients, OAuth, the CLI, the operator token).
+  // x-webability-token is the fallback: gateways like Smithery reserve
+  // Authorization for their own hop and refuse to forward it upstream, so they
+  // carry the user's token in a custom header. A stale header pasted into a
+  // client config must not override a live OAuth sign-in.
+  const tokens = [req.headers.authorization, req.headers['x-webability-token']]
+    .map((raw) => String(raw || '').replace(/^Bearer\s+/i, '').trim())
+    .filter(Boolean)
+  return [...new Set(tokens)]
 }
 
 /** Constant-time match for the shared operator token (no length/prefix timing leak). */
@@ -125,7 +160,8 @@ const anonLimiter = createAnonLimiter()
 // Sign-in flood limits (#201), per client IP. Each POST /authorize/start mints
 // a device code on the platform API, and each unknown bearer token costs a
 // platform whoami call; neither needs an account. Only FAILED token checks
-// count, so valid tokens never use this budget.
+// count, once per dead token per TOKEN_TTL_MS, so valid tokens never use this
+// budget and a lockout cannot block a token the OAuth endpoints just issued.
 const ANON_AUTH_START_PER_HOUR = Number(process.env.ANON_AUTH_START_PER_HOUR || 20)
 const BAD_TOKEN_PER_HOUR = Number(process.env.BAD_TOKEN_PER_HOUR || 30)
 const signInLimiter = createAnonLimiter()
@@ -180,7 +216,7 @@ const httpServer = createHttpServer(async (req, res) => {
 
   // OAuth front door (metadata, DCR, authorize, token) — see oauth.ts.
   try {
-    if (await handleOAuth(req, res, url)) return
+    if (await handleOAuth(req, res, url, rememberIssued)) return
   } catch (err) {
     if (err instanceof BodyTooLargeError) {
       sendTooLarge(res, err.limit, false)
@@ -256,12 +292,30 @@ const httpServer = createHttpServer(async (req, res) => {
   // authenticate should learn their token is bad, not be silently downgraded
   // to anonymous; the MCP spec requires 401 for an invalid token). The shared
   // operator token is accepted too.
-  const token = bearer(req)
+  const candidates = bearerCandidates(req)
+  // A verified token comes before an unknown one, so an unknown token in the
+  // other header cannot pull a good caller into the lockout below.
+  const usable = candidates.filter((t) => !isRejected(t))
+  const token = candidates.find(matchesShared) ?? usable.find((t) => tokenCache.has(t)) ?? usable[0] ?? candidates[0] ?? ''
   const ip = clientIp(req.headers, req.socket.remoteAddress)
   const badTokenKey = `${ip}:badtoken`
   let authToken: string | undefined
   let anonymous = false
   let tokenCheck: TokenCheck = { state: 'invalid' }
+  const sendInvalidToken = () => {
+    res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
+    sendJson(res, 401, {
+      jsonrpc: '2.0',
+      error: {
+        code: -32001,
+        message:
+          'Invalid or expired token. Reconnect (your client re-runs the sign-in), run `webability login` for a fresh token, ' +
+          'or remove the Authorization and x-webability-token headers: the free scanning tools work without an account. ' +
+          'Docs: https://www.webability.io/docs/mcp',
+      },
+      id: null,
+    })
+  }
   if (!token && mcpPath === SIGN_IN_MCP_PATH) {
     res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
     sendJson(res, 401, {
@@ -279,14 +333,19 @@ const httpServer = createHttpServer(async (req, res) => {
     anonymous = true
   } else if (matchesShared(token)) {
     authToken = undefined // operator mode: account tools use the deploy's WEBABILITY_API_KEY
+  } else if (isRejected(token)) {
+    // Known dead: a 401, not the 429 below, so the client re-runs sign-in.
+    sendInvalidToken()
+    return
   } else if (!tokenCache.has(token) && !signInLimiter.full(badTokenKey, BAD_TOKEN_PER_HOUR).ok) {
     // Too many failed token checks from this IP: refuse an unknown token
-    // without asking the platform. A token already verified skips this.
+    // without asking the platform. A token already verified or just issued
+    // by OAuth skips this.
     const gate = signInLimiter.full(badTokenKey, BAD_TOKEN_PER_HOUR)
     res.setHeader('Retry-After', String(gate.retryAfterS))
     sendJson(res, 429, {
       jsonrpc: '2.0',
-      error: { code: -32001, message: `Too many invalid tokens from this network. Try again in ${Math.ceil(gate.retryAfterS / 60)} min, or drop the Authorization header: the free scanning tools work without an account.` },
+      error: { code: -32001, message: `Too many invalid tokens from this network. Sign in again, or try this token in ${Math.ceil(gate.retryAfterS / 60)} min. The free scanning tools work now if you remove the Authorization and x-webability-token headers.` },
       id: null,
     })
     return
@@ -301,19 +360,11 @@ const httpServer = createHttpServer(async (req, res) => {
     })
     return
   } else {
-    signInLimiter.allow(badTokenKey, BAD_TOKEN_PER_HOUR)
-    res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
-    sendJson(res, 401, {
-      jsonrpc: '2.0',
-      error: {
-        code: -32001,
-        message:
-          'Invalid or expired token. Reconnect (your client re-runs the sign-in), run `webability login` for a fresh token, ' +
-          'or drop the Authorization header entirely — the free scanning tools work without an account. ' +
-          'Docs: https://www.webability.io/docs/mcp',
-      },
-      id: null,
-    })
+    // A concurrent request with this token may have recorded it during the
+    // await above: spend the budget once per dead token, not once per request.
+    if (!isRejected(token)) signInLimiter.allow(badTokenKey, BAD_TOKEN_PER_HOUR)
+    rememberRejected(token)
+    sendInvalidToken()
     return
   }
 
