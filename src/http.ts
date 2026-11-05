@@ -368,6 +368,17 @@ const httpServer = createHttpServer(async (req, res) => {
     return
   }
 
+  // This server is stateless, so it never pushes on a standing GET stream. The
+  // SDK would open one and send no bytes: no headers reach Cloudflare, it
+  // answers 524 at 125s, and Cursor marks the server failed. 405 is the spec's
+  // way to say there is no GET stream. Comes after auth so a client with no
+  // token still gets the 401 that starts sign-in.
+  if (req.method === 'GET') {
+    res.setHeader('Allow', 'POST, DELETE, OPTIONS')
+    sendJson(res, 405, { jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed: this server has no GET stream' }, id: null })
+    return
+  }
+
   try {
     const body = req.method === 'POST' ? await readJsonBody(req) : undefined
 
