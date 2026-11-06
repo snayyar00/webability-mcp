@@ -1566,10 +1566,20 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
 
     try {
       const scanBoth = async (signal?: AbortSignal) => {
-        const baseline = baselineId ? stored(baselineId) : await live(baselineUrl!, signal)
-        if ((baseline as any).blocked) throw new Error(`baseline ${baselineUrl} was BLOCKED (${(baseline as any).blocked.reason}) — not scanned, cannot diff`)
-        const current = currentId ? stored(currentId) : await live(url!, signal)
-        if ((current as any).blocked) throw new Error(`current ${url} was BLOCKED (${(current as any).blocked.reason}) — not scanned, cannot diff`)
+        // At once: one after the other, two ordinary pages pass the hosted budget.
+        // When one side fails, stop the other: its browser would run on unseen.
+        const stop = new AbortController()
+        const both = signal ? AbortSignal.any([signal, stop.signal]) : stop.signal
+        const side = async (name: string, id: string | undefined, target: string | undefined) => {
+          const scan = id ? stored(id) : await live(target!, both)
+          if ((scan as any).blocked) throw new Error(`${name} ${target} was BLOCKED (${(scan as any).blocked.reason}) — not scanned, cannot diff`)
+          return scan
+        }
+        const stopOther = (err: unknown): never => { stop.abort(); throw err }
+        const [baseline, current] = await Promise.all([
+          side('baseline', baselineId, baselineUrl).catch(stopOther),
+          side('current', currentId, url).catch(stopOther),
+        ])
         return { baseline, current }
       }
       // Hosted only, as scan_page: one budget covers both live scans so the

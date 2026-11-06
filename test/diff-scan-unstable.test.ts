@@ -19,11 +19,17 @@ let badLoads = new Set<number>()
 let imagesByLoad: number[] = []
 const IMG = (n: number) => `<img id="gsi_${n}" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">`
 const page = (bad: boolean, images = 0) => `<!doctype html><html lang="en"><head><title>t</title></head><body><main><h1>t</h1><p>ok</p>${bad ? '<img id="flaky" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">' : ''}${Array.from({ length: images }, (_, n) => IMG(n)).join('')}</main></body></html>`
+// A pair scans at once, so arrival order says nothing about the side. The current
+// side asks for /?c. Baseline loads are numbered 1, 3 and current loads 2, 4.
+const loadNumber = (seen: { baseline: number; current: number }, reqUrl: string | undefined) =>
+  reqUrl === '/?c' ? 2 * ++seen.current : 2 * ++seen.baseline - 1
+let seen = { baseline: 0, current: 0 }
 const http = createHttpServer((req, res) => {
-  if (req.url !== '/') { res.writeHead(204); res.end(); return }
+  if (req.url !== '/' && req.url !== '/?c') { res.writeHead(204); res.end(); return }
   hits++
+  const load = loadNumber(seen, req.url)
   res.writeHead(200, { 'content-type': 'text/html' })
-  res.end(page(badLoads.has(hits), imagesByLoad[hits - 1] ?? 0))
+  res.end(page(badLoads.has(load), imagesByLoad[load - 1] ?? 0))
 })
 let url = ''
 let client: Client
@@ -39,9 +45,10 @@ after(() => { http.close() })
 
 const run = async (loads: number[], images: number[] = []) => {
   hits = 0
+  seen = { baseline: 0, current: 0 }
   badLoads = new Set(loads)
   imagesByLoad = images
-  const r: any = await client.callTool({ name: 'diff_scan', arguments: { baselineUrl: url, url, format: 'json' } })
+  const r: any = await client.callTool({ name: 'diff_scan', arguments: { baselineUrl: url, url: url + '?c', format: 'json' } })
   assert.notEqual(r.isError, true, r.content?.[0]?.text)
   return { text: r.content.map((c: any) => c.text).join('\n'), loads: hits }
 }
@@ -89,13 +96,14 @@ test('a count change on one pair only is unstable', async () => {
 // wanted. From `hangFrom` on, the page never answers.
 const hostedDiff = async (budgetMs: number, delayMs: number, hangFrom: number) => {
   const { openSession } = await import('../src/browser.ts')
-  let n = 0
+  const seenSlow = { baseline: 0, current: 0 }
   let thirdLoadAt = 0
+  const startedAt: Record<number, number> = {}
   const sockets = new Set<import('node:net').Socket>()
   const slow = createHttpServer((req, res) => {
-    if (req.url !== '/') { res.writeHead(204); res.end(); return }
-    n++
-    const load = n
+    if (req.url !== '/' && req.url !== '/?c') { res.writeHead(204); res.end(); return }
+    const load = loadNumber(seenSlow, req.url)
+    startedAt[load] = Date.now()
     if (load >= 3) thirdLoadAt ||= Date.now()
     if (load >= hangFrom) return // never answer
     setTimeout(() => {
@@ -117,7 +125,8 @@ const hostedDiff = async (budgetMs: number, delayMs: number, hangFrom: number) =
     openSession: async (o) => {
       const session = await openSession({ ...o, remote: false, setupContext: undefined })
       await session.context.route('http://slow-diff.test/**', async (route: any) => {
-        const res = await fetch(localBase + new URL(route.request().url()).pathname).catch(() => null)
+        const target = new URL(route.request().url())
+        const res = await fetch(localBase + target.pathname + target.search).catch(() => null)
         if (!res) return route.abort().catch(() => {})
         await route.fulfill({ status: res.status, contentType: 'text/html', body: await res.text() }).catch(() => {})
       })
@@ -128,10 +137,10 @@ const hostedDiff = async (budgetMs: number, delayMs: number, hangFrom: number) =
   await Promise.all([server.connect(b), c.connect(a)])
   try {
     const started = Date.now()
-    const r: any = await c.callTool({ name: 'diff_scan', arguments: { baselineUrl: slowUrl, url: slowUrl, format: 'json', context: 'Checking the hosted diff budget covers the second pass.' } })
+    const r: any = await c.callTool({ name: 'diff_scan', arguments: { baselineUrl: slowUrl, url: slowUrl + '?c', format: 'json', context: 'Checking the hosted diff budget covers the second pass.' } })
     const text = r.content.map((x: any) => x.text).join('\n')
     assert.notEqual(r.isError, true, text)
-    return { text, elapsed: Date.now() - started, started, thirdLoadAt }
+    return { text, elapsed: Date.now() - started, started, thirdLoadAt, startedAt }
   } finally {
     ;(dnsPromises as any).lookup = realLookup
     await c.close()
@@ -153,10 +162,59 @@ test('hosted diff_scan: the second pair shares the call budget and an unfinished
 }, 45_000)
 
 test('hosted diff_scan: a second pair that cannot fit does not start, and the reply comes early', async () => {
-  // Each load takes 5s plus the scan, so the first pair takes over half the budget.
+  // Each load takes 12s plus the scan, so the first pair takes over half the budget.
   const BUDGET_MS = 22_000
-  const { text, elapsed, thirdLoadAt } = await hostedDiff(BUDGET_MS, 5_000, 99)
+  const { text, elapsed, thirdLoadAt } = await hostedDiff(BUDGET_MS, 12_000, 99)
   assert.equal(thirdLoadAt, 0, 'no third load')
   assert.ok(elapsed < BUDGET_MS, `returned after ${elapsed}ms`)
   assert.match(text, /^UNCONFIRMED: 1 possible new/)
+}, 45_000)
+
+// Seen on prod: 12.6s scans, one after the other, ran past the 25s hosted budget
+// on both real pages tried. Two scans at once take about as long as one.
+test('hosted diff_scan: a pair that fits only at once scans at once', async () => {
+  const DELAY_MS = 7_000
+  const { text, startedAt } = await hostedDiff(18_000, DELAY_MS, 99)
+  assert.ok(Math.abs(startedAt[1] - startedAt[2]) < DELAY_MS, `load 1 and load 2 started ${Math.abs(startedAt[1] - startedAt[2])}ms apart`)
+  assert.match(text, /^UNCONFIRMED: 1 possible new/)
+}, 45_000)
+
+test('hosted diff_scan: when one side fails, the other scan stops too', async () => {
+  const { openSession } = await import('../src/browser.ts')
+  const realLookup = dnsPromises.lookup
+  ;(dnsPromises as any).lookup = async () => [{ address: '93.184.215.14', family: 4 }]
+  let opened = 0
+  const closed = new Set<unknown>()
+  const [a, b] = InMemoryTransport.createLinkedPair()
+  const server = createServer({
+    remote: true,
+    authToken: 'test-token',
+    scanPageDeadlineMs: 20_000,
+    openSession: async (o) => {
+      const session = await openSession({ ...o, remote: false, setupContext: undefined })
+      opened++
+      const close = session.close.bind(session)
+      session.close = async () => { closed.add(session); await close() }
+      await session.context.route('http://fail-diff.test/**', async (route: any) => {
+        if (route.request().url().endsWith('?c')) return route.abort() // the current side fails at once
+        // the baseline side never answers
+      })
+      return session
+    },
+  })
+  const c = new Client({ name: 'test', version: '1' }, { capabilities: {} })
+  await Promise.all([server.connect(b), c.connect(a)])
+  try {
+    const started = Date.now()
+    const r: any = await c.callTool({ name: 'diff_scan', arguments: { baselineUrl: 'http://fail-diff.test/', url: 'http://fail-diff.test/?c', format: 'json', context: 'Checking a failed side stops the other scan in a pair.' } })
+    const elapsed = Date.now() - started
+    assert.equal(r.isError, true)
+    assert.ok(elapsed < 10_000, `returned after ${elapsed}ms`)
+    // A session still opening when the failure comes closes as soon as it opens.
+    for (let i = 0; i < 80 && closed.size < 2; i++) await new Promise((r) => setTimeout(r, 100))
+    assert.equal(closed.size, 2, `${opened} opened, ${closed.size} closed: both browser sessions must be closed`)
+  } finally {
+    ;(dnsPromises as any).lookup = realLookup
+    await c.close()
+  }
 }, 45_000)
