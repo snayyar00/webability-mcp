@@ -14,7 +14,7 @@ import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
 import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelBlockHint, tunnelHeadersFor } from './tunnelAuth'
 import { DeadlineError, withDeadline } from './deadline'
-import { stratifiedCap } from './capStratified'
+import { pageStratified, stratifiedCap } from './capStratified'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import dnsPromises from 'dns/promises'
@@ -23,12 +23,13 @@ import type { BrowserContext } from 'playwright'
 import { blockedUrlMessage, resolvedAddressFrom } from './blockedUrlMessage.js'
 import { judgeOptionsFromEnv } from './judgeConfig.js'
 import { describeScanTarget, newScanId, readScanHistory, readScanResult, recordScan, scanLogDir, scanLogEnabled } from './scanLog.js'
+import { errorHint, type ErrorHint } from './toolErrorHint.js'
 import { classifyToolError, describeTelemetryTarget, extractToolTelemetry, reportScanEvent, sanitizeTelemetryError } from './telemetry.js'
 import { enablePostHogMcpAnalytics } from './posthog.js'
 import { MCP_VERSION } from './version.js'
 import { generateReportPdf, type PdfIssue } from './reportPdf.js'
 import { axeRuleFixMeta, enrichIssue, webabilityRuleFixMeta, FIXABILITY_TIERS, type Fixability } from './fixOps.js'
-import { IMPACT_RANK, INLINE_BUDGET, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
+import { IMPACT_RANK, INLINE_BUDGET, OFFSET_PROPERTY, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote } from './scanShaping.js'
 import { fastScanHtml } from './fastScan.js'
@@ -81,9 +82,32 @@ function authRequired(text: string): ToolResponse {
  * A genuine failure or refused call (bad input, blocked URL, API error). `isError: true` is how an MCP client tells a
  * refusal from a result; without it an agent reads the error text as success.
  */
-function toolError(text: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
-  return { content: [{ type: 'text', text }], isError: true }
+function toolError(text: string, hint?: Partial<ErrorHint>): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  const response = { content: [{ type: 'text' as const, text }], isError: true as const }
+  if (hint) errorHintByResponse.set(response, hint)
+  return response
 }
+
+const AUDIT_POLL_SECONDS = 15
+
+/**
+ * Typed poll hints for start_audit / get_audit. While the audit runs the caller
+ * waits `pollAfterSeconds` and repeats `next`; once it is complete or failed
+ * both are null. `expiresAt` is the API's own value when it sends one, else null.
+ */
+function auditHints(data: { id: number; status: string; expiresAt?: string }) {
+  const done = data.status === 'complete' || data.status === 'failed'
+  return {
+    id: data.id,
+    status: data.status,
+    pollAfterSeconds: done ? null : AUDIT_POLL_SECONDS,
+    next: done ? null : { tool: 'get_audit', args: { id: data.id } },
+    expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : null,
+  }
+}
+
+/** Explicit `structuredContent.error` fields for a toolError whose code the text classifier cannot know. */
+const errorHintByResponse = new WeakMap<object, Partial<ErrorHint>>()
 
 /**
  * Associates a returned tool response with the FULL, pre-truncation scan result
@@ -520,6 +544,7 @@ const ALL_TOOLS = [
           viewport: { type: 'string', enum: ['desktop', 'tablet', 'mobile'], description: 'Viewport size (default: desktop)' },
           sourceRoot: { type: 'string', description: 'Local project root (local installs only). Issues without a framework `source` pointer get `sourceCandidates[]` — files whose contents match the selector\'s id/class/attribute tokens.' },
           ...OUTPUT_CONTROL_PROPERTIES,
+          ...OFFSET_PROPERTY,
         },
         required: ['url'],
       },
@@ -556,7 +581,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'start_audit',
-      description: 'Kick off a FULL accessibility audit deliverable for a URL — a persistent, timestamped artifact, not an inline scan. Runs the server-side pipeline (axe + advanced checks + mobile viewports + annotated screenshots + optional agent spot-check) and produces a downloadable report and a formatted Excel workbook (Cover / Status / Barriers / ADA context sheets) stored durably. Returns immediately with an audit `id`; poll `get_audit` for progress and, when complete, download URLs. Use this when someone needs a durable artifact to attach as evidence of testing effort for a compliance officer or legal response — for iterating on code, use scan_page + verify_fix instead. Needs a free WebAbility account (sign in by connecting https://mcp.webability.io/mcp/auth, or run `webability login`). Set includeAgent:true to add the slower agentic manual-audit pass. To audit a local dev server, open a tunnel (`webability-tunnel --port 3000`) and pass its URL as `url` with the printed secret as `tunnel_secret`; keep the tunnel open until get_audit reports complete (about 5 minutes) — the pipeline loads the page several times.',
+      description: 'Kick off a FULL accessibility audit deliverable for a URL — a persistent, timestamped artifact, not an inline scan. Runs the server-side pipeline (axe + advanced checks + mobile viewports + annotated screenshots + optional agent spot-check) and produces a downloadable report and a formatted Excel workbook (Cover / Status / Barriers / ADA context sheets) stored durably. Returns immediately with an audit `id`; poll `get_audit` for progress and, when complete, download URLs. structuredContent carries `{id, status, pollAfterSeconds, next, expiresAt}`; `expiresAt` is null until the API reports a retention time (download URLs last about 1 hour), and an unknown or expired id returns an `audit_not_found` error. Use this when someone needs a durable artifact to attach as evidence of testing effort for a compliance officer or legal response — for iterating on code, use scan_page + verify_fix instead. Needs a free WebAbility account (sign in by connecting https://mcp.webability.io/mcp/auth, or run `webability login`). Set includeAgent:true to add the slower agentic manual-audit pass. To audit a local dev server, open a tunnel (`webability-tunnel --port 3000`) and pass its URL as `url` with the printed secret as `tunnel_secret`; keep the tunnel open until get_audit reports complete (about 5 minutes) — the pipeline loads the page several times.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -625,6 +650,7 @@ const ALL_TOOLS = [
           autoNavigate: { type: 'array', items: { type: 'string' }, description: 'The URLs to walk after startUrl, in order (the MCP server is headless and cannot discover a journey interactively). Omit or pass [] to scan only startUrl as a single page.' },
           sourceRoot: { type: 'string', description: 'Local project root (local installs only) for `sourceCandidates[]` on issues without a framework `source` pointer.' },
           ...OUTPUT_CONTROL_PROPERTIES,
+          ...OFFSET_PROPERTY,
         },
         required: ['startUrl'],
       },
@@ -914,6 +940,13 @@ const handleCallTool = async (request: CallToolRequest, opts: ServerOptions = {}
     throw err
   }
   const durationMs = Date.now() - started
+  if ((response as any)?.isError && !(response as any).structuredContent?.error) {
+    const text = (response as any).content?.find?.((c: any) => c?.type === 'text')?.text ?? ''
+    ;(response as any).structuredContent = {
+      ...((response as any).structuredContent ?? {}),
+      error: errorHint(toolName, request.params.arguments as Record<string, unknown> | undefined, text, errorHintByResponse.get(response as object)),
+    }
+  }
   const firstText = Array.isArray((response as any)?.content)
     ? ((response as any).content.find((c: any) => c?.type === 'text')?.text ?? '')
     : ''
@@ -1125,7 +1158,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     const url = args?.url as string
     if (!url) return toolError('Error: url is required')
     let controls: OutputControls
-    try { controls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
+    try { controls = parseOutputControls(args as Record<string, unknown>, { hosted: Boolean(opts.remote) }) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
 
     try {
       const scanOptions: PageScanOptions = {
@@ -1236,12 +1269,16 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       const issuesTotal = filteredIssues.length
       const issueEntries = sortedIssues.length
       const issuesTruncated = issueEntries > RESULT_CAP
+      const pageOffset = controls.offset
+      const nextOffset = pageOffset + RESULT_CAP < issueEntries ? pageOffset + RESULT_CAP : null
       // Stratify the cap: one representative per issue TYPE first, then fill by
       // severity. Without this, a majority type (e.g. 25 contrast_insufficient
       // moderates) can fill the entire moderate band and hide a whole type —
       // observed on squarespace.com (155 issues incl. 26 keyboard_trap; the
       // default response returned 0 of them, persona P007 round 3).
-      const [capIssues, typesRescued] = stratifiedCap(sortedIssues, RESULT_CAP)
+      // Page one keeps the stratified cut. Later pages continue the same ordering
+      // from `offset`, so the tail the cap dropped stays reachable.
+      const [capIssues, typesRescued] = pageStratified(sortedIssues, pageOffset, RESULT_CAP)
       const typeStratified = typesRescued
 
       const collapsedGroups = collapsedIssues.collapsedGroups
@@ -1257,6 +1294,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         cssFramework: framework?.cssToolkit ?? 'unknown',
         ...(framework?.builder ? { builder: framework.builder } : {}),
         truncated: issuesTruncated,
+        offset: pageOffset,
+        nextOffset,
         issues: capIssues,
         issuesReturned: capIssues.length,
         issueEntries,
@@ -1271,9 +1310,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           : {}),
       }
 
-      const note = issuesTruncated
+      const note = (issuesTruncated
         ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: payload.issuesReturned, total: issueEntries, stratified: typeStratified })
-        : ''
+        : '') + (nextOffset !== null ? ` More entries remain: pass offset: ${nextOffset} to read the next page.` : '')
       const summary =
         scanHeadline({ url, shown: shownSummary, ...(filtered ? { page: mergedSummary, filters: controlsList(controls) } : {}), issueEntries, collapsedGroups }) +
         note
@@ -1491,7 +1530,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       return toolError('diff_scan by history id is not available on the hosted MCP server — it keeps no scan history. Run the local MCP (`npx -y @webability/mcp`) to diff against a stored scan, or pass baselineUrl + url to diff two live pages here.')
     }
     let diffControls: OutputControls
-    try { diffControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
+    try { diffControls = parseOutputControls(args as Record<string, unknown>, { hosted: Boolean(opts.remote) }) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
 
     type Projected = ReturnType<typeof enrichIssue> & { id: string; impact?: string }
     const live = async (target: string, signal?: AbortSignal): Promise<{ issues: Projected[]; blocked?: unknown }> => {
@@ -1682,8 +1721,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       if (!res.ok) {
         return toolError(`start_audit failed (${res.status}): ${await res.text()}`)
       }
-      const data = (await res.json()) as { id: number; status: string; includeAgent?: boolean }
+      const data = (await res.json()) as { id: number; status: string; includeAgent?: boolean; expiresAt?: string }
       return {
+        structuredContent: auditHints(data),
         content: [
           {
             type: 'text',
@@ -1716,7 +1756,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         return toolError(`get_audit could not authenticate (${res.status}). Re-run \`webability login\` (or refresh WEBABILITY_API_KEY) and retry.`)
       }
       if (res.status === 404) {
-        return toolError(`No audit #${id} for this account. Check the id, and that you are the account that started it.`)
+        return toolError(`No audit #${id} for this account. Check the id, and that you are the account that started it. It may also have expired: start a new audit with start_audit.`, { code: 'audit_not_found', retriable: false, next: { tool: 'start_audit', action: 'start a new audit; an unknown or expired id cannot be read' } })
       }
       if (!res.ok) {
         return toolError(`get_audit failed (${res.status}): ${await res.text()}`)
@@ -1740,7 +1780,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       } else {
         text = `Audit #${data.id} for ${data.url} — ${data.status}${data.currentStep ? ` (at ${data.currentStep})` : ''}. Steps: ${steps}. Poll again in ~15s.`
       }
-      return { content: [{ type: 'text', text }, { type: 'text', text: '```json\n' + JSON.stringify(data, null, 2) + '\n```' }] }
+      return { structuredContent: auditHints(data), content: [{ type: 'text', text }, { type: 'text', text: '```json\n' + JSON.stringify(data, null, 2) + '\n```' }] }
     } catch (err) {
       return toolError(`get_audit error: ${(err as Error).message}`)
     }
@@ -1749,7 +1789,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   if (name === 'flow_scan') {
     const startUrl = args?.startUrl as string
     let flowControls: OutputControls
-    try { flowControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
+    try { flowControls = parseOutputControls(args as Record<string, unknown>, { hosted: Boolean(opts.remote) }) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
     if (!startUrl) return toolError('Error: startUrl is required')
     const maxPages = flowScanMaxPages(args?.maxPages, !!opts.remote)
     const autoNav = (args?.autoNavigate as string[]) || []
@@ -1920,8 +1960,10 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       const RESULT_CAP = 50
       // Stratified cap — same rationale as scan_page: a majority type must not
       // fill the list and hide other types across a multi-page journey.
-      const [capIssues, typesRescued] = stratifiedCap(collapsedIssues.list, RESULT_CAP)
+      const flowOffset = flowControls.offset
+      const [capIssues, typesRescued] = pageStratified(collapsedIssues.list, flowOffset, RESULT_CAP)
       const issuesTruncated = collapsedIssues.list.length > RESULT_CAP
+      const flowNextOffset = flowOffset + RESULT_CAP < collapsedIssues.list.length ? flowOffset + RESULT_CAP : null
 
       const payload = {
         startUrl,
@@ -1944,6 +1986,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           ? { pageSummary: { uniqueIssues: allUnique.length, pagesDropped: droppedPages.length }, filters: controlsList(flowControls) }
           : {}),
         truncated: issuesTruncated,
+        offset: flowOffset,
+        nextOffset: flowNextOffset,
         issues: capIssues,
         issueEntries: collapsedIssues.list.length,
         issuesTotal: unique.length,
@@ -1957,7 +2001,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           : '') +
         (issuesTruncated
           ? truncationNote({ remote: Boolean(opts.remote), cap: RESULT_CAP, returned: capIssues.length, total: collapsedIssues.list.length, stratified: typesRescued }).trim() + '\n'
-          : '')
+          : '') +
+        (flowNextOffset !== null ? `More entries remain: pass offset: ${flowNextOffset} to read the next page.\n` : '')
 
       // Human-readable summary. Surface dropped pages EXPLICITLY — never
       // return fewer pages than requested without saying why.
@@ -2295,7 +2340,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     const engine = (args?.engine as string | undefined) || 'in-process'
     if (engine !== 'in-process' && engine !== 'browser') return toolError('Error: engine must be "in-process" or "browser"')
     let htmlControls: OutputControls
-    try { htmlControls = parseOutputControls(args as Record<string, unknown>) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
+    try { htmlControls = parseOutputControls(args as Record<string, unknown>, { hosted: Boolean(opts.remote) }) } catch (e) { return toolError(`Error: ${(e as Error).message}`) }
     // An explicit axe wcag2aaa tag is an AAA request (the level gate would drop it otherwise).
     if (tags.includes('wcag2aaa') && !htmlControls.level) htmlControls = { ...htmlControls, level: 'AAA' }
 

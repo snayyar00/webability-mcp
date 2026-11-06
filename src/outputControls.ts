@@ -30,8 +30,10 @@ export interface OutputControls {
   rules?: Set<string>
   wcag?: Set<string>
   format: 'json' | 'compact'
-  /** True when the caller passed `format`; false when 'json' is the default. */
+  /** True when the caller passed `format`; false when the default applied. */
   formatExplicit?: boolean
+  /** Index into the severity-sorted entry list where the page starts. 0 = first page. */
+  offset: number
 }
 
 /** JSON-schema fragment every scan tool spreads into its `properties`. */
@@ -40,20 +42,29 @@ export const OUTPUT_CONTROL_PROPERTIES = {
   minImpact: { type: 'string', enum: IMPACTS, description: 'Only findings at this severity or above (critical > serious > moderate > minor)' },
   rules: { type: 'array', items: { type: 'string' }, description: 'Only these rule ids (WebAbility type such as "missing_alt" or axe rule id such as "image-alt"). See get_rules.' },
   wcag: { type: 'array', items: { type: 'string' }, description: 'Only these WCAG criteria. A prefix selects the whole guideline ("1.4") or principle ("2").' },
-  format: { type: 'string', enum: ['json', 'compact'], description: '"compact" prints one line per element with rule metadata once. "json" returns every field (html, fix values, source). Default: JSON when it fits inline (under ~24k chars), otherwise compact plus a JSON summary of every count.' },
+  format: { type: 'string', enum: ['json', 'compact'], description: '"compact" prints one line per element with rule metadata once. "json" returns every field (html, fix values, source). Default: JSON when it fits inline (under ~24k chars), otherwise compact plus a JSON summary of every count. On the hosted server the default is compact.' },
 } as const
 
-export function parseOutputControls(args: Record<string, unknown> | undefined): OutputControls {
+/** Page cursor for tools that cap their issue list (scan_page, flow_scan). */
+export const OFFSET_PROPERTY = {
+  offset: { type: 'integer', minimum: 0, description: 'Start the issue list at this index of the severity-sorted entries. The response carries `nextOffset` when more remain; pass it to read the next page. Default 0. Each call scans the page again, so on a live page the list can shift between calls; treat the offset as a position, not a snapshot.' },
+} as const
+
+/** `hosted`: no `format` given → compact, a fraction of the tokens. Explicit `format` always wins. */
+export function parseOutputControls(args: Record<string, unknown> | undefined, opts: { hosted?: boolean } = {}): OutputControls {
   const a = args ?? {}
   const minImpact = a.minImpact as string | undefined
   if (minImpact !== undefined && !(minImpact in RANK)) throw new Error(`minImpact must be one of ${IMPACTS.join(' | ')}`)
   const formatExplicit = a.format !== undefined && a.format !== null
-  const format = (a.format as string | undefined) ?? 'json'
+  const format = (a.format as string | undefined) ?? (opts.hosted ? 'compact' : 'json')
   if (format !== 'json' && format !== 'compact') throw new Error('format must be "json" or "compact"')
   const level = a.level as string | undefined
   if (level !== undefined && level !== null && !LEVELS.includes(level as Level)) throw new Error(`level must be one of ${LEVELS.join(' | ')}`)
   const list = (v: unknown) => (Array.isArray(v) && v.length ? new Set(v.map((x) => String(x).trim()).filter(Boolean)) : undefined)
-  return { ...(level ? { level: level as Level } : {}), ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format, formatExplicit }
+  const rawOffset = a.offset
+  if (rawOffset !== undefined && rawOffset !== null && !(typeof rawOffset === 'number' && Number.isInteger(rawOffset) && rawOffset >= 0)) throw new Error('offset must be a non-negative integer')
+  const offset = typeof rawOffset === 'number' ? rawOffset : 0
+  return { offset, ...(level ? { level: level as Level } : {}), ...(minImpact ? { minImpact: minImpact as Impact } : {}), rules: list(a.rules), wcag: list(a.wcag), format, formatExplicit }
 }
 
 /** AAA criteria the caller named exactly in wcag[] (a prefix like "2.4" never opts in). */
@@ -232,9 +243,16 @@ export function renderFindingsBlock(
   fullLists?: { issues: readonly IssueRow[] },
 ): { type: 'text'; text: string } {
   const sections = () => compactLists.map((l) => `${compactHeading(l)}\n${compactText(l.items)}`).join('\n\n')
-  if (controls.format === 'compact') return { type: 'text', text: sections() }
   const json = '```json\n' + JSON.stringify(payload, null, 2) + '\n```'
-  if (controls.formatExplicit || json.length <= INLINE_BUDGET) return { type: 'text', text: json }
+  if (controls.format === 'compact') {
+    if (controls.formatExplicit) return { type: 'text', text: sections() }
+    // An implicit compact default (hosted) keeps the inline budget: a listing
+    // that fits goes out as is, a longer one takes the budgeted path below.
+    const listing = sections()
+    if (listing.length <= INLINE_BUDGET) return { type: 'text', text: listing }
+  } else if (controls.formatExplicit || json.length <= INLINE_BUDGET) {
+    return { type: 'text', text: json }
+  }
 
   const summary: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(payload)) if (!LIST_KEYS.has(k)) summary[k] = v
@@ -242,7 +260,7 @@ export function renderFindingsBlock(
     summary.byRule = countByRule(fullLists.issues)
   }
   const head =
-    `Output: compact — the full JSON is ${json.length.toLocaleString('en-US')} chars, over the inline budget of ${INLINE_BUDGET.toLocaleString('en-US')}. ` +
+    `Output: compact — ${controls.format === 'compact' ? 'the listing is' : 'the full JSON is'} ${(controls.format === 'compact' ? sections().length : json.length).toLocaleString('en-US')} chars, over the inline budget of ${INLINE_BUDGET.toLocaleString('en-US')}. ` +
     'Pass format: "json" for every field (html, fix values, source pointers), or narrow with rules / wcag / minImpact / rootSelector. Counts below cover every finding.'
   const summaryBlock = '```json\n' + JSON.stringify(summary, null, 2) + '\n```'
   let body = sections()

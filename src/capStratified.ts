@@ -64,3 +64,17 @@ export function stratifiedCap<T extends { impact?: string; type?: string }>(
   }
   return [kept, rescued]
 }
+
+/**
+ * One page of the capped list. The pages walk a single ordering: the
+ * stratified first page, then every remaining entry in severity order. So page
+ * two never repeats an entry the stratified cut pulled forward onto page one,
+ * and `offset` is a stable index across calls.
+ */
+export function pageStratified<T extends { impact?: string; type?: string }>(sorted: readonly T[], offset: number, cap: number): [T[], boolean] {
+  const [first, rescued] = stratifiedCap(sorted, cap)
+  if (offset <= 0) return [first, rescued]
+  const shown = new Set<T>(first)
+  const ordered = [...first, ...sorted.filter((i) => !shown.has(i))]
+  return [ordered.slice(offset, offset + cap), false]
+}
