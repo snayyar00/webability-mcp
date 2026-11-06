@@ -218,3 +218,55 @@ test('hosted diff_scan: when one side fails, the other scan stops too', async ()
     await c.close()
   }
 }, 45_000)
+
+// Seen on prod: two diff_scan calls together ran 4 Chromiums and both timed out.
+// The hosted server builds one server per request, so the limit must span them.
+test('hosted diff_scan: a second call during a run is refused as busy, and the next call works', async () => {
+  const { openSession } = await import('../src/browser.ts')
+  const realLookup = dnsPromises.lookup
+  ;(dnsPromises as any).lookup = async () => [{ address: '93.184.215.14', family: 4 }]
+  let release = () => {}
+  let held = new Promise<void>((r) => { release = r })
+  let firstLoad = () => {}
+  const loading = new Promise<void>((r) => { firstLoad = r })
+  const connect = async () => {
+    const [a, b] = InMemoryTransport.createLinkedPair()
+    const server = createServer({
+      remote: true,
+      authToken: 'test-token',
+      scanPageDeadlineMs: 20_000,
+      openSession: async (o) => {
+        const session = await openSession({ ...o, remote: false, setupContext: undefined })
+        await session.context.route('http://busy-diff.test/**', async (route: any) => {
+          firstLoad()
+          await held
+          await route.fulfill({ status: 200, contentType: 'text/html', body: page(false, 0) }).catch(() => {})
+        })
+        return session
+      },
+    })
+    const c = new Client({ name: 'test', version: '1' }, { capabilities: {} })
+    await Promise.all([server.connect(b), c.connect(a)])
+    return c
+  }
+  const args = { baselineUrl: 'http://busy-diff.test/', url: 'http://busy-diff.test/?c', format: 'json', context: 'Checking overlapping hosted calls.' }
+  const [first, second, third] = [await connect(), await connect(), await connect()]
+  try {
+    const running: Promise<any> = first.callTool({ name: 'diff_scan', arguments: args })
+    await loading
+    const started = Date.now()
+    const busy: any = await second.callTool({ name: 'diff_scan', arguments: args })
+    assert.ok(Date.now() - started < 2_000, 'a busy reply must come at once')
+    assert.equal(busy.isError, true)
+    assert.match(busy.content[0].text, /busy/)
+    assert.equal(busy.structuredContent.error.retriable, true)
+    release()
+    assert.notEqual((await running).isError, true)
+    const after: any = await third.callTool({ name: 'diff_scan', arguments: args })
+    assert.notEqual(after.isError, true, after.content?.[0]?.text)
+  } finally {
+    release()
+    ;(dnsPromises as any).lookup = realLookup
+    await Promise.all([first.close(), second.close(), third.close()])
+  }
+}, 45_000)

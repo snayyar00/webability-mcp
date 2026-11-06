@@ -90,6 +90,10 @@ function toolError(text: string, hint?: Partial<ErrorHint>): { content: Array<{ 
 
 const AUDIT_POLL_SECONDS = 15
 
+// A diff_scan runs 2 Chromiums at once. Two calls together ran 4 on the hosted
+// box and both timed out. Module scope: the hosted server builds one server per request.
+let hostedDiffRunning = false
+
 /**
  * Typed poll hints for start_audit / get_audit. While the audit runs the caller
  * waits `pollAfterSeconds` and repeats `next`; once it is complete or failed
@@ -1564,6 +1568,14 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       return { issues: mergeSameElement(payload.issues.map(project)) }
     }
 
+    if (opts.remote && hostedDiffRunning) {
+      return toolError('diff_scan is busy: this server runs one diff_scan at a time, and another is running now. Repeat this call in 30 seconds.', {
+        code: 'rate_limited',
+        retriable: true,
+        next: { tool: 'diff_scan', args: args as Record<string, unknown>, action: 'wait 30 seconds, then repeat this call' },
+      })
+    }
+    if (opts.remote) hostedDiffRunning = true
     try {
       const scanBoth = async (signal?: AbortSignal) => {
         // At once: one after the other, two ordinary pages pass the hosted budget.
@@ -1693,6 +1705,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before the 30s limit on hosted tool calls. Try again, or use start_audit for slow or large sites.`)
       }
       return toolError(`diff_scan failed: ${(err as Error).message}`)
+    } finally {
+      if (opts.remote) hostedDiffRunning = false
     }
   }
 
