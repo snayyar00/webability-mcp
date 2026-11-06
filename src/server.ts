@@ -172,6 +172,11 @@ export function flowScanMaxPages(raw: unknown, remote: boolean): number {
 
 /** Hosted scan_page (and diff_scan, for both scans together) stops here so the answer reaches Zapier (30s action limit) as a message, not a 504. */
 export const SCAN_PAGE_HOSTED_DEADLINE_MS = 25_000
+/**
+ * A diff_scan does two scans of work, so it gets the most the 30s HTTP limit
+ * allows. Ordinary pages took 20.7s to 23.1s on the shared hosted box.
+ */
+export const DIFF_SCAN_HOSTED_DEADLINE_MS = 28_000
 
 /** A DNS lookup that hangs would hold a hosted request past the caller's 30s limit. */
 const DNS_LOOKUP_DEADLINE_MS = 5_000
@@ -1598,7 +1603,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       // HTTP caller gets this answer before its 30s limit, not a 504.
       const firstPairStarted = Date.now()
       const { baseline, current } = opts.remote
-        ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS), 'diff_scan')
+        ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? DIFF_SCAN_HOSTED_DEADLINE_MS), 'diff_scan')
         : await scanBoth()
       const firstPairMs = Date.now() - firstPairStarted
 
@@ -1654,9 +1659,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         try {
           // The second pair takes about as long as the first. If it cannot fit,
           // say so now and do not spend the rest of the budget.
-          if (opts.remote && scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) < firstPairMs) throw new Error('no time for a second pair')
+          if (opts.remote && scanBudgetLeft(opts.scanPageDeadlineMs ?? DIFF_SCAN_HOSTED_DEADLINE_MS) < firstPairMs) throw new Error('no time for a second pair')
           const again = opts.remote
-            ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS), 'diff_scan')
+            ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? DIFF_SCAN_HOSTED_DEADLINE_MS), 'diff_scan')
             : await scanBoth()
           // Compare counts, not keys: two equivalent elements share one key, so
           // a change from one to two shows only in the second pair's multiset diff.
@@ -1702,7 +1707,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       }
     } catch (err) {
       if (err instanceof DeadlineError) {
-        return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before the 30s limit on hosted tool calls. Try again, or use start_audit for slow or large sites.`)
+        return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? DIFF_SCAN_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before the 30s limit on hosted tool calls. Try again, or use start_audit for slow or large sites.`)
       }
       return toolError(`diff_scan failed: ${(err as Error).message}`)
     } finally {

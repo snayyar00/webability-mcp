@@ -94,7 +94,7 @@ test('a count change on one pair only is unstable', async () => {
 // from a local slow server through openSession.
 // Runs one hosted diff_scan. Load 2 differs from load 1, so a second pair is
 // wanted. From `hangFrom` on, the page never answers.
-const hostedDiff = async (budgetMs: number, delayMs: number, hangFrom: number) => {
+const hostedDiff = async (budgetMs: number | undefined, delayMs: number, hangFrom: number) => {
   const { openSession } = await import('../src/browser.ts')
   const seenSlow = { baseline: 0, current: 0 }
   let thirdLoadAt = 0
@@ -269,4 +269,13 @@ test('hosted diff_scan: a second call during a run is refused as busy, and the n
     ;(dnsPromises as any).lookup = realLookup
     await Promise.all([first.close(), second.close(), third.close()])
   }
+}, 45_000)
+
+// Seen on prod: kedianomics pairs took 20.7s to 23.1s, and a 25s budget left little room.
+test('hosted diff_scan: the default budget runs to 28s and stops before the 30s limit', async () => {
+  // The second pair hangs, so the call ends exactly when the budget does.
+  const { text, elapsed } = await hostedDiff(undefined, 0, 3)
+  assert.ok(elapsed > 26_000, `stopped after ${elapsed}ms`)
+  assert.ok(elapsed < 29_500, `stopped after ${elapsed}ms`)
+  assert.match(text, /^UNCONFIRMED: 1 possible new/)
 }, 45_000)
