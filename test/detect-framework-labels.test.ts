@@ -123,3 +123,9 @@ test('Next.js App Router (demo.vercel.store) is nextjs without #__next / __NEXT_
 test('Next.js data-nextjs-* attribute alone is nextjs', async () => {
   assert.equal((await detect('<div data-nextjs-scroll-focus-boundary="">x</div>')).label, 'nextjs')
 })
+
+test('WordPress markup with no wp-content asset path is still WordPress', async () => {
+  const stack = await detect('<div class="vc_row wpb_row"><div class="wpb_wrapper"><p>x</p></div></div>')
+  assert.equal(stack.framework, 'wordpress')
+  assert.equal(stack.builder, 'wpbakery')
+})

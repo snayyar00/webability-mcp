@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { chromium } from 'playwright'
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
@@ -73,11 +75,16 @@ test('minImpact filters before the cap and is echoed in the summary line', async
 
 test('scan_html defaults to the in-process engine and returns structured fixes', async () => {
   const client = await connect()
-  const res: any = await client.callTool({ name: 'scan_html', arguments: { html: '<img src="x.png"><button></button>' } })
+  // The claim is "no browser launch", not speed: count Chromium launches during the call.
+  const realLaunch = chromium.launch
+  let launches = 0
+  ;(chromium as any).launch = (...a: unknown[]) => { launches++; return (realLaunch as any).apply(chromium, a) }
+  let res: any
+  try { res = await client.callTool({ name: 'scan_html', arguments: { html: '<img src="x.png"><button></button>' } }) } finally { (chromium as any).launch = realLaunch }
   const payload = jsonBlock(res)
   assert.equal(payload.engine, 'in-process')
   assert.equal(payload.fragment, true)
-  assert.ok(payload.durationMs < 5000, `in-process scan took ${payload.durationMs}ms`)
+  assert.equal(launches, 0, 'in-process scan_html must not launch a browser')
   const alt = payload.issues.find((i: any) => i.type === 'missing_alt' || i.type === 'image-alt')
   assert.ok(alt, `expected a missing-alt finding, got ${payload.issues.map((i: any) => i.type)}`)
   assert.ok(alt.fix?.op, 'in-process issues carry fix.op')

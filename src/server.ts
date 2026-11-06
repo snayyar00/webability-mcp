@@ -3,6 +3,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ErrorCode, ListResourcesRequestSchema, ListToolsRequestSchema, McpError, ReadResourceRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js'
 import { CARD_RESOURCE_URI, CARD_TOOLS, cardExtension, cardResource, cardResourceContents, cardToolMeta, scanCard, verifyCard } from './appCards.js'
+import { resolveAuthToken } from './authToken.js'
 import { AI_FIX_FRAMEWORKS, aiFixFramework, detectPageStack, type PageStack } from './siteFramework.js'
 import { resolveVerifyFixArgs, verifyFixTargetUrl, VERIFY_FIX_URL_KEYS } from './verifyFixArgs.js'
 import { resolveGetRulesArgs, ruleIdMatches } from './getRulesArgs.js'
@@ -11,14 +12,11 @@ import { sessionPage } from './enginePage.js'
 import { scan, verifyFixRefusal, REASON_TEXT, getContrastRatio, extractSiteTheme, VIEWPORT_SIZES, JUDGE_DEFAULT_TIMEOUT_MS, type JudgeOptions } from '@webability/core'
 import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
-import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelHeadersFor } from './tunnelAuth'
+import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelBlockHint, tunnelHeadersFor } from './tunnelAuth'
 import { DeadlineError, withDeadline } from './deadline'
 import { stratifiedCap } from './capStratified'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { readFileSync } from 'fs'
-import { homedir } from 'os'
-import { join } from 'path'
 import dnsPromises from 'dns/promises'
 import { isIP } from 'net'
 import type { BrowserContext } from 'playwright'
@@ -95,40 +93,6 @@ function toolError(text: string): { content: Array<{ type: 'text'; text: string 
  */
 const fullScanResultByResponse = new WeakMap<object, unknown>()
 
-/**
- * Resolve a WebAbility auth token for Full tools that need a JWT (`visual_audit`, `start_audit`).
- * Free for the customer with a WebAbility account — the token identifies the account.
- *
- * Lookup order: explicit env var (the natural channel for an MCP server config) → the
- * token the `webability` CLI persisted after login. The CLI stores it with the `conf`
- * package (projectName "webability"); we read that JSON directly rather than depend on
- * the CLI package. Returns '' when nothing is found so callers can emit an actionable
- * "authenticate first" message instead of leaking a bare 401.
- */
-function resolveAuthToken(): string {
-  const fromEnv = process.env.WEBABILITY_API_KEY || process.env.ABILYO_API_KEY || ''
-  if (fromEnv) return fromEnv
-  const home = homedir()
-  const candidates: string[] = []
-  if (process.platform === 'darwin') {
-    candidates.push(join(home, 'Library', 'Preferences', 'webability-nodejs', 'config.json'))
-  } else if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || join(home, 'AppData', 'Roaming')
-    candidates.push(join(appData, 'webability-nodejs', 'Config', 'config.json'))
-  }
-  const xdg = process.env.XDG_CONFIG_HOME || join(home, '.config')
-  candidates.push(join(xdg, 'webability-nodejs', 'config.json'))
-  for (const p of candidates) {
-    try {
-      const parsed = JSON.parse(readFileSync(p, 'utf8'))
-      if (parsed && typeof parsed.apiKey === 'string' && parsed.apiKey) return parsed.apiKey
-    } catch {
-      // file absent or unreadable — try the next candidate
-    }
-  }
-  return ''
-}
-
 export interface ServerOptions {
   /** Remote/hosted mode (HTTP transport reachable from the internet): enables the SSRF
    *  URL allowlist and disables local-filesystem tools (find_source). Off for local stdio. */
@@ -145,6 +109,8 @@ export interface ServerOptions {
   anonymous?: boolean
   /** Hosted scan_page / diff_scan time budget. Tests set it low; production uses SCAN_PAGE_HOSTED_DEADLINE_MS. */
   scanPageDeadlineMs?: number
+  /** Tests only: opens the browser for diff_scan's live scans. Lets a hosted-mode test reach a local page. */
+  openSession?: typeof openSession
 }
 
 /** The judge stops this long before the hosted deadline, leaving time to build the reply. */
@@ -574,7 +540,7 @@ const ALL_TOOLS = [
     },
     {
       name: 'diff_scan',
-      description: 'Compare two scans of the same page and report what changed: `fixed[]` (in the baseline, gone now), `new[]` (regressions — not in the baseline, present now), `remaining[]` (still there). Page-level complement to verify_fix (one element). Baseline is a scan_history id (`baselineId`, local installs) or a live scan of `baselineUrl`; current is `url` (scanned live now) or another history id (`currentId`). Findings are matched by issue id (rule + element), so a changed class/id on a fixed element reads as fixed AND new — check `new[]` before calling it a regression. Typical loop: scan_page → edit → diff_scan(baselineId=<that scan id>, url=<same url>) → confirm new[] is empty.',
+      description: 'Compare two scans of the same page and report what changed: `fixed[]` (in the baseline, gone now), `new[]` (regressions — not in the baseline, present now), `remaining[]` (still there). Page-level complement to verify_fix (one element). Baseline is a scan_history id (`baselineId`, local installs) or a live scan of `baselineUrl`; current is `url` (scanned live now) or another history id (`currentId`). Live scans run a second time when they differ, and a difference that does not hold goes to `unstable[]`, so a changed page can take twice as long. Findings are matched by issue id (rule + element), so a changed class/id on a fixed element reads as fixed AND new — check `new[]` before calling it a regression. Typical loop: scan_page → edit → diff_scan(baselineId=<that scan id>, url=<same url>) → confirm new[] is empty.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1178,7 +1144,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           : await scanPageOnEngine(url, tunnel, args?.viewport, scanOptions, false)
       } catch (err) {
         if (err instanceof DeadlineError) {
-          return toolError(`${url} took longer than ${deadlineMs / 1000}s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites.`)
+          return toolError(`${url} took longer than ${deadlineMs / 1000}s to scan, so it stopped before the 30s limit on hosted tool calls. Try again, or use start_audit for slow or large sites.`)
         }
         throw err
       }
@@ -1210,7 +1176,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
                 `BLOCKED: ${url} was not actually scanned. ${b.reason}` +
                 ` This is NOT a clean result — do not report the page as accessible or issue-free.` +
                 (b.vendor ? ` Detected vendor: ${b.vendor}.` : '') +
-                (typeof b.status === 'number' ? ` HTTP ${b.status}.` : ''),
+                (typeof b.status === 'number' ? ` HTTP ${b.status}.` : '') +
+                tunnelBlockHint(url, b.status),
             },
             { type: 'text', text: '```json\n' + JSON.stringify(blockedPayload, null, 2) + '\n```' },
           ],
@@ -1537,7 +1504,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         judge: judgeFor(opts),
       }
       const t = tunnelTargetFor(target, (args as any)?.tunnel_secret)
-      const { result, pointers } = await scanPageOnEngine(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal)
+      const { result, pointers } = await scanPageOnEngine(target, t, args?.viewport, scanOptions, Boolean(opts.remote), signal, opts.openSession)
       if (result.blocked) return { issues: [], blocked: result.blocked }
       const project = (i: any): Projected => enrichIssue({ id: i.id, impact: i.impact, wcag: i.wcag, type: i.type, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix, ...(pointers[i.selector] ? { source: pointers[i.selector] } : {}) })
       return { issues: mergeSameElement(result.issues.map(project)) }
@@ -1568,9 +1535,11 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       }
       // Hosted only, as scan_page: one budget covers both live scans so the
       // HTTP caller gets this answer before its 30s limit, not a 504.
+      const firstPairStarted = Date.now()
       const { baseline, current } = opts.remote
         ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS), 'diff_scan')
         : await scanBoth()
+      const firstPairMs = Date.now() - firstPairStarted
 
       // Match key. WebAbility/axe ids are `<engine>-<rule>-<selector hash>` and
       // stable across scans. Legacy ids from archived scans (the removed
@@ -1598,23 +1567,53 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         GENERATED_ID.lastIndex = 0
         return unstable ? `${i.id.split('-')[0]}|${i.type}|${i.wcag}|${stableSelector(sel)}` : i.id
       }
+      const counts = (list: Projected[]) => {
+        const m = new Map<string, number>()
+        for (const i of list) { const k = keyOf(i); m.set(k, (m.get(k) ?? 0) + 1) }
+        return m
+      }
+      const take = (m: Map<string, number>, k: string) => { const n = m.get(k) ?? 0; if (n > 0) m.set(k, n - 1); return n > 0 }
       const diff = (a: Projected[], b: Projected[]) => {
         // Multiset match: each baseline finding absorbs at most ONE current
         // finding with the same key, so a second equivalent element (two Radix
         // popovers where there was one) is reported as new, not swallowed.
-        const counts = (list: Projected[]) => {
-          const m = new Map<string, number>()
-          for (const i of list) { const k = keyOf(i); m.set(k, (m.get(k) ?? 0) + 1) }
-          return m
-        }
-        const take = (m: Map<string, number>, k: string) => { const n = m.get(k) ?? 0; if (n > 0) m.set(k, n - 1); return n > 0 }
         const A = counts(a), B = counts(b)
         const kept: Projected[] = [], added: Projected[] = [], gone: Projected[] = []
         for (const i of b) (take(A, keyOf(i)) ? kept : added).push(i)
         for (const i of a) if (!take(B, keyOf(i))) gone.push(i)
         return { gone: bySeverityDesc(gone), added: bySeverityDesc(added), kept: bySeverityDesc(kept) }
       }
-      const issues = diff(filterIssues(baseline.issues as any[], diffControls), filterIssues(current.issues as any[], diffControls))
+      let issues = diff(filterIssues(baseline.issues as any[], diffControls), filterIssues(current.issues as any[], diffControls))
+      // A page can differ between two loads with no code change: a carousel
+      // that starts late, or a list that crosses a cap. A difference counts only
+      // if it holds on a second pair of scans. The rest goes to unstable[].
+      let unstable: Projected[] = []
+      let unconfirmed = false
+      if (!(baselineId && currentId) && (issues.added.length || issues.gone.length)) {
+        try {
+          // The second pair takes about as long as the first. If it cannot fit,
+          // say so now and do not spend the rest of the budget.
+          if (opts.remote && scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) < firstPairMs) throw new Error('no time for a second pair')
+          const again = opts.remote
+            ? await withDeadline(scanBoth, scanBudgetLeft(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS), 'diff_scan')
+            : await scanBoth()
+          // Compare counts, not keys: two equivalent elements share one key, so
+          // a change from one to two shows only in the second pair's multiset diff.
+          const second = diff(filterIssues(again.baseline.issues as any[], diffControls), filterIssues(again.current.issues as any[], diffControls))
+          const confirm = (first: Projected[], againList: Projected[]) => {
+            const left = counts(againList)
+            const held: Projected[] = [], noise: Projected[] = []
+            for (const i of first) (take(left, keyOf(i)) ? held : noise).push(i)
+            return { held, noise }
+          }
+          const added = confirm(issues.added, second.added), gone = confirm(issues.gone, second.gone)
+          unstable = bySeverityDesc([...added.noise, ...gone.noise])
+          issues = { ...issues, added: added.held, gone: gone.held }
+        } catch {
+          // Out of time, or the page blocked the second look: say so, do not guess.
+          unconfirmed = true
+        }
+      }
       const CAP = 50
       const payload = {
         baseline: baselineId ?? baselineUrl,
@@ -1623,21 +1622,26 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         fixed: issues.gone.slice(0, CAP),
         new: issues.added.slice(0, CAP),
         remaining: issues.kept.slice(0, CAP),
-        truncated: [issues.gone, issues.added, issues.kept].some((l) => l.length > CAP),
+        unstable: unstable.slice(0, CAP),
+        unconfirmed,
+        truncated: [issues.gone, issues.added, issues.kept, unstable].some((l) => l.length > CAP),
       }
-      const verdict = issues.added.length === 0
+      const verdict = unconfirmed
+        ? `UNCONFIRMED: ${issues.added.length} possible new and ${issues.gone.length} possible fixed, ${issues.kept.length} remaining (${baseline.issues.length} → ${current.issues.length}). No second scan finished, so these differences may be page noise. Run diff_scan again before acting on them.`
+        : issues.added.length === 0
         ? `No regressions: ${issues.gone.length} fixed, 0 new, ${issues.kept.length} remaining (${baseline.issues.length} → ${current.issues.length}).`
         : `REGRESSIONS: ${issues.added.length} new issue(s) not in the baseline — see new[]. Also ${issues.gone.length} fixed, ${issues.kept.length} remaining (${baseline.issues.length} → ${current.issues.length}).`
+      const loadNote = unstable.length ? ` ${unstable.length} finding(s) appeared on only one load and are not counted, see unstable[].` : ''
       const idNote = issues.added.length && issues.gone.length ? ' If you changed a fixed element\'s class/id, it appears in BOTH fixed[] and new[] — compare selectors before calling it a regression.' : ''
       return {
         content: [
-          { type: 'text', text: verdict + idNote + (isFiltered(diffControls) ? describeControls(diffControls) : '') + (payload.truncated ? ` Lists capped at ${CAP} (severity-sorted).` : '') },
-          renderFindings(diffControls, payload, [{ title: 'New (regressions)', items: payload.new }, { title: 'Fixed', items: payload.fixed }, { title: 'Remaining', items: payload.remaining }]),
+          { type: 'text', text: verdict + loadNote + idNote + (isFiltered(diffControls) ? describeControls(diffControls) : '') + (payload.truncated ? ` Lists capped at ${CAP} (severity-sorted).` : '') },
+          renderFindings(diffControls, payload, [{ title: 'New (regressions)', items: payload.new }, { title: 'Unstable (one load only)', items: payload.unstable }, { title: 'Fixed', items: payload.fixed }, { title: 'Remaining', items: payload.remaining }]),
         ],
       }
     } catch (err) {
       if (err instanceof DeadlineError) {
-        return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before Zapier's 30s limit. Try again, or use start_audit for slow or large sites.`)
+        return toolError(`diff_scan of ${baselineUrl} and ${url} took longer than ${(opts.scanPageDeadlineMs ?? SCAN_PAGE_HOSTED_DEADLINE_MS) / 1000}s to scan, so it stopped before the 30s limit on hosted tool calls. Try again, or use start_audit for slow or large sites.`)
       }
       return toolError(`diff_scan failed: ${(err as Error).message}`)
     }

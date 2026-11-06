@@ -29,6 +29,8 @@ type Signals = {
   assets: string[]
   hasVueAttr: boolean
   hasElementorClass: boolean
+  hasWpBakeryClass: boolean
+  hasWordPressClass: boolean
   ngVersion: boolean
   vpClass: boolean
   globals: string[]
@@ -83,6 +85,8 @@ function collectSignals(): Signals {
     globals,
     hasVueAttr: vueAttr || !!d.querySelector('[data-v-app]'),
     hasElementorClass: !!d.querySelector('[class*="elementor-"], .elementor'),
+    hasWpBakeryClass: !!d.querySelector('.wpb_wrapper, .vc_row'),
+    hasWordPressClass: !!d.querySelector('[class*="wp-block-"], [class*="wp-image-"]'),
     ngVersion: !!d.querySelector('[ng-version]'),
     vpClass: !!d.querySelector('.VPDoc, .VPContent, .VPNav'),
     // Next.js App Router pages have no #__next / __NEXT_DATA__. They carry the
@@ -130,11 +134,13 @@ export function classifySignals(s: Signals): SiteFramework {
     return { label: 'astro', evidence: ev(s.astroIsland && 'astro-island / data-astro-* markup', gen.startsWith('astro') && genEv) }
   }
   const elementor = gen.startsWith('elementor') || has('/plugins/elementor') || s.hasElementorClass
-  if (gen.startsWith('wordpress') || has('/wp-content/') || has('/wp-includes/') || elementor) {
+  const wpBakery = has('/plugins/js_composer') || s.hasWpBakeryClass
+  // Caching and CDN plugins rewrite asset paths, so markup has to count too.
+  if (gen.startsWith('wordpress') || has('/wp-content/') || has('/wp-includes/') || elementor || wpBakery || s.hasWordPressClass) {
     return {
       label: 'wordpress',
-      ...(elementor ? { builder: 'elementor' } : {}),
-      evidence: ev(gen.startsWith('wordpress') && genEv, has('/wp-content/') && '/wp-content/ assets', has('/wp-includes/') && '/wp-includes/ assets', elementor && 'Elementor markup or assets'),
+      ...(elementor ? { builder: 'elementor' } : wpBakery ? { builder: 'wpbakery' } : {}),
+      evidence: ev(gen.startsWith('wordpress') && genEv, has('/wp-content/') && '/wp-content/ assets', has('/wp-includes/') && '/wp-includes/ assets', elementor && 'Elementor markup or assets', wpBakery && 'WPBakery markup', s.hasWordPressClass && 'WordPress block classes'),
     }
   }
   if (s.globals.includes('Shopify')) return { label: 'shopify', evidence: ['window.Shopify'] }

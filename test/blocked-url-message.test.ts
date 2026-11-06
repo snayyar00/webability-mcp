@@ -73,3 +73,9 @@ test('the resolved address is parsed out of the guard text', () => {
   assert.equal(resolvedAddressFrom('"a.test" resolves to blocked internal address 192.168.1.5'), '192.168.1.5')
   assert.equal(resolvedAddressFrom('cannot resolve host "nope"'), undefined)
 })
+
+test('the refusal names the tunnel and the arguments it needs', () => {
+  const msg = blockedUrlMessage(LOCALHOST_DETAIL, '::1')
+  assert.match(msg, /webability-tunnel --port 3000/)
+  assert.match(msg, /tunnel_secret/)
+})

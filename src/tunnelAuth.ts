@@ -92,3 +92,12 @@ export function tunnelHeadersFor(requestUrl: string, target: TunnelTarget | null
   if (!match || match[1] !== target.id) return {}
   return { [TUNNEL_SECRET_HEADER]: target.secret }
 }
+
+/**
+ * The relay answers 401 with no secret and 404 with a wrong one or a closed
+ * tunnel. A scan sees only the status, so say what it means here.
+ */
+export function tunnelBlockHint(url: string, status: number | undefined): string {
+  if (!isTunnelUrl(url) || (status !== 401 && status !== 404)) return ''
+  return ' This is a webability-tunnel URL: `tunnel_secret` is missing or wrong, or the tunnel has closed. Pass the secret `webability-tunnel` printed, or start the tunnel again.'
+}

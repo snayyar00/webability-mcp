@@ -63,7 +63,7 @@ export function blockedUrlMessage(detail: string, resolvedAddress?: string): str
     '',
     'Other clients: add `npx -y @webability/mcp` as a stdio server. (The `-y` matters — without it npx may fail with "could not determine executable to run".)',
     '',
-    'Alternatively, expose the dev server on a public URL and scan that. If you use Vite, add the tunnel hostname to `server.allowedHosts` or it answers 403 to everything.',
+    'Or open a tunnel: run `npx -p @webability/mcp webability-tunnel --port 3000` (it needs a free WebAbility account: `webability login`, or set WEBABILITY_API_KEY). Then pass the URL it prints as `url` and the secret it prints as `tunnel_secret`. If you use Vite, add the tunnel hostname to `server.allowedHosts` or it answers 403 to everything.',
   ].join('\n')
 }
 

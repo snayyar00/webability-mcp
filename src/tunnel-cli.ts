@@ -10,6 +10,7 @@
  * already has the MCP installed, and a second package is a second thing to
  * version, publish and get wrong.
  */
+import { resolveAuthToken } from './authToken'
 import { openTunnel, type TunnelHandle } from './tunnel/client'
 import { keepTunnel } from './tunnel/reconnect'
 
@@ -19,7 +20,7 @@ function arg(name: string, fallback = ''): string {
 }
 
 const port = Number(arg('port'))
-const token = arg('token', process.env.WEBABILITY_API_KEY || '')
+const token = arg('token') || resolveAuthToken()
 const relayUrl = arg('relay', process.env.WEBABILITY_TUNNEL_RELAY || 'wss://tunnel.webability.io')
 
 if (!port) {
@@ -30,7 +31,7 @@ if (!port) {
   process.exit(1)
 }
 if (!token) {
-  console.error('No token. Pass --token or set WEBABILITY_API_KEY (free account at https://app.webability.io).')
+  console.error('No token. Run `webability login`, pass --token, or set WEBABILITY_API_KEY (free account at https://app.webability.io).')
   process.exit(1)
 }
 

@@ -7,14 +7,20 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { chromium } from 'playwright'
+
 import { fastScanHtml } from '../src/fastScan.ts'
 
 const PAGE = '<!doctype html><html lang="en"><head><title>t</title></head><body><main><h1>Hi</h1><img src="x.png"><button></button><a href="#"></a><p style="color:#aaa;background:#fff">low</p></main></body></html>'
 
-test('finds the structural issues with fix op + fixability, in well under a second', async () => {
-  const t0 = Date.now()
-  const r = await fastScanHtml(PAGE)
-  const ms = Date.now() - t0
+test('finds the structural issues with fix op + fixability, in-process, with no browser launch', async () => {
+  // The claim is "no browser launch". Count Chromium launches during the scan.
+  const realLaunch = chromium.launch
+  let launches = 0
+  ;(chromium as any).launch = (...a: unknown[]) => { launches++; return (realLaunch as any).apply(chromium, a) }
+  let r: Awaited<ReturnType<typeof fastScanHtml>>
+  try { r = await fastScanHtml(PAGE) } finally { (chromium as any).launch = realLaunch }
+  assert.equal(launches, 0, 'fastScanHtml must not launch a browser')
   const ids = r.issues.map((i) => i.type)
   assert.ok(ids.includes('image-alt') || ids.includes('missing_alt'), `alt: ${ids}`)
   assert.ok(ids.includes('button-name') || ids.includes('unlabeled_button'), `button: ${ids}`)
@@ -23,10 +29,6 @@ test('finds the structural issues with fix op + fixability, in well under a seco
     assert.ok(i.fixability, `${i.id} has fixability`)
     assert.notEqual(i.fixability, 'visual', `${i.id} visual rules are not reported from jsdom`)
   }
-  // ~550ms cold on a laptop; the claim is "no browser launch" (a Chromium
-  // scan is 3-8s), not a micro-benchmark — under the full parallel suite this
-  // hit 1539ms once (2026-08-26), so the bound is load-tolerant.
-  assert.ok(ms < 4000, `took ${ms}ms`)
   assert.equal(r.engine, 'in-process')
 })
 
