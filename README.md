@@ -207,6 +207,61 @@ Filters apply before the 50-item cap, so `minImpact: "serious"` returns every se
 | `start_audit` | Full (free w/ account; stub on Lite) | Kick off the full server-side audit deliverable (report + Excel workbook). Returns an id to poll. |
 | `get_audit` | Full (free w/ account; stub on Lite) | Check an audit's progress and, once complete, get the severity summary + report/workbook download URLs. |
 
+## Proposed install check (unimplemented)
+
+`check_install` is a registered skeleton on Lite and Full. It accepts
+`{ "url": "https://example.com" }`; bare domains default to HTTPS. Local mode
+accepts local HTTP(S) sites, while hosted mode retains its existing URL safety
+checks. Valid calls currently return an MCP error (`isError: true`) explaining
+that detection is not implemented, with no installation state or evidence.
+
+The proposed successful result, returned as `structuredContent` and readable
+JSON text, is:
+
+```ts
+{
+  url: string;
+  finalUrl: string;
+  state: 'present' | 'blocked' | 'error' | 'not_installed';
+  evidence: InstallEvidence[];
+}
+```
+
+`InstallEvidence` is a discriminated union:
+
+| `kind` | Evidence fields | Meaning |
+|---|---|---|
+| `script` | `scriptUrl`, `httpStatus` | Recognized embed loaded successfully, with no observed attributable failure |
+| `security_policy` | `blockedUrl`, `directive`, `policy` | Enforced policy blocked the recognized script; report-only violations do not establish blocking |
+| `script_error` | `scriptUrl`, `message` | Error attributable to the recognized script, not an unrelated page error |
+| `absence` | `inspectedScriptUrls`, `observationDurationMs` | Completed observation found no recognized embed within the observed scope |
+
+Each state requires nonempty supporting evidence. A detected script error is a
+successful diagnostic result, not an MCP tool failure. Invalid input, navigation
+failure, and unavailable detection are tool errors and must not become
+`not_installed`. Presence does not prove widget activation, licensing, or WCAG
+conformance; absence describes only the completed observation window.
+
+Proposed script identity covers the repository's install snippet,
+`https://enhancer.webability.io/widget.min.js`, and the embed in
+[WebAbility's installation documentation](https://www.webability.io/docs),
+`https://widget-v2.webability.io/widget.min.js`. Match exact HTTPS host/path
+combinations, ignoring query strings and fragments. Generic widget attributes
+and substring matches do not establish identity. Legacy domains and self-hosted
+copies are outside this initial contract. Lazy initialization may delay widget
+activation after the embed loads.
+
+`test/install-check.test.ts` contains exactly four **intentionally failing**
+behavior tests, one per state. They inject raw browser-observation fixtures into
+`checkInstall(url, { observe })` and assert the desired state and evidence.
+Currently all four throw `InstallCheckNotImplementedError`. Later PRs will add
+observation, script matching, and classification; this PR implements none of them.
+Run the four red tests with `node --import tsx --test test/install-check.test.ts`.
+
+Accessibility context: [WebAIM's introduction](https://webaim.org/intro/) and the
+[WCAG 2.2 Quick Reference](https://www.w3.org/WAI/WCAG22/quickref/). This tool
+checks an installation, not accessibility conformance.
+
 ## When to use this MCP
 
 - Building a new component and want it accessible from day one
