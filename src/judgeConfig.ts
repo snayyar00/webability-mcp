@@ -3,8 +3,9 @@
  *
  * Local (stdio) installs talk to an OpenAI-compatible chat endpoint
  * (OpenRouter by default) with the operator's own key. The hosted server
- * never holds a model key in the scan path: it posts the undecided set to the
- * platform's `/api/judge-incomplete`. The platform answers only the caller's
+ * never holds a model key in the scan path: it posts the undecided set, and
+ * each rubric batch (by rubric id and prompt hash, never the prompt text), to
+ * the platform's `/api/judge-incomplete`. The platform answers only the caller's
  * bearer token or the hosted server's shared secret (`x-mcp-internal`), so
  * anonymous hosted scans are judged too. Any platform error fails closed
  * (items stay dropped).
@@ -13,7 +14,7 @@
  *   OPENROUTER_API_KEY            enables the local judge
  *   WEBABILITY_JUDGE=off          disables it everywhere
  *   WEBABILITY_JUDGE_BASE_URL     default https://openrouter.ai/api/v1
- *   WEBABILITY_JUDGE_VISION_MODEL default anthropic/claude-haiku-4.5
+ *   WEBABILITY_JUDGE_VISION_MODEL default qwen/qwen3.6-35b-a3b (open weights; set anthropic/claude-haiku-4.5 to fall back)
  *   WEBABILITY_JUDGE_TEXT_MODEL   default deepseek/deepseek-v4-flash
  *   WEBABILITY_JUDGE_TIMEOUT_MS   total budget per scan, default 20000
  */

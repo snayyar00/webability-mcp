@@ -20,6 +20,8 @@ export const CARD_TOOLS: ReadonlySet<string> = new Set(['scan_page', 'verify_fix
 
 const REPORT_PAGE = 'https://www.webability.io/website-accessibility-checker'
 const TOP_ISSUES = 6
+/** Example selectors a collapsed top-issue row shows. */
+const TOP_EXAMPLES = 3
 const TOP_REMAINING = 5
 
 /** Server `capabilities.extensions` entry for MCP Apps (extension id io.modelcontextprotocol/ui). */
@@ -61,7 +63,7 @@ export const cardResourceContents = () => ({
 })
 
 type Summary = { total: number; critical: number; serious: number; moderate: number; minor: number }
-type Finding = { type?: string; wcag?: string; impact?: string; selector?: string; message?: string; count?: number }
+type Finding = { type?: string; wcag?: string; impact?: string; selector?: string; message?: string; count?: number; examples?: readonly string[] }
 
 export type ScanCard = {
   kind: 'scan'
@@ -76,7 +78,12 @@ export type ScanCard = {
   filters?: string
   /** Whole-page issue count when filters are on, so a filtered zero is never read as a clean page. */
   pageTotal?: number
-  topIssues: Array<{ type?: string; wcag?: string; impact?: string; selector?: string; message?: string; count?: number }>
+  /**
+   * A collapsed entry (count > 1) stands for several elements: it carries up
+   * to 3 `examples` and no `selector`, so one selector is never shown as if it
+   * matched every element.
+   */
+  topIssues: Array<{ type?: string; wcag?: string; impact?: string; selector?: string; examples?: string[]; message?: string; count?: number }>
   reportUrl: string
 }
 
@@ -104,14 +111,18 @@ export function scanCard(p: { url: string; summary: Summary; issues: readonly Fi
     issuesTotal: p.issuesTotal,
     ...(p.framework && p.framework !== 'unknown' ? { framework: p.framework } : {}),
     ...(p.filters ? { filters: p.filters, pageTotal: (p.pageSummary ?? p.summary).total } : {}),
-    topIssues: p.issues.slice(0, TOP_ISSUES).map((i) => ({
-      type: i.type,
-      wcag: i.wcag,
-      impact: i.impact,
-      selector: clip(i.selector, 120),
-      message: clip(i.message, 160),
-      ...(typeof i.count === 'number' && i.count > 1 ? { count: i.count } : {}),
-    })),
+    topIssues: p.issues.slice(0, TOP_ISSUES).map((i) => {
+      const many = typeof i.count === 'number' && i.count > 1
+      const examples = many ? (i.examples?.length ? i.examples : i.selector ? [i.selector] : []).slice(0, TOP_EXAMPLES).map((e) => clip(e, 120)!) : []
+      return {
+        type: i.type,
+        wcag: i.wcag,
+        impact: i.impact,
+        ...(many ? { examples } : { selector: clip(i.selector, 120) }),
+        message: clip(i.message, 160),
+        ...(many ? { count: i.count } : {}),
+      }
+    }),
     reportUrl: `${REPORT_PAGE}?url=${encodeURIComponent(p.url)}`,
   }
 }
@@ -209,7 +220,7 @@ button:focus-visible,a:focus-visible{outline:3px solid var(--brand);outline-offs
     var rows = (d.topIssues || []);
     if (rows.length) {
       h += '<table><caption>Top issues</caption><thead><tr><th scope="col">Issue</th><th scope="col">WCAG</th><th scope="col">Impact</th><th scope="col">Element</th></tr></thead><tbody>' +
-        rows.map(function(i){ return '<tr><td>' + esc(label(i.type)) + (i.count > 1 ? ' ×' + n(i.count) : '') + '</td><td>' + esc(i.wcag) + '</td><td>' + esc(cap(i.impact)) + '</td><td><code>' + esc(i.selector) + '</code></td></tr>'; }).join('') +
+        rows.map(function(i){ return '<tr><td>' + esc(label(i.type)) + (i.count > 1 ? ' ×' + n(i.count) : '') + '</td><td>' + esc(i.wcag) + '</td><td>' + esc(cap(i.impact)) + '</td><td>' + (i.examples ? i.examples.map(function(e){ return '<code>' + esc(e) + '</code>'; }).join('<br>') + (i.count > i.examples.length ? '<br>+' + n(i.count - i.examples.length) + ' more' : '') : '<code>' + esc(i.selector) + '</code>') + '</td></tr>'; }).join('') +
         '</tbody></table>';
       var shown = rows.reduce(function(a, i){ return a + (i.count || 1); }, 0);
       if (total > shown) h += '<div class="more">' + n(total - shown) + ' more in the full report.</div>';

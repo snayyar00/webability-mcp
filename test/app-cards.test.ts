@@ -141,6 +141,21 @@ test('scanCard keeps a collapsed entry\'s count', () => {
   assert.equal(card.topIssues[0]!.count, 5)
 })
 
+// vectorweb.solutions (2026-11-09): five link-name findings collapsed into
+// one entry showed selector ".d-md-inline-flex" with count 5 — one selector
+// that matches one node, presented as five. A collapsed entry names its
+// example elements, never one selector for all of them.
+test('scanCard: a collapsed entry lists its examples, not one selector for all', async () => {
+  const examples = ['.d-md-inline-flex', '.logo > a', 'a[href="tel:1"]', '.link:nth-child(2)', '.link[target="_blank"]']
+  const card = scanCard({ url: 'https://uw.test/', summary: { total: 5, critical: 0, serious: 5, moderate: 0, minor: 0 }, issues: [{ ...ISSUE(1, 'serious'), selector: examples[0], count: 5, examples } as any], issuesTotal: 5 })
+  const row = card.topIssues[0]! as any
+  assert.equal(row.count, 5)
+  assert.equal(row.selector, undefined)
+  assert.deepEqual(row.examples, examples.slice(0, 3))
+  const text = await renderCard({ structuredContent: card })
+  assert.ok(text.includes('.logo > a'), 'the card shows more than the first example')
+})
+
 test('verifyCard: pass and fail', () => {
   const pass = verifyCard({ url: 'https://uw.test/after.html', selector: '#logo', wcag: '1.1.1', verified: true, remainingCount: 0, remainingIssues: [] })
   assert.deepEqual(pass, { kind: 'verify', url: 'https://uw.test/after.html', selector: '#logo', wcag: '1.1.1', verified: true, remainingCount: 0, remaining: [] })

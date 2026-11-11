@@ -1406,7 +1406,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       }
     }
 
-    const refusal = await verifyFixRefusal(wcag, selector)
+    const refusal = await verifyFixRefusal(wcag, selector, undefined, { judge: !!judgeFor(opts) })
     if (refusal) return unverified(refusal.reason, refusal.text, { isError: refusal.isError })
 
     try {

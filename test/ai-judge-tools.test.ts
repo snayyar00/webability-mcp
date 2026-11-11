@@ -85,11 +85,12 @@ test('scan_page: the judge promotes the mixed-gradient contrast finding with a c
   assert.ok(hit, 'promoted 1.4.3 violation on #g\n' + text.slice(0, 600))
   assert.match(hit.message, /\d\.\d\d:1 at worst/)
   assert.equal(hit.fix.attribute, 'style')
-  // The stub's #ffffff passes on both measured ends behind this short text, so it is kept.
-  assert.equal(hit.fix.suggestedValue, 'color:#ffffff !important;')
+  // Half the glyph pixels fail: the tool measurement settles it, the model never sees this row.
+  assert.match(hit.fix.suggestedValue, /^color:#[0-9a-f]{6} !important;$/)
   assert.equal(hit.fixability, 'visual')
-  assert.ok((json.judged as any[]).some((j) => j.verdict === 'violation' && j.id === hit.id), 'judged[] carries the verdict')
-  assert.ok(modelCalls.some((c) => c.hasImage && c.model === 'anthropic/claude-haiku-4.5'), 'vision model used for a page scan')
+  assert.ok((json.judged as any[]).some((j) => j.verdict === 'violation' && j.id === hit.id && /2nd-percentile glyph pixel/.test(j.reason)), 'judged[] carries the measured verdict')
+  assert.ok(!modelCalls.some((c) => c.ids.includes(hit.id)), 'a measured row is not sent to the model')
+  assert.ok(modelCalls.some((c) => c.hasImage && c.model === 'qwen/qwen3.6-35b-a3b'), 'vision model used for a page scan')
 })
 
 test('verify_fix: still a violation on the unfixed page, verified on the fixed page', async () => {
