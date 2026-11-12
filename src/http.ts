@@ -27,8 +27,8 @@ import { createHash, timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
 import { handleOAuth, wwwAuthenticate } from './oauth.js'
-import { anonLimitClass, anonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
-import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH } from './signIn.js'
+import { anonLimitClass, anonLimitMessage, appsAnonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
+import { APPS_MCP_PATH, MCP_PATH, MCP_PATHS, PUBLIC_URL, SIGN_IN_MCP_PATH, appsChallenge } from './signIn.js'
 import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
 import { BodyTooLargeError, MCP_MAX_BODY_BYTES, declaredTooLarge, readBodyCapped } from './bodyLimit.js'
 
@@ -157,6 +157,27 @@ const ANON_AI_PER_HOUR = Number(process.env.ANON_AI_PER_HOUR || 10)
 
 const anonLimiter = createAnonLimiter()
 
+/** /mcp/apps over the anonymous cap: a JSON-RPC response for each request in
+ * the body (a batch stays a batch). A tool call gets an isError result with
+ * the sign-in challenge; any other request gets the same text as an error. */
+function appsLimitedResponse(body: unknown, text: string): unknown {
+  const msgs = (Array.isArray(body) ? body : [body]).filter((m: any) => m && typeof m === 'object' && 'id' in m && typeof m.method === 'string')
+  const replies = msgs.map((m: any) =>
+    m.method === 'tools/call'
+      ? {
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            content: [{ type: 'text', text }],
+            isError: true,
+            _meta: { 'mcp/www_authenticate': [appsChallenge('Sign in to WebAbility to keep scanning now')] },
+          },
+        }
+      : { jsonrpc: '2.0', id: m.id, error: { code: -32001, message: text } },
+  )
+  return Array.isArray(body) ? replies : (replies[0] ?? { jsonrpc: '2.0', id: null, error: { code: -32001, message: text } })
+}
+
 // Sign-in flood limits (#201), per client IP. Each POST /authorize/start mints
 // a device code on the platform API, and each unknown bearer token costs a
 // platform whoami call; neither needs an account. Only FAILED token checks
@@ -270,7 +291,7 @@ const httpServer = createHttpServer(async (req, res) => {
     return
   }
 
-  if (url.pathname !== MCP_PATH && url.pathname !== SIGN_IN_MCP_PATH) {
+  if (!MCP_PATHS.includes(url.pathname)) {
     sendJson(res, 404, { error: 'not_found' })
     return
   }
@@ -309,9 +330,11 @@ const httpServer = createHttpServer(async (req, res) => {
       error: {
         code: -32001,
         message:
-          'Invalid or expired token. Reconnect (your client re-runs the sign-in), run `webability login` for a fresh token, ' +
-          'or remove the Authorization and x-webability-token headers: the free scanning tools work without an account. ' +
-          'Docs: https://www.webability.io/docs/mcp',
+          mcpPath === APPS_MCP_PATH
+            ? 'Your WebAbility sign-in has expired. Reconnect WebAbility in ChatGPT to sign in again.'
+            : 'Invalid or expired token. Reconnect (your client re-runs the sign-in), run `webability login` for a fresh token, ' +
+              'or remove the Authorization and x-webability-token headers: the free scanning tools work without an account. ' +
+              'Docs: https://www.webability.io/docs/mcp',
       },
       id: null,
     })
@@ -396,6 +419,14 @@ const httpServer = createHttpServer(async (req, res) => {
         const gate = anonLimiter.allow(`${ip}:${cls}`, limit)
         if (!gate.ok) {
           res.setHeader('Retry-After', String(gate.retryAfterS))
+          if (mcpPath === APPS_MCP_PATH) {
+            // ChatGPT: a bare 429 is a dead end (no sign-in signal), and its
+            // anonymous users share OpenAI's egress IPs, so they reach the cap
+            // together. Answer each request with an isError tool result that
+            // carries the sign-in challenge (a signed-in caller has no cap).
+            sendJson(res, 200, appsLimitedResponse(body, appsAnonLimitMessage({ cls, limit, retryAfterS: gate.retryAfterS, resetAt: gate.resetAt })))
+            return
+          }
           sendJson(res, 429, {
             jsonrpc: '2.0',
             error: {
@@ -410,7 +441,9 @@ const httpServer = createHttpServer(async (req, res) => {
       }
     }
 
-    const server = createServer({ remote: true, authToken, anonymous })
+    // /mcp/apps (ChatGPT) declares per-tool securitySchemes and answers an
+    // anonymous account-tool call with an isError + www_authenticate challenge.
+    const server = createServer({ remote: true, authToken, anonymous, appsAuth: mcpPath === APPS_MCP_PATH })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     res.on('close', () => {
       transport.close().catch(() => {})

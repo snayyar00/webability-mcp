@@ -23,7 +23,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'http'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
-import { MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
+import { APPS_MCP_PATH, MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
 import { OAUTH_MAX_BODY_BYTES, readBodyCapped } from './bodyLimit.js'
 
 const ISSUER = PUBLIC_URL
@@ -232,9 +232,10 @@ const AS_METADATA = {
   service_documentation: 'https://www.webability.io/docs/mcp',
 }
 
-/** RFC 9728 metadata for one MCP path: /mcp (anonymous allowed) or /mcp/auth (sign-in path).
- * The issued access token is the caller's WebAbility token, valid on both
- * paths: the `resource` value tells the client which URL it is signing in
+/** RFC 9728 metadata for one MCP path: /mcp (anonymous allowed), /mcp/auth
+ * (sign-in path) or /mcp/apps (ChatGPT, anonymous allowed).
+ * The issued access token is the caller's WebAbility token, valid on every
+ * path: the `resource` value tells the client which URL it is signing in
  * for; it is not an audience binding. The bare /.well-known path serves the
  * /mcp document. */
 const resourceMetadata = (mcpPath: string) => ({
@@ -374,7 +375,8 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     req.method === 'GET' &&
     (path === '/.well-known/oauth-authorization-server' ||
       path === `/.well-known/oauth-authorization-server${MCP_PATH}` ||
-      path === `/.well-known/oauth-authorization-server${SIGN_IN_MCP_PATH}`)
+      path === `/.well-known/oauth-authorization-server${SIGN_IN_MCP_PATH}` ||
+      path === `/.well-known/oauth-authorization-server${APPS_MCP_PATH}`)
   ) {
     json(res, 200, AS_METADATA)
     return true
@@ -385,6 +387,10 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
   }
   if (req.method === 'GET' && path === `/.well-known/oauth-protected-resource${SIGN_IN_MCP_PATH}`) {
     json(res, 200, resourceMetadata(SIGN_IN_MCP_PATH))
+    return true
+  }
+  if (req.method === 'GET' && path === `/.well-known/oauth-protected-resource${APPS_MCP_PATH}`) {
+    json(res, 200, resourceMetadata(APPS_MCP_PATH))
     return true
   }
 

@@ -36,7 +36,7 @@ import { fastScanHtml } from './fastScan.js'
 import { openSession } from './browser.js'
 import { isBlockedAddress } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
-import { ACCOUNT_TOOLS, signInRequired } from './signIn.js'
+import { ACCOUNT_TOOLS, appsAuthChallenge, appsSignInRequired, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
 
 /** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
@@ -75,6 +75,26 @@ const errorCodeByResponse = new WeakMap<object, string>()
 function authRequired(text: string): ToolResponse {
   const response: ToolResponse = { content: [{ type: 'text', text: /nothing ran/i.test(text) ? text : `${text}\n\nNothing ran: no account data was read and nothing was changed.` }] }
   errorCodeByResponse.set(response, 'auth_required')
+  return response
+}
+
+/**
+ * The sign-in answer for an account tool called with no account. On /mcp/apps
+ * (ChatGPT) it IS an error with a WWW-Authenticate challenge in `_meta`: the
+ * OpenAI Apps SDK shows its sign-in UI only for that shape
+ * (developers.openai.com/apps-sdk/build/auth). Everywhere else it is the plain
+ * result above. Telemetry records `auth_required` either way.
+ */
+function accountRequired(tool: string, opts: ServerOptions, text: string = signInRequired(tool)): ToolResponse {
+  if (!opts.appsAuth) return authRequired(text)
+  const response: ToolResponse = {
+    content: [{ type: 'text', text: appsSignInRequired(tool) }],
+    isError: true,
+    _meta: { 'mcp/www_authenticate': [appsAuthChallenge(tool)] },
+  }
+  errorCodeByResponse.set(response, 'auth_required')
+  // ChatGPT runs the sign-in itself: no `webability login` / other-client step.
+  errorHintByResponse.set(response, { code: 'auth_required', retriable: false, next: { tool, action: 'sign in to WebAbility when ChatGPT asks, then repeat this call' } })
   return response
 }
 
@@ -135,6 +155,10 @@ export interface ServerOptions {
    *  resolveAuthToken(), which on the hosted deploy is the operator's own key
    *  and would run anonymous traffic on the operator's account. */
   anonymous?: boolean
+  /** Hosted /mcp/apps (ChatGPT / OpenAI Apps SDK): every tool declares
+   *  `securitySchemes`, and an account tool called without an account returns
+   *  isError + `_meta["mcp/www_authenticate"]` so ChatGPT starts sign-in. */
+  appsAuth?: boolean
   /** Hosted scan_page / diff_scan time budget. Tests set it low; production uses SCAN_PAGE_HOSTED_DEADLINE_MS. */
   scanPageDeadlineMs?: number
   /** Tests only: opens the browser for diff_scan's live scans. Lets a hosted-mode test reach a local page. */
@@ -468,19 +492,22 @@ function liteFullUpgradeMessage(toolName: string): string {
   )
 }
 
-function buildInstructions(isLite: boolean): string {
-  const edition = isLite
+function buildInstructions(isLite: boolean, apps = false): string {
+  const edition = apps
+    ? `This is **WebAbility** for ChatGPT. Scan and check tools work without signing in, under fair-use limits per IP. \`visual_audit\`, \`start_audit\`, \`get_audit\`, \`add_site\`, \`list_sites\` and \`create_upgrade_link\` need a WebAbility account; called without one, ChatGPT asks the user to sign in.`
+    : isLite
     ? `This is **WebAbility MCP Lite** (local, free, no account). Scan / fix / verify / report-PDF run on this machine.
 \`visual_audit\`, \`start_audit\`, and \`get_audit\` are listed so you know they exist — they are **free with a WebAbility account** on hosted Full at ${HOSTED_MCP_URL} (dashboard / Smithery: ${SMITHERY_INSTALL}). When the user needs vision or a compliance report, tell them to connect Full (still free; a free account is all it needs). To sign in from this machine, run \`webability login\` (from \`@webability/cli\`).`
     : `This is **WebAbility MCP** (hosted Full). Scan and check tools work with no account or key, under fair-use limits per IP. A free WebAbility account unlocks \`visual_audit\`, \`start_audit\` and \`get_audit\`; called without one, they return the sign-in steps for each client. An AI agent with its own AgentMail inbox can sign itself up: choose "Sign in with AgentID" on the WebAbility sign-in page. A signed-in agent can then set up a site with no human: \`add_site\`, \`get_install_snippet\`, and \`create_upgrade_link\` (a payment link it gives to its owner); \`list_sites\` shows each plan.`
 
-  const routingExtra = isLite
+  const routing = isLite
     ? `- Vision / compliance report → \`visual_audit\` / \`start_audit\` (listed as Full stubs here; free with account on hosted Full at ${HOSTED_MCP_URL})
 - "Turn these findings into a shareable PDF" → \`generate_report_pdf\` (local; pass the issues[] from scan_page)
 - "What did we scan before" → \`scan_history\` (local only)`
     : `- "Catch issues axe misses (icon contrast, focus visibility, look-but-not-button)" → \`visual_audit\` (free with account)
 - "I need a report to hand to a compliance officer / legal" → \`start_audit\`, then poll \`get_audit\` (free with account)
 - \`find_source\` / \`scan_history\` / \`generate_report_pdf\` are not available on the hosted server`
+  const routingExtra = apps ? routing.replace(/\(free with account\)/g, '(needs sign-in)') : routing
 
   return `WebAbility is a web accessibility platform — AI-powered widget, scanner, and agents for WCAG 2.2 / ADA / Section 508 / EAA compliance. https://webability.io
 
@@ -860,6 +887,33 @@ function withAnnotations<T extends { name: string }>(tool: T): T & { title?: str
   return annotations ? { ...tool, title: annotations.title, annotations } : tool
 }
 
+const ACCOUNT_SCHEMES = [{ type: 'oauth2', scopes: ['mcp'] }]
+const OPTIONAL_SCHEMES = [{ type: 'noauth' }, { type: 'oauth2', scopes: ['mcp'] }]
+
+/**
+ * /mcp/apps wording: ChatGPT signs the user in itself, so a description must
+ * not send them to another client, to `webability login`, or to AgentID, and
+ * OpenAI's review refuses offers ("free account") in tool text.
+ */
+const APPS_DESCRIPTION_REWRITES: Array<[RegExp, string]> = [
+  [/Needs a free WebAbility account \([^)]*\)\./g, 'Needs a WebAbility account.'],
+  [/Needs a free WebAbility account\./g, 'Needs a WebAbility account.'],
+  [/Free with a WebAbility account\./g, 'Needs a WebAbility account.'],
+  [/Sign in with a free WebAbility account for vision and full audits \([^)]*\)\./g, 'Needs a WebAbility account.'],
+  // No pricing or offers outside create_upgrade_link (OpenAI review).
+  [/ The site gets the full widget for its first 30 days and a first scan\./g, ' The site gets a first scan.'],
+  [/, and use create_upgrade_link to get a payment link for the WebAbility Pro plan\./g, '.'],
+  [/ Use it to check that a payment activated WebAbility Pro on a site\./g, ''],
+]
+
+/** /mcp/apps: per-tool auth for the OpenAI Apps SDK, top level and mirrored in
+ * `_meta` (merged: card tools keep `_meta.ui`). */
+function withAppsAuth<T extends { name: string; description?: string; _meta?: Record<string, unknown> }>(tool: T): T & { securitySchemes: unknown[] } {
+  const securitySchemes = ACCOUNT_TOOLS.has(tool.name) ? ACCOUNT_SCHEMES : OPTIONAL_SCHEMES
+  const description = APPS_DESCRIPTION_REWRITES.reduce((d, [re, to]) => d.replace(re, to), tool.description ?? '')
+  return { ...tool, description, securitySchemes, _meta: { ...(tool._meta ?? {}), securitySchemes } }
+}
+
 /** Local-only recovery hint inside a tool description; stripped on hosted. */
 const SCAN_HISTORY_HINT = ' or use scan_history(id) for the full set'
 
@@ -908,6 +962,7 @@ function handleListTools(opts: ServerOptions = {}) {
     .map(withAnnotations)
     // MCP Apps hosts render these two results as a card (see appCards.ts).
     .map((tool) => (CARD_TOOLS.has(tool.name) ? { ...tool, _meta: cardToolMeta() } : tool))
+    .map((tool) => (opts.appsAuth ? withAppsAuth(tool) : tool))
   return { tools }
 }
 
@@ -1068,7 +1123,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   // Hosted anonymous call to an account tool: answer with a sign-in result (not an
   // error, never an HTTP 401 — see signIn.ts), before the URL guard's DNS lookup and before any
   // browser or API work. These calls are in no rate-limit class.
-  if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return authRequired(signInRequired(name))
+  if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return accountRequired(name, opts)
 
   // Account tools call only our own API with the caller's token, so they run
   // before the hosted URL guard (which would DNS-check a site the agent has
@@ -1085,7 +1140,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   }
   if (name === 'add_site' || name === 'list_sites' || name === 'create_upgrade_link') {
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
-    if (!token) return authRequired(signInRequired(name))
+    if (!token) return accountRequired(name, opts)
     try {
       if (name === 'list_sites') {
         const sites = await listSites(API_URL, token)
@@ -1730,7 +1785,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     }
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
     if (!token) {
-      return authRequired('start_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+      return accountRequired('start_audit', opts, 'start_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
@@ -1771,7 +1826,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     if (!id && id !== 0) return toolError('Error: id is required (from start_audit)')
     const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
     if (!token) {
-      return authRequired('get_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+      return accountRequired('get_audit', opts, 'get_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
     }
 
     try {
@@ -2299,7 +2354,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
       // vision on the caller's account (#124).
       const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
       if (!token) {
-        return authRequired('visual_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
+        return accountRequired('visual_audit', opts, 'visual_audit needs a free WebAbility account. Run `webability login` (or connect to the hosted server and sign in), then retry.')
       }
 
       let res: Response
@@ -2864,7 +2919,7 @@ export function createServer(opts: ServerOptions = {}) {
   const isLite = !opts.remote
   const server = new Server(
     { name: isLite ? 'webability-lite' : 'webability', version: MCP_VERSION },
-    { capabilities: { tools: {}, resources: {}, extensions: cardExtension() }, instructions: buildInstructions(isLite) },
+    { capabilities: { tools: {}, resources: {}, extensions: cardExtension() }, instructions: buildInstructions(isLite, opts.appsAuth === true) },
   )
   server.setRequestHandler(ListToolsRequestSchema, () => handleListTools(opts))
   server.setRequestHandler(ListResourcesRequestSchema, () => ({ resources: [cardResource()] }))

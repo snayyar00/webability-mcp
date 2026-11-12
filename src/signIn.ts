@@ -1,7 +1,7 @@
 /**
  * Hosted sign-in paths and the text an anonymous caller gets from an account tool.
  *
- * The hosted server has two MCP URLs:
+ * The hosted server has three MCP URLs:
  * - `/mcp` never answers an anonymous request with 401. A 401 on a tool call
  *   makes Claude Code cache the server as `needs-auth`, and every later session
  *   on that machine starts with zero tools (measured with Claude Code 2.1.288).
@@ -15,15 +15,24 @@
  *   WWW-Authenticate, so a client that starts OAuth only on a 401 (claude.ai
  *   connectors per claude.com/docs/connectors/building/authentication; Cursor,
  *   VS Code, opencode) signs the user in when they add it.
+ * - `/mcp/apps` is the ChatGPT (OpenAI Apps SDK) path. Anonymous requests are
+ *   allowed, as on `/mcp`, but every tool declares `securitySchemes` and an
+ *   anonymous call to an account tool returns `isError: true` with
+ *   `_meta["mcp/www_authenticate"]`: that is the only signal that makes
+ *   ChatGPT show its sign-in UI (developers.openai.com/apps-sdk/build/auth).
  */
 export const PUBLIC_URL = (process.env.MCP_PUBLIC_URL || 'https://mcp.webability.io').replace(/\/+$/, '')
 export const MCP_PATH = '/mcp'
 export const SIGN_IN_MCP_PATH = '/mcp/auth'
+export const APPS_MCP_PATH = '/mcp/apps'
+
+/** Every hosted MCP path. */
+export const MCP_PATHS: readonly string[] = [MCP_PATH, SIGN_IN_MCP_PATH, APPS_MCP_PATH]
 
 /** Tools that need the caller's own WebAbility account. */
 export const ACCOUNT_TOOLS: ReadonlySet<string> = new Set(['start_audit', 'get_audit', 'visual_audit', 'add_site', 'list_sites', 'create_upgrade_link'])
 
-/** The protected-resource metadata URL for one of the two MCP paths (RFC 9728 §3.1 path form). */
+/** The protected-resource metadata URL for one of the MCP paths (RFC 9728 §3.1 path form). */
 export function resourceMetadataUrl(mcpPath: string): string {
   return `${PUBLIC_URL}/.well-known/oauth-protected-resource${mcpPath}`
 }
@@ -50,4 +59,26 @@ export function signInRequired(tool: string): string {
     '',
     `Then call ${tool} again.`,
   ].join('\n')
+}
+
+/** Tool-result text for an anonymous call to an account tool on `/mcp/apps`.
+ * The first line keeps "not signed in" and "Nothing ran": telemetry and the
+ * PostHog filter classify the call by those phrases. ChatGPT shows its own
+ * sign-in button from the challenge in `_meta`, so no client steps here. */
+export function appsSignInRequired(tool: string): string {
+  return [
+    `${tool} needs a WebAbility account, and you are not signed in. Nothing ran: no account data was read and nothing was changed.`,
+    '',
+    `Sign in to WebAbility when ChatGPT asks, then call ${tool} again. The scan and check tools work without signing in.`,
+  ].join('\n')
+}
+
+/** A `_meta["mcp/www_authenticate"]` challenge on `/mcp/apps`. `description` must hold no double quote. */
+export function appsChallenge(description: string): string {
+  return `Bearer resource_metadata="${resourceMetadataUrl(APPS_MCP_PATH)}", error="insufficient_scope", error_description="${description.replace(/"/g, "'")}"`
+}
+
+/** The challenge for an anonymous account-tool call on `/mcp/apps`. */
+export function appsAuthChallenge(tool: string): string {
+  return appsChallenge(`Sign in to WebAbility to use ${tool}`)
 }

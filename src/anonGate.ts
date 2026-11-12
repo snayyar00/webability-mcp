@@ -113,16 +113,34 @@ export function createAnonLimiter(now: () => number = Date.now) {
   }
 }
 
+function limitParts(o: { cls: 'heavy' | 'ai'; limit: number; retryAfterS: number; resetAt: number }) {
+  const what = o.cls === 'ai' ? (o.limit === 1 ? 'AI fix call' : 'AI fix calls') : o.limit === 1 ? 'page-loading call' : 'page-loading calls'
+  const wait = o.retryAfterS < 60 ? `${o.retryAfterS} s` : `${Math.ceil(o.retryAfterS / 60)} min`
+  const at = new Date(o.resetAt).toISOString().slice(11, 16)
+  return { what, wait, at }
+}
+
+/**
+ * The anonymous-cap answer on /mcp/apps (ChatGPT): the limit and reset time,
+ * no other client's sign-in steps. ChatGPT shows its sign-in button from the
+ * challenge the caller puts next to this text.
+ */
+export function appsAnonLimitMessage(o: { cls: 'heavy' | 'ai'; limit: number; retryAfterS: number; resetAt: number }): string {
+  const { what, wait, at } = limitParts(o)
+  return (
+    `Anonymous fair-use limit reached: ${o.limit} ${what} per hour from this network. Nothing ran. ` +
+    `It resets in ${wait} (at ${at} UTC). Sign in to WebAbility when ChatGPT asks to keep going now.`
+  )
+}
+
 /**
  * The anonymous-cap answer. Persona round 4: the old text ("… or retry
  * later") gave no limit and no reset time. States the limit, when this
  * caller's window resets, and how to remove the limit.
  */
 export function anonLimitMessage(o: { cls: 'heavy' | 'ai'; limit: number; retryAfterS: number; resetAt: number }): string {
-  const what = o.cls === 'ai' ? (o.limit === 1 ? 'AI fix call' : 'AI fix calls') : o.limit === 1 ? 'page-loading call' : 'page-loading calls'
+  const { what, wait, at } = limitParts(o)
   const examples = o.cls === 'ai' ? ` (${[...AI_TOOLS].join(', ')})` : ` (${[...HEAVY_TOOLS].join(', ')}, check_color_contrast with a url + selector or with a url and no brandColors)`
-  const wait = o.retryAfterS < 60 ? `${o.retryAfterS} s` : `${Math.ceil(o.retryAfterS / 60)} min`
-  const at = new Date(o.resetAt).toISOString().slice(11, 16)
   return (
     `Anonymous fair-use limit reached: ${o.limit} ${what}${examples} per hour from this IP address. ` +
     `It resets in ${wait} (at ${at} UTC). ` +
