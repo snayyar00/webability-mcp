@@ -87,6 +87,9 @@ async function callTool(name: string, args: unknown, opts: Record<string, unknow
 }
 
 const APPS_ANON = { remote: true, anonymous: true, appsAuth: true }
+const APPS_SIGNED_IN = { remote: true, appsAuth: true, authToken: 'test-token' }
+/** /mcp/apps hides the payment-link tool (OpenAI holds payment tools for manual review). */
+const APPS_ACCOUNT_TOOLS = [...ACCOUNT_TOOLS].filter((t) => t !== 'create_upgrade_link')
 const MCP_ANON = { remote: true, anonymous: true }
 
 describe('in-memory /mcp/apps server', () => {
@@ -117,7 +120,7 @@ describe('in-memory /mcp/apps server', () => {
       assert.deepEqual(t.securitySchemes, want, t.name)
       assert.deepEqual(t._meta?.securitySchemes, want, `${t.name} _meta`)
     }
-    for (const name of ACCOUNT_TOOLS) assert.ok(tools.some((t) => t.name === name), `${name} listed`)
+    for (const name of APPS_ACCOUNT_TOOLS) assert.ok(tools.some((t) => t.name === name), `${name} listed`)
   })
 
   test('card tools keep their _meta.ui next to the schemes', async () => {
@@ -132,14 +135,63 @@ describe('in-memory /mcp/apps server', () => {
     }
   })
 
+  test('/mcp/apps does not list create_upgrade_link; plain /mcp still does', async () => {
+    const apps = await listTools(APPS_ANON)
+    assert.ok(!apps.some((t) => t.name === 'create_upgrade_link'), 'hidden on /mcp/apps')
+    for (const t of apps) assert.doesNotMatch(`${t.title ?? ''} ${t.description}`, /create_upgrade_link|payment|Stripe|WebAbility Pro/i, t.name)
+    const sess = await raw(APPS_ANON)
+    await sess.close()
+    assert.doesNotMatch(sess.init.result.instructions, /create_upgrade_link|payment/i)
+    const plain = await listTools(MCP_ANON)
+    assert.ok(plain.some((t) => t.name === 'create_upgrade_link'), 'still on /mcp')
+  })
+
+  test('calling create_upgrade_link on /mcp/apps is refused as an unknown tool, even signed in', async () => {
+    let hit = false
+    const prev = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      if (String(input).includes('create-checkout-session')) hit = true
+      return prev(input, init)
+    }) as typeof fetch
+    const r = await callTool('create_upgrade_link', { domain: 'shop.example.com' }, APPS_SIGNED_IN)
+    assert.equal(r.result.isError, true, r.text)
+    assert.match(r.text, /^Unknown tool: create_upgrade_link/)
+    assert.equal(hit, false, 'no checkout session created')
+    // Anonymous: refused the same way, with no sign-in challenge first.
+    const anon = await callTool('create_upgrade_link', { domain: 'shop.example.com' }, APPS_ANON)
+    assert.equal(anon.result.isError, true, anon.text)
+    assert.match(anon.text, /^Unknown tool: create_upgrade_link/)
+    assert.equal(anon.result._meta?.['mcp/www_authenticate'], undefined, JSON.stringify(anon.result._meta))
+  })
+
+  test('signed-in add_site on /mcp/apps does not point to create_upgrade_link', async () => {
+    const site = { id: 7, url: 'https://shop.example.com', planTier: 'FREE', expiredAt: null, status: 'active' }
+    globalThis.fetch = (async (input: any, init?: any) => {
+      if (String(input).endsWith('/mcp/scan-events')) {
+        events.push(JSON.parse(String(init?.body)))
+        return new Response(null, { status: 204 })
+      }
+      return new Response(JSON.stringify({ data: { addSite: 'ok', getUserSites: { sites: [site], total: 1 } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as typeof fetch
+    const apps = await callTool('add_site', { url: 'https://shop.example.com' }, APPS_SIGNED_IN)
+    assert.notEqual(apps.result.isError, true, apps.text)
+    assert.match(apps.text, /^Added https:\/\/shop\.example\.com/)
+    assert.match(apps.text, /get_install_snippet/)
+    assert.doesNotMatch(apps.text, /create_upgrade_link|WebAbility Pro|pays/)
+    const plain = await callTool('add_site', { url: 'https://shop.example.com' }, { remote: true, authToken: 'test-token' })
+    assert.match(plain.text, /create_upgrade_link/)
+  })
+
   test('no tool description or server instructions on /mcp/apps mention AgentID, "free" accounts, or other clients', async () => {
     const tools = await listTools(APPS_ANON)
     for (const t of tools) {
       assert.doesNotMatch(t.description, /AgentID|free WebAbility account|Free with a WebAbility account|\/mcp\/auth|webability login|claude mcp login/i, t.name)
     }
-    // OpenAI review: no pricing, subscription offers or promotions outside the
-    // one tool whose job is the payment link (create_upgrade_link).
-    for (const t of tools.filter((x) => x.name !== 'create_upgrade_link')) {
+    // OpenAI review: no pricing, subscription offers or promotions in any tool.
+    for (const t of tools) {
       assert.doesNotMatch(`${t.title ?? ''} ${t.description}`, /payment|Pro plan|WebAbility Pro|Stripe|30 days|price/i, t.name)
     }
     const sess = await raw(APPS_ANON)
@@ -147,7 +199,7 @@ describe('in-memory /mcp/apps server', () => {
     assert.doesNotMatch(sess.init.result.instructions, /AgentID|AgentMail|free WebAbility account|free with account/i)
   })
 
-  for (const tool of ACCOUNT_TOOLS) {
+  for (const tool of APPS_ACCOUNT_TOOLS) {
     test(`anonymous ${tool}: isError + one www_authenticate challenge + telemetry auth_required`, async () => {
       const r = await callTool(tool, ARGS, APPS_ANON)
       assert.equal(r.result.isError, true, r.text)

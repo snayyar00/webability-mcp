@@ -494,7 +494,7 @@ function liteFullUpgradeMessage(toolName: string): string {
 
 function buildInstructions(isLite: boolean, apps = false): string {
   const edition = apps
-    ? `This is **WebAbility** for ChatGPT. Scan and check tools work without signing in, under fair-use limits per IP. \`visual_audit\`, \`start_audit\`, \`get_audit\`, \`add_site\`, \`list_sites\` and \`create_upgrade_link\` need a WebAbility account; called without one, ChatGPT asks the user to sign in.`
+    ? `This is **WebAbility** for ChatGPT. Scan and check tools work without signing in, under fair-use limits per IP. \`visual_audit\`, \`start_audit\`, \`get_audit\`, \`add_site\` and \`list_sites\` need a WebAbility account; called without one, ChatGPT asks the user to sign in.`
     : isLite
     ? `This is **WebAbility MCP Lite** (local, free, no account). Scan / fix / verify / report-PDF run on this machine.
 \`visual_audit\`, \`start_audit\`, and \`get_audit\` are listed so you know they exist — they are **free with a WebAbility account** on hosted Full at ${HOSTED_MCP_URL} (dashboard / Smithery: ${SMITHERY_INSTALL}). When the user needs vision or a compliance report, tell them to connect Full (still free; a free account is all it needs). To sign in from this machine, run \`webability login\` (from \`@webability/cli\`).`
@@ -895,12 +895,19 @@ const OPTIONAL_SCHEMES = [{ type: 'noauth' }, { type: 'oauth2', scopes: ['mcp'] 
  * not send them to another client, to `webability login`, or to AgentID, and
  * OpenAI's review refuses offers ("free account") in tool text.
  */
+/**
+ * /mcp/apps hides the payment-link tool: OpenAI holds a tool that hands out a
+ * Stripe Checkout link for manual review, and ChatGPT users upgrade in the
+ * dashboard instead. Hidden from tools/list and refused as unknown on call.
+ */
+const APPS_HIDDEN_TOOLS: ReadonlySet<string> = new Set(['create_upgrade_link'])
+
 const APPS_DESCRIPTION_REWRITES: Array<[RegExp, string]> = [
   [/Needs a free WebAbility account \([^)]*\)\./g, 'Needs a WebAbility account.'],
   [/Needs a free WebAbility account\./g, 'Needs a WebAbility account.'],
   [/Free with a WebAbility account\./g, 'Needs a WebAbility account.'],
   [/Sign in with a free WebAbility account for vision and full audits \([^)]*\)\./g, 'Needs a WebAbility account.'],
-  // No pricing or offers outside create_upgrade_link (OpenAI review).
+  // No pricing, payment or offers in any tool text (OpenAI review).
   [/ The site gets the full widget for its first 30 days and a first scan\./g, ' The site gets a first scan.'],
   [/, and use create_upgrade_link to get a payment link for the WebAbility Pro plan\./g, '.'],
   [/ Use it to check that a payment activated WebAbility Pro on a site\./g, ''],
@@ -923,6 +930,7 @@ function handleListTools(opts: ServerOptions = {}) {
     .filter((tool) => {
       // Hosted Full: no local-filesystem / local-history tools
       if (!isLite && (tool.name === 'find_source' || tool.name === 'scan_history' || tool.name === 'generate_report_pdf')) return false
+      if (opts.appsAuth && APPS_HIDDEN_TOOLS.has(tool.name)) return false
       return true
     })
     .map((tool) => {
@@ -1123,6 +1131,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   // Hosted anonymous call to an account tool: answer with a sign-in result (not an
   // error, never an HTTP 401 — see signIn.ts), before the URL guard's DNS lookup and before any
   // browser or API work. These calls are in no rate-limit class.
+  // Before the sign-in guard: a hidden tool must not prompt a sign-in first.
+  if (opts.appsAuth && APPS_HIDDEN_TOOLS.has(name)) return toolError(`Unknown tool: ${name}`)
   if (opts.anonymous && ACCOUNT_TOOLS.has(name)) return accountRequired(name, opts)
 
   // Account tools call only our own API with the caller's token, so they run
@@ -1156,7 +1166,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           content: [
             {
               type: 'text',
-              text: `Added ${site.url}.\n${describeSite(site)}\n\nNext:\n1. Install the widget: call get_install_snippet and put the tag on every page.\n2. For WebAbility Pro: call create_upgrade_link with domain ${site.url} and give the link to the person who pays.`,
+              text: opts.appsAuth
+                ? `Added ${site.url}.\n${describeSite(site)}\n\nNext: install the widget. Call get_install_snippet and put the tag on every page.`
+                : `Added ${site.url}.\n${describeSite(site)}\n\nNext:\n1. Install the widget: call get_install_snippet and put the tag on every page.\n2. For WebAbility Pro: call create_upgrade_link with domain ${site.url} and give the link to the person who pays.`,
             },
           ],
         }
