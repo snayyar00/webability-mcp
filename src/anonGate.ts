@@ -58,7 +58,7 @@ export function calledTools(body: unknown): ToolCall[] {
 }
 
 // Browser-launching tools: each call is a headless page on this box.
-const HEAVY_TOOLS = new Set(['scan_page', 'flow_scan', 'diff_scan', 'verify_fix', 'detect_framework', 'scan_html', 'check_aria'])
+const HEAVY_TOOLS = new Set(['check_install', 'scan_page', 'flow_scan', 'diff_scan', 'verify_fix', 'detect_framework', 'scan_html', 'check_aria'])
 const AI_TOOLS = new Set(['generate_ai_fix'])
 
 /**
