@@ -207,6 +207,82 @@ Filters apply before the 50-item cap, so `minImpact: "serious"` returns every se
 | `start_audit` | Full (free w/ account; stub on Lite) | Kick off the full server-side audit deliverable (report + Excel workbook). Returns an id to poll. |
 | `get_audit` | Full (free w/ account; stub on Lite) | Check an audit's progress and, once complete, get the severity summary + report/workbook download URLs. |
 
+## Install check
+
+`check_install` inspects the top-level page on Lite and Full. It accepts
+`{ "url": "https://example.com" }`; bare domains default to HTTPS. Local mode
+accepts local HTTP(S) sites, while hosted mode retains its existing URL safety
+checks and browser-scan rate limits. Hosted tunnel URLs accept `tunnel_secret`.
+
+The successful result, returned as `structuredContent` and readable
+JSON text, is:
+
+```ts
+{
+  url: string;
+  finalUrl: string;
+  state: 'present' | 'blocked' | 'error' | 'not_installed';
+  evidence: InstallEvidence[];
+}
+```
+
+`InstallEvidence` is a discriminated union:
+
+| `kind` | Evidence fields | Meaning |
+|---|---|---|
+| `script` | `scriptUrl`, `httpStatus` | Recognized embed loaded successfully, with no observed attributable failure |
+| `security_policy` | `blockedUrl`, `directive`, `policy` | Enforced policy blocked the recognized script; report-only violations do not establish blocking |
+| `script_error` | `scriptUrl`, `message` | Error attributable to the recognized script, not an unrelated page error |
+| `script_load` | `scriptUrl`, `httpStatus` or `failure` | Failed download (HTTP 4xx/5xx, DNS/network failure, or client/ad-blocker refusal) maps to `error` |
+| `consent` | `scriptUrl`, `type`, `attributes` | Unrequested `text/plain` embed with a consent marker maps to `blocked` |
+| `absence` | `inspectedScriptUrls`, `observationDurationMs` | Completed observation found no recognized embed within the observed scope |
+
+Each state requires nonempty supporting evidence. A detected script error is a
+successful diagnostic result, not an MCP tool failure. Invalid input, navigation
+failure, and unavailable detection are tool errors and must not become
+`not_installed`. Presence does not prove widget activation, licensing, or WCAG
+conformance; absence describes only the completed observation window.
+
+Script identity covers the repository's install snippet,
+`https://enhancer.webability.io/widget.min.js`, and the embed in
+[WebAbility's installation documentation](https://www.webability.io/docs),
+`https://widget-v2.webability.io/widget.min.js`, the dashboard Install tab
+snippet, `https://widget.webability.io/widget.min.js`, and the legacy
+`https://widget.access-widget.com/widget.min.js`. Match exact HTTPS host/path
+combinations, ignoring query strings and fragments. Generic widget attributes
+and substring matches do not establish identity. Agency custom hostnames and
+self-hosted copies are outside this initial contract. Lazy initialization may delay widget
+activation after the embed loads.
+
+Observation starts before page scripts, waits for page load (20-second navigation
+timeout), then observes for one additional second. It records completed script
+requests, enforced CSP violations, attributable runtime exceptions, and script
+attributes. Consent markers supported are `data-cookieconsent`,
+`data-cookiecategory`, and `data-consent`, including embeds using `data-src`.
+No consent is granted and no security policy is bypassed.
+
+Classification prioritizes confirmed policy/consent blocking, then script errors
+or failed downloads, then successful downloads, then absence. Report-only CSP
+and unrelated page errors do not establish a failure. A recognized tag or request
+without a conclusive outcome produces a tool error rather than false absence.
+Navigation failures (including HTTP 4xx/5xx) also produce tool errors.
+
+Coverage is bounded to the top-level document and observation window. Iframes,
+late interaction-triggered injection, and cross-origin errors whose source the
+browser hides are not fully covered. A successful download is not proof that all
+widget features initialized or that the site is accessible.
+
+`test/install-check.test.ts` covers the four states, failed downloads, consent,
+identity boundaries, and inconclusive observations with raw fixtures.
+`test/install-observation.test.ts` exercises real Chromium against routed local
+fixtures, including enforced CSP, runtime exceptions, HTTP errors, client blocking,
+and consent-held tags. Run both with
+`node --import tsx --test test/install-check.test.ts test/install-observation.test.ts`.
+
+Accessibility context: [WebAIM's introduction](https://webaim.org/intro/) and the
+[WCAG 2.2 Quick Reference](https://www.w3.org/WAI/WCAG22/quickref/). This tool
+checks an installation, not accessibility conformance.
+
 ## When to use this MCP
 
 - Building a new component and want it accessible from day one
