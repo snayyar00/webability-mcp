@@ -3,6 +3,7 @@
  * here, so launch recovery (missing browser, HTTP/2 failures) lives in one
  * spot instead of eight.
  */
+import { schemeForBareUrl } from './publicUrl.js'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -155,13 +156,7 @@ export function isHttp2ProtocolError(err: unknown): boolean {
  * a bare local host gets http:// — the README prompts say "Scan localhost:3000"
  * and https:// there fails with an SSL error. Every other bare host gets https://.
  */
-export function schemeForBareUrl(raw: string): 'http' | 'https' {
-  const authority = raw.split(/[/?#]/, 1)[0].toLowerCase()
-  const host = authority.replace(/:\d+$/, '')
-  return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || host.endsWith('.localhost')
-    ? 'http'
-    : 'https'
-}
+export { schemeForBareUrl } from './publicUrl.js'
 
 /** Scan targets may arrive without a scheme (core scan() used to add one). */
 export function normalizeScanUrl(url: string): string {

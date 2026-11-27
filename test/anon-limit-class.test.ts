@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import { anonLimitClass } from '../src/anonGate.ts'
 
 test('browser-launching tools are heavy', () => {
-  for (const t of ['scan_page', 'flow_scan', 'diff_scan', 'verify_fix', 'detect_framework', 'scan_html', 'check_aria']) {
+  for (const t of ['check_install', 'scan_page', 'flow_scan', 'diff_scan', 'verify_fix', 'detect_framework', 'scan_html', 'check_aria']) {
     assert.equal(anonLimitClass({ name: t }), 'heavy', t)
   }
 })

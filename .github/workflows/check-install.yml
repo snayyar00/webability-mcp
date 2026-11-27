@@ -1,0 +1,46 @@
+name: Check WebAbility installation
+on:
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Public URL to check
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      url:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event_name != 'deployment_status' || github.event.deployment_status.state == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      # Build the pinned CLI until a registry version includes check-install.
+      - uses: actions/checkout@v4
+        with:
+          repository: s-kar10/webability-mcp
+          ref: 5f740030108935548ef40cefed2c00a5a609b2e1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install the packaged CLI
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          tarball=$(npm pack --silent --pack-destination "$RUNNER_TEMP")
+          npm install --global "$RUNNER_TEMP/$tarball"
+      - name: Check the deployed page
+        env:
+          DEPLOY_URL: ${{ inputs.url || github.event.deployment_status.environment_url }}
+        run: webability check-install "$DEPLOY_URL"

@@ -24,6 +24,49 @@ or `claude mcp add --transport http webability https://mcp.webability.io/mcp`
 
 **Local** (the browser runs on your machine, so it scans `localhost` directly): `npx -y -p @webability/mcp webability-mcp`
 
+## Check the widget after deployment
+
+Run `webability check-install <url>` with the packaged CLI. From this checkout,
+build it first with `pnpm install --frozen-lockfile && pnpm run build`.
+To try the executable in an isolated directory, run `npm pack` and install
+the resulting tarball there with `npm install /absolute/path/to/package.tgz`.
+Then run:
+
+```sh
+npm exec --offline -- webability check-install https://your-deployment.example/pricing
+```
+
+The CLI sends one public page URL to WebAbility's installation API. It accepts
+a bare domain, preserves the path and query, and drops the fragment. Anonymous
+checks work without setup. Set `WEBABILITY_API_KEY` to use your account's
+higher limit. The client also recognizes an existing CLI login.
+
+| Exit | Meaning | Output |
+| --- | --- | --- |
+| 0 | The widget script loaded (`installed`). | JSON on stdout with the checked and final URLs, state, owner's sentence, next step and evidence. |
+| 1 | The API completed the check and found `blocked`, `error` or `not_installed`. | The same JSON on stdout. Show the sentence and next step to the site owner. |
+| 2 | The check could not determine the installation state. | A message on stderr. Includes usage, URL validation, transport, HTTP and invalid-response errors. |
+
+On HTTP 502, retry the check. On HTTP 429, wait at least one minute before
+retrying. The CLI makes a single request with a 75-second timeout.
+
+The [GitHub Actions workflow](.github/workflows/check-install.yml) can be
+copied into a site's repository. It reads the public environment URL from a
+successful deployment status. For a deployment job that returns its URL as an
+output, call the workflow with `needs: deploy`, `uses: ./.github/workflows/check-install.yml`,
+and `with: { url: "${{ needs.deploy.outputs.url }}" }`. Either nonzero exit
+fails the job. The example builds an immutable revision with the new command.
+
+MCP clients call `check_install` with `{"url":"…"}`. The hosted transport
+uses the API and preserves the original MCP success state `present` and the
+evidence items. API failures produce MCP tool errors without an installation
+state. Local stdio uses the browser on your machine and accepts localhost,
+including a local WordPress installation.
+
+The [Framer smoke result](docs/check-install-framer-smoke.json) records an
+anonymous packaged CLI run on November 27, 2026. The CLI exited 1 because
+the page held the widget behind a consent preference.
+
 ## What you get back
 
 Real output, `scan_page` on https://demo.vercel.store (trimmed):

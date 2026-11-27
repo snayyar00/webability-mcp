@@ -18,8 +18,6 @@ import { DeadlineError, withDeadline } from './deadline'
 import { pageStratified, stratifiedCap } from './capStratified'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import dnsPromises from 'dns/promises'
-import { isIP } from 'net'
 import type { BrowserContext } from 'playwright'
 import { blockedUrlMessage, resolvedAddressFrom } from './blockedUrlMessage.js'
 import { judgeOptionsFromEnv } from './judgeConfig.js'
@@ -34,28 +32,21 @@ import { IMPACT_RANK, INLINE_BUDGET, OFFSET_PROPERTY, OUTPUT_CONTROL_PROPERTIES,
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote, widgetViewNote } from './scanShaping.js'
 import { SCAN_HTML_DEADLINE_MS, ScanHtmlBusyError, ScanHtmlLimitError, assertScanHtmlWithinCaps, fastScanHtml } from './fastScan.js'
-import { openSession, schemeForBareUrl } from './browser.js'
-import { isBlockedAddress } from './egressProxy.js'
+import { openSession } from './browser.js'
+import { assertSafeUrl, normalizeUrlArg } from './publicUrl.js'
+export { normalizeUrlArg } from './publicUrl.js'
+import { checkInstallApi, installUrl, apiBaseUrl } from './installApi.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, appsAuthChallenge, appsSignInRequired, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
+import { checkInstall } from './installCheck.js'
+import { observeInstall } from './installObservation.js'
 
 /** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
 export const HOSTED_URL_ARG_KEYS: string[] = [...new Set(['url', 'startUrl', 'baselineUrl', ...VERIFY_FIX_URL_KEYS])]
 
-/** Bare domains ("webability.io") get https://, a bare local host gets http://
- *  (a dev server speaks plain HTTP). Anything that already names a scheme
- *  (http:example.com, file://, javascript:) is left alone, so the SSRF guard still judges
- *  and refuses it. "host:8080" is a port, not a scheme. Blank stays blank, so verify_fix
- *  can fall through from an empty `url` to its `pageUrl` alias. */
-export function normalizeUrlArg(raw: string): string {
-  const u = raw.trim()
-  if (!u) return ''
-  return /^[a-z][a-z0-9+.-]*:(?!\d)/i.test(u) ? u : `${schemeForBareUrl(u)}://${u}`
-}
-
 const execFileAsync = promisify(execFile)
-const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
+const API_URL = apiBaseUrl()
 
 /** AI-judge options for this request (see judgeConfig.ts). Undefined = judge skipped. */
 const judgeFor = (opts: ServerOptions) => judgeOptionsFromEnv({ remote: opts.remote, anonymous: opts.anonymous, authToken: opts.authToken, apiUrl: API_URL })
@@ -212,35 +203,6 @@ export function flowScanMaxPages(raw: unknown, remote: boolean): number {
  * in 90 days hit it, and none came from Zapier (2026-11-26).
  */
 export const HOSTED_CALL_DEADLINE_MS = 55_000
-
-/** A DNS lookup that hangs would hold a hosted request past the caller's deadline. */
-const DNS_LOOKUP_DEADLINE_MS = 5_000
-
-/** SSRF guard: only http(s) to public, externally-resolvable addresses.
- *  Checks one URL. Redirect hops never reach a route handler, so hosted
- *  contexts also send every connection through the egress proxy
- *  (egressProxy.ts, wired in browser.ts openSession), which checks each hop. */
-async function assertSafeUrl(raw: string): Promise<void> {
-  let u: URL
-  try {
-    u = new URL(raw)
-  } catch {
-    throw new Error(`invalid URL "${raw}"`)
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`scheme "${u.protocol}" not allowed`)
-  let addrs: string[]
-  if (isIP(u.hostname)) {
-    addrs = [u.hostname]
-  } else {
-    try {
-      addrs = (await withDeadline(() => dnsPromises.lookup(u.hostname, { all: true }), DNS_LOOKUP_DEADLINE_MS, 'dns lookup')).map((r) => r.address)
-    } catch {
-      throw new Error(`cannot resolve host "${u.hostname}"`)
-    }
-  }
-  if (addrs.length === 0) throw new Error(`no addresses for "${u.hostname}"`)
-  for (const a of addrs) if (isBlockedAddress(a)) throw new Error(`"${u.hostname}" resolves to blocked internal address ${a}`)
-}
 
 /** Install an SSRF guard on a Playwright context: every request the page makes — top-level
  *  navigations AND sub-resources (e.g. <img>/<script> in attacker-supplied HTML) — is
@@ -620,6 +582,17 @@ const REMOTE_LOCALHOST_CAVEAT =
 
 const ALL_TOOLS = [
     {
+      name: 'check_install',
+      description: 'Check whether the WebAbility embed script is present, blocked by an enforced security policy or consent manager, failing with an error, or not installed, with evidence. This is not an accessibility-conformance check. Use local stdio for localhost. Hosted checks require a public page URL.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          url: { type: 'string', description: 'Website URL to inspect (HTTP or HTTPS; bare domains default to HTTPS).' },
+        },
+        required: ['url'],
+      },
+    },
+    {
       name: 'scan_page',
       description: 'Scan a web page for WCAG accessibility issues. Works on any URL — deployed sites, localhost, staging. Returns `issues` (violations the scanner stands behind; findings the engines cannot decide are settled by the AI judge — a violation with a fix, or a pass recorded in `judged[]` with its reason — and anything unsettled is dropped, never listed for review) and a `summary`. On React ≤18 / Vue dev builds each issue carries `source` ({file, line, column, component}) read from the live component tree. Every issue carries a structured `fix.op` (add-attribute | set-attribute | remove-attribute | add-element | remove-element | add-text-content | suggest) with `fix.attribute` / `fix.value` when known, and a `fixability` tier (mechanical = apply as given; contextual = op known, value needs judgment; visual = needs rendered output, propose only).',
       inputSchema: {
@@ -910,6 +883,7 @@ const ALL_TOOLS = [
 type Hints = { title: string; readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean }
 const read = (title: string, openWorldHint: boolean): Hints => ({ title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint })
 const TOOL_ANNOTATIONS: Record<string, Hints> = {
+  check_install: read('Check the WebAbility installation', true),
   scan_page: read('Scan a page for accessibility issues', true),
   verify_fix: read('Verify an accessibility fix', true),
   diff_scan: read('Compare two accessibility scans', true),
@@ -1262,6 +1236,14 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
   // Normalise every URL arg once, before the guard, so the guard and the
   // handler see the same value. A bare domain used to fail `new URL()` in the
   // guard and come back as "invalid URL".
+  if (name === 'check_install') {
+    try {
+      const target = installUrl(args?.url)
+      if (args) args.url = target
+    } catch (err) {
+      return toolError(`check_install failed: ${(err as Error).message}`)
+    }
+  }
   if (args) {
     const a = args as Record<string, unknown>
     for (const k of HOSTED_URL_ARG_KEYS) if (typeof a[k] === 'string' && a[k]) a[k] = normalizeUrlArg(a[k] as string)
@@ -1289,8 +1271,29 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         // machine and scans localhost fine. Cloud-metadata and CGNAT stay
         // generic — see blockedUrlMessage.ts.
         const detail = (e as Error).message
-        return toolError(blockedUrlMessage(detail, resolvedAddressFrom(detail)))
+        return toolError(blockedUrlMessage(detail, resolvedAddressFrom(detail), name !== 'check_install'))
       }
+    }
+  }
+
+  if (name === 'check_install') {
+    try {
+      const url = args!.url as string
+      const result = opts.remote
+        ? await checkInstallApi(url, opts.anonymous ? undefined : opts.authToken).then(diagnostic => ({
+            ...diagnostic, state: diagnostic.state === 'installed' ? 'present' : diagnostic.state,
+          }))
+        : await checkInstall(url, {
+            observe: target => observeInstall(target, {
+              setupContext: context => tunnel ? installSsrfRoute(context, tunnel) : undefined,
+            }),
+          })
+      return {
+        structuredContent: result,
+        content: [{ type: 'text', text: '```json\n' + JSON.stringify(result, null, 2) + '\n```' }],
+      }
+    } catch (err) {
+      return toolError(`check_install failed: ${(err as Error).message}`)
     }
   }
 

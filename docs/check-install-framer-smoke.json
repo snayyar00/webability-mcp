@@ -1,0 +1,17 @@
+{
+  "url": "https://jubilant-organization-752879.framer.app/",
+  "finalUrl": "https://jubilant-organization-752879.framer.app/",
+  "state": "blocked",
+  "sentence": "A cookie consent tool holds the WebAbility script until a visitor accepts cookies.",
+  "nextStep": "In your consent tool, mark the WebAbility script as necessary, or remove the consent attributes from its tag. Then check again.",
+  "evidence": [
+    {
+      "kind": "consent",
+      "scriptUrl": "https://widget.webability.io/widget.min.js",
+      "type": "text/plain",
+      "attributes": {
+        "data-cookieconsent": "preferences"
+      }
+    }
+  ]
+}
