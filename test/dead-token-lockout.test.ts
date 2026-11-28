@@ -21,7 +21,7 @@ const REDIRECT = 'https://claude.ai/api/mcp/auth_callback'
 const VERIFIER = 'dead-token-lockout-verifier-0123456789abcdefghijklmnop'
 const CHALLENGE = createHash('sha256').update(VERIFIER).digest('base64url')
 
-const VALID = new Set(['good-a', 'good-after-burst', 'good-b', 'good-oauth', 'good-other', 'good-fallback', 'good-gateway', 'good-signed-in', 'good-refreshed'])
+const VALID = new Set(['good-a', 'good-after-burst', 'good-b', 'good-oauth', 'good-other', 'good-fallback', 'good-gateway', 'good-signed-in', 'good-refreshed', 'good-revoked'])
 const whoamiSeen: string[] = []
 
 /** An ephemeral port: a fixed range (24000-26000) collides with the same suite
@@ -58,6 +58,13 @@ before(async () => {
         // Hold the verdict so every burst request is in flight before the first one lands.
         if (token === 'dead-burst') setTimeout(answer, 100)
         else answer()
+      } else if (req.url?.startsWith('/cli/audit/')) {
+        // The platform revokes this token: the account route refuses it, and
+        // from now on so does /cli/whoami.
+        const token = (req.headers.authorization || '').replace('Bearer ', '')
+        if (token === 'good-revoked') VALID.delete(token)
+        res.statusCode = VALID.has(token) ? 200 : 401
+        res.end(VALID.has(token) ? JSON.stringify({ id: 1, status: 'done' }) : '{}')
       } else if (req.url === '/cli/device-code') {
         res.end(JSON.stringify({ deviceCode: 'dc', userCode: 'ABCD-1234', verificationUrl: 'https://app.webability.io/cli/verify?code=ABCD-1234' }))
       } else if (req.url === '/cli/device-token') {
@@ -269,4 +276,19 @@ test('the /authorize/start flood limit carries a sign-in challenge, not just a b
   const challenge = r.headers.get('www-authenticate') || ''
   assert.match(challenge, /resource_metadata="[^"]+"/)
   assert.doesNotMatch(challenge, /invalid_token/, 'this caller sent no token')
+})
+
+test('a token the platform refuses on a tool call is not trusted by the HTTP gate for the cache TTL', async () => {
+  const ip = '203.0.113.77'
+  // Validated once: the gate caches it.
+  assert.equal((await listTools(ip, bearer('good-revoked'))).status, 200)
+  // A tool call reaches the platform, which now refuses the token.
+  const call = await fetch(`${BASE}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'cf-connecting-ip': ip, ...bearer('good-revoked') },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_audit', arguments: { id: 1 } } }),
+  })
+  await call.body?.cancel()
+  // The very next request re-validates and is refused, not served from the cache.
+  assert.equal((await listTools(ip, bearer('good-revoked'))).status, 401, 'the gate must share the cache the tool call evicted')
 })

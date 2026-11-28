@@ -38,6 +38,7 @@ import { openSession, schemeForBareUrl } from './browser.js'
 import { isBlockedAddress, normalizeHost } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, appsAuthChallenge, appsSignInRequired, signInRequired } from './signIn.js'
+import { forgetValidatedToken } from './tokenCache.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
 
 /** Every arg that can carry a URL the server will navigate to; the hosted SSRF guard checks all of them. */
@@ -1933,6 +1934,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         return toolError('start_audit is rate-limited (too many audits queued). Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
+        // A revoked token must stop being trusted by the HTTP gate's cache: it
+        // otherwise stays "valid" there for the rest of TOKEN_TTL_MS (#229).
+        forgetValidatedToken(token)
         return toolError(`start_audit could not authenticate (${res.status}). Your WebAbility token is missing, expired, or lacks access. Re-run \`webability login\` (or refresh WEBABILITY_API_KEY) and retry.`)
       }
       if (!res.ok) {
@@ -1970,6 +1974,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         return toolError('get_audit is rate-limited. Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
+        forgetValidatedToken(token)
         return toolError(`get_audit could not authenticate (${res.status}). Re-run \`webability login\` (or refresh WEBABILITY_API_KEY) and retry.`)
       }
       if (res.status === 404) {
@@ -2399,6 +2404,8 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           : { 'Content-Type': 'application/json' },
         body: relayBody,
       })
+      // A refused token must stop the HTTP gate's cache trusting it (#229).
+      if (token && (res.status === 401 || res.status === 403)) forgetValidatedToken(token)
       if (res.status === 401 && token) {
         // A held token can be stale (revoked or rotated). Retry once header-free so a fix
         // the platform would still serve is not lost; the caller gets a tool result either
@@ -2547,6 +2554,7 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         return toolError('visual_audit is rate-limited. Wait and retry.')
       }
       if (res.status === 401 || res.status === 403) {
+        forgetValidatedToken(token)
         return toolError(`visual_audit could not authenticate (${res.status}). Your WebAbility token is missing, expired, or lacks access. Re-run \`webability login\` (or refresh WEBABILITY_API_KEY) and retry.`)
       }
       if (!res.ok) {

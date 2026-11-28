@@ -33,7 +33,8 @@ import { APPS_MCP_PATH, MCP_PATH, MCP_PATHS, PUBLIC_URL, SIGN_IN_MCP_PATH, appsC
 import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
 import { BodyTooLargeError, MCP_MAX_BODY_BYTES, declaredTooLarge, readBodyCapped } from './bodyLimit.js'
 import { setSecurityHeaders } from './securityHeaders.js'
-import { createTokenCache } from './tokenCache.js'
+import { TOKEN_TTL_MS, validatedTokens as tokenCache } from './tokenCache.js'
+import { checkToken, type TokenCheck } from './tokenCheck.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
@@ -42,12 +43,10 @@ const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 
 // normal path, so this is no longer required for the server to start.
 const SHARED_TOKEN = process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.length >= 32 ? process.env.MCP_AUTH_TOKEN : ''
 
-// Validated-token cache: token → expiry epoch ms. Avoids a /cli/whoami round-trip
-// on every request in the stateless model; short TTL so revocation propagates.
-// Bounded, because every distinct token a caller sends would otherwise add an
-// entry for the life of the process.
-const tokenCache = createTokenCache({ max: 10_000 })
-const TOKEN_TTL_MS = 5 * 60 * 1000
+// Validated-token cache: token → expiry epoch ms, process-wide (tokenCache.ts).
+// One instance so a 401/403 from a platform call made by a tool (server.ts,
+// account.ts) evicts the entry this gate would otherwise trust for the rest of
+// TOKEN_TTL_MS.
 
 // scan_html's per-call budget, when an operator needs to lower it below the
 // 24 s default (a smaller box, or a proxy with a shorter read timeout than the
@@ -104,44 +103,6 @@ function matchesShared(token: string): boolean {
   const a = Buffer.from(token)
   const b = Buffer.from(SHARED_TOKEN)
   return a.length === b.length && timingSafeEqual(a, b)
-}
-
-/**
- * Validate a caller's WebAbility token against the API (cached).
- * Only 401/403 from the API are a verdict on the token ('invalid').
- * 'unavailable' = no verdict: network error, 5xx, throttling (429) or another
- * transient status (408, 425, ...). That is not a
- * verdict on the token: answering it with 401 would make Claude Code mark the
- * server needs-auth (zero tools in later sessions) and claude.ai invalidate
- * the connector, for every signed-in user, during an API outage.
- */
-type TokenCheck = { state: 'valid' | 'invalid' } | { state: 'unavailable'; retryAfter: string }
-const DEFAULT_RETRY_AFTER_S = '30'
-
-/** Upstream Retry-After when it is delta-seconds or an HTTP date; otherwise our default. */
-function retryAfterFrom(res: Response): string {
-  const raw = (res.headers.get('retry-after') || '').trim()
-  if (/^\d{1,6}$/.test(raw)) return raw
-  const when = Date.parse(raw)
-  if (!Number.isNaN(when)) return String(Math.max(1, Math.ceil((when - Date.now()) / 1000)))
-  return DEFAULT_RETRY_AFTER_S
-}
-
-async function checkUserToken(token: string): Promise<TokenCheck> {
-  if (!token) return { state: 'invalid' }
-  const cached = tokenCache.get(token)
-  if (cached !== undefined) return { state: 'valid' }
-  try {
-    const res = await fetch(`${API_URL}/cli/whoami`, { headers: { Authorization: `Bearer ${token}` } })
-    if (res.ok) {
-      tokenCache.set(token, Date.now() + TOKEN_TTL_MS)
-      return { state: 'valid' }
-    }
-    if (res.status === 401 || res.status === 403) return { state: 'invalid' }
-    return { state: 'unavailable', retryAfter: retryAfterFrom(res) }
-  } catch {
-    return { state: 'unavailable', retryAfter: DEFAULT_RETRY_AFTER_S }
-  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown) {
@@ -430,7 +391,7 @@ const httpServer = createHttpServer(async (req, res) => {
       id: null,
     })
     return
-  } else if ((tokenCheck = await checkUserToken(token)).state === 'valid') {
+  } else if ((tokenCheck = await checkToken(API_URL, tokenCache, token)).state === 'valid') {
     authToken = token // per-user mode: account tools use the caller's key
   } else if (tokenCheck.state === 'unavailable') {
     res.setHeader('Retry-After', tokenCheck.retryAfter)

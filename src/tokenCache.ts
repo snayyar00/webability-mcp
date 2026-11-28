@@ -61,3 +61,30 @@ export function createTokenCache({ max, now = Date.now }: TokenCacheOptions): To
     },
   }
 }
+
+/**
+ * How long a platform "this token is valid" answer is trusted. Short, because
+ * revocation is only noticed on the next platform round-trip.
+ */
+export const TOKEN_TTL_MS = 5 * 60 * 1000
+
+/**
+ * The process-wide cache. One instance so that a refusal seen by a tool call
+ * (`server.ts`, `account.ts`) can evict the entry the HTTP gate (`http.ts`)
+ * would otherwise trust for the rest of the TTL.
+ */
+export const validatedTokens = createTokenCache({ max: 10_000 })
+
+/**
+ * A platform call made with `token` answered 401/403, so the token is no
+ * longer known good. The next request re-validates it against the platform
+ * instead of trusting a cached answer for up to TOKEN_TTL_MS — that is the
+ * revocation window this closes.
+ *
+ * Deliberately evicts only: 403 can be a plan or ownership refusal on a token
+ * that is still authentic, so marking it rejected would tell a signed-in user
+ * to sign in again. One extra `/cli/whoami` is the whole cost.
+ */
+export function forgetValidatedToken(token: string): void {
+  if (token) validatedTokens.delete(token)
+}

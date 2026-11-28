@@ -9,6 +9,8 @@
  * API's checkout.session.completed webhook activates the plan on the site.
  */
 
+import { forgetValidatedToken } from './tokenCache.js'
+
 export const DASHBOARD_ORIGIN = (process.env.WEBABILITY_DASHBOARD_URL || 'https://app.webability.io').replace(/\/+$/, '')
 
 /** The dashboard's only self-serve plan (`VITE_PLAN_NAME` on the dashboard, `products.type` in the API). */
@@ -48,6 +50,7 @@ function headers(token: string): Record<string, string> {
 async function graphql<T>(apiUrl: string, token: string, query: string, variables: Record<string, unknown>): Promise<T> {
   const res = await fetch(`${apiUrl}/graphql`, { method: 'POST', headers: headers(token), body: JSON.stringify({ query, variables }) })
   if (res.status === 401 || res.status === 403) {
+    forgetValidatedToken(token)
     throw new AccountError(`WebAbility could not authenticate this account (${res.status}). Sign in again, then retry.`)
   }
   const payload = (await res.json().catch(() => null)) as { data?: T; errors?: Array<{ message?: string }> } | null
@@ -102,6 +105,7 @@ export async function createUpgradeLink(
     redirect: 'manual',
   })
   const body = (await res.json().catch(() => null)) as { url?: string; error?: string } | null
+  if (res.status === 401 || res.status === 403) forgetValidatedToken(token)
   if (res.status === 401) throw new AccountError('WebAbility could not authenticate this account (401). Sign in again, then retry.')
   if (body?.error) throw new AccountError(body.error)
   if (!res.ok && res.status !== 303) throw new AccountError(`WebAbility checkout failed (${res.status}).`)
