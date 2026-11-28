@@ -1,3 +1,5 @@
+import { classifyAddress } from './egressProxy.js'
+
 /**
  * What to tell someone whose URL the hosted server refused.
  *
@@ -26,19 +28,10 @@
  * naming the metadata range confirms which cloud we run on.
  */
 export function isDeveloperLocalAddress(addr: string): boolean {
-  const a = (addr || '').toLowerCase()
-  if (a === '::1' || a === '::') return true
-  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
-  const ipv4 = mapped ? mapped[1] : a
-  const m = ipv4.match(/^(\d+)\.(\d+)\.\d+\.\d+$/)
-  if (!m) return false
-  const o1 = parseInt(m[1], 10)
-  const o2 = parseInt(m[2], 10)
-  if (o1 === 0 || o1 === 127) return true                  // this-host / loopback
-  if (o1 === 10) return true                               // private
-  if (o1 === 172 && o2 >= 16 && o2 <= 31) return true       // private
-  if (o1 === 192 && o2 === 168) return true                 // private
-  return false                                              // 169.254.x, 100.64-127.x: stay generic
+  // One classifier with the guard and the proxy, so the message can never
+  // disagree with the refusal it explains.
+  const kind = classifyAddress(addr)
+  return kind === 'loopback' || kind === 'private' || kind === 'link-local'
 }
 
 /**

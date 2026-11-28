@@ -1,6 +1,6 @@
 import type { IncomingHttpHeaders } from 'node:http'
 import { contrastLaunchesBrowser } from './contrastPalette.js'
-import { signInSteps } from './signIn.js'
+import { ACCOUNT_TOOLS, signInSteps } from './signIn.js'
 
 /**
  * The address the hosted anonymous rate limit keys on. It must be one
@@ -24,20 +24,51 @@ export function clientIp(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const socket = (remoteAddress || 'unknown').trim()
-  if ((env.TRUST_CF_CONNECTING_IP || '').trim().toLowerCase() === 'true') {
+  const policy = clientIpPolicy(env)
+  if (policy.source === 'cf-connecting-ip') {
     const cf = String(headers['cf-connecting-ip'] || '').trim()
     if (cf) return cf
   }
+  if (policy.source === 'x-forwarded-for') {
+    const raw = headers['x-forwarded-for']
+    const entries = (Array.isArray(raw) ? raw.join(',') : String(raw || ''))
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (entries.length >= policy.hops) return entries[entries.length - policy.hops]
+  }
+  return socket
+
+}
+
+type ClientIpPolicy =
+  | { source: 'cf-connecting-ip' }
+  | { source: 'socket' }
+  | { source: 'x-forwarded-for'; hops: number }
+
+/**
+ * The env-var decision behind `clientIp`, parsed once so the boot log and the
+ * lookup cannot disagree. TRUSTED_PROXY_HOPS defaults to 1 and falls back to 1
+ * for unparsable or negative values; 0 means no proxy.
+ */
+function clientIpPolicy(env: NodeJS.ProcessEnv): ClientIpPolicy {
+  if ((env.TRUST_CF_CONNECTING_IP || '').trim().toLowerCase() === 'true') return { source: 'cf-connecting-ip' }
   const parsed = Number.parseInt(String(env.TRUSTED_PROXY_HOPS ?? '1'), 10)
   const hops = Number.isFinite(parsed) && parsed >= 0 ? parsed : 1
-  if (hops === 0) return socket
-  const raw = headers['x-forwarded-for']
-  const entries = (Array.isArray(raw) ? raw.join(',') : String(raw || ''))
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  if (entries.length < hops) return socket
-  return entries[entries.length - hops]
+  return hops === 0 ? { source: 'socket' } : { source: 'x-forwarded-for', hops }
+}
+
+/**
+ * One line, logged at boot, naming the source `clientIp` will key the
+ * anonymous limiter on. Both env vars fail silently when wrong, so the
+ * effective policy is stated rather than assumed.
+ */
+export function describeClientIpPolicy(env: NodeJS.ProcessEnv = process.env): string {
+  const policy = clientIpPolicy(env)
+  if (policy.source === 'cf-connecting-ip') return 'CF-Connecting-IP (TRUST_CF_CONNECTING_IP=true; the origin must accept Cloudflare traffic alone)'
+  if (policy.source === 'socket') return 'the socket address (TRUSTED_PROXY_HOPS=0)'
+  const { hops } = policy
+  return `the rightmost ${hops} entr${hops === 1 ? 'y' : 'ies'} of X-Forwarded-For (TRUSTED_PROXY_HOPS=${hops}), falling back to the socket address`
 }
 
 export interface ToolCall {
@@ -79,6 +110,32 @@ export function anonLimitClass(call: ToolCall): 'heavy' | 'ai' | null {
 
 const WINDOW_MS = 60 * 60 * 1000
 
+/** One anonymous AI-fix unit is 16 KB of relayed payload. */
+const AI_WEIGHT_UNIT_BYTES = 16 * 1024
+
+function argBytes(v: unknown): number {
+  if (v === undefined || v === null) return 0
+  if (typeof v === 'string') return Buffer.byteLength(v, 'utf8')
+  try {
+    return Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8')
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * What one anonymous call costs its per-IP bucket. AI fixes are relayed to a
+ * metered model with the caller's own payload, so the charge is that payload's
+ * weight — one unit per 16 KB, rounded up — not a flat one: a flat count let a
+ * single 2 MB call buy a whole hour's budget. Every other tool costs one.
+ */
+export function anonCallCost(call: ToolCall): number {
+  if (anonLimitClass(call) !== 'ai') return 1
+  const a = (call.args ?? {}) as Record<string, unknown>
+  const bytes = argBytes(a.html) + argBytes(a.context) + argBytes(a.issue)
+  return Math.max(1, Math.ceil(bytes / AI_WEIGHT_UNIT_BYTES))
+}
+
 export type AnonGateResult = { ok: boolean; retryAfterS: number; resetAt: number }
 
 /**
@@ -90,7 +147,7 @@ export type AnonGateResult = { ok: boolean; retryAfterS: number; resetAt: number
 export function createAnonLimiter(now: () => number = Date.now) {
   const buckets = new Map<string, { n: number; resetAt: number }>()
   return {
-    allow(key: string, limit: number): AnonGateResult {
+    allow(key: string, limit: number, cost = 1): AnonGateResult {
       const t = now()
       let b = buckets.get(key)
       if (!b || b.resetAt <= t) {
@@ -100,7 +157,9 @@ export function createAnonLimiter(now: () => number = Date.now) {
           for (const [k, v] of buckets) if (v.resetAt <= t) buckets.delete(k)
         }
       }
-      b.n += 1
+      // Charge what the request tried to spend, refused or not: otherwise a
+      // caller retries a refused heavy call for free until the window closes.
+      b.n += cost
       return { ok: b.n <= limit, retryAfterS: Math.max(0, Math.ceil((b.resetAt - t) / 1000)), resetAt: b.resetAt }
     },
     /** Would the NEXT allow() for this key be refused? Counts nothing. */
@@ -113,11 +172,54 @@ export function createAnonLimiter(now: () => number = Date.now) {
   }
 }
 
-function limitParts(o: { cls: 'heavy' | 'ai'; limit: number; retryAfterS: number; resetAt: number }) {
-  const what = o.cls === 'ai' ? (o.limit === 1 ? 'AI fix call' : 'AI fix calls') : o.limit === 1 ? 'page-loading call' : 'page-loading calls'
+function limitParts(o: { cls: 'heavy' | 'ai' | 'account'; limit: number; retryAfterS: number; resetAt: number }) {
+  const what =
+    o.cls === 'ai'
+      ? o.limit === 1
+        ? 'AI fix call'
+        : 'AI fix calls'
+      : o.cls === 'account'
+        ? o.limit === 1
+          ? 'account call'
+          : 'account calls'
+        : o.limit === 1
+          ? 'page-loading call'
+          : 'page-loading calls'
   const wait = o.retryAfterS < 60 ? `${o.retryAfterS} s` : `${Math.ceil(o.retryAfterS / 60)} min`
   const at = new Date(o.resetAt).toISOString().slice(11, 16)
   return { what, wait, at }
+}
+
+/**
+ * Which per-IP operator bucket a tool call counts against, or null.
+ *
+ * A caller holding the shared MCP_AUTH_TOKEN is not anonymous — the anonymous
+ * gate above skips it — and not identified — no account token, so account
+ * tools run against the deploy's own API key. The harm is spend and side
+ * effects on our account, which is the ACCOUNT_TOOLS family plus the heavy and
+ * AI families; this gives each of them a budget (#227).
+ */
+export function operatorLimitClass(call: ToolCall): 'heavy' | 'ai' | 'account' | null {
+  const cls = anonLimitClass(call)
+  if (cls) return cls
+  if (ACCOUNT_TOOLS.has(call.name)) return 'account'
+  return null
+}
+
+/**
+ * The operator-cap answer. Deliberately not the anonymous message: this caller
+ * already has a credential, so "sign in with a free account" is not the fix —
+ * the fix is a per-user token, and the env var names what to raise.
+ */
+export function operatorLimitMessage(o: { cls: 'heavy' | 'ai' | 'account'; limit: number; retryAfterS: number; resetAt: number }): string {
+  const { what, wait, at } = limitParts(o)
+  const envVar = o.cls === 'ai' ? 'OPERATOR_AI_PER_HOUR' : o.cls === 'account' ? 'OPERATOR_ACCOUNT_PER_HOUR' : 'OPERATOR_HEAVY_PER_HOUR'
+  return (
+    `Operator token limit reached: ${o.limit} ${what} per hour from this IP address (${envVar}). Nothing ran. ` +
+    `It resets in ${wait} (at ${at} UTC). ` +
+    'Use a WebAbility user token instead of the shared operator token so calls are attributed to an account: ' +
+    signInSteps().join(' ')
+  )
 }
 
 /**

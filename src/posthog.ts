@@ -3,6 +3,7 @@ import { createRequire } from 'module'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import type { BeforeSendFn, PostHog as PostHogClient } from '@posthog/mcp'
 import type { ServerOptions } from './server.js'
+import { sanitizeTelemetryError } from './telemetry.js'
 
 const POSTHOG_HOST = process.env.POSTHOG_HOST || 'https://us.i.posthog.com'
 const require = createRequire(import.meta.url)
@@ -74,7 +75,36 @@ export const redactSensitiveMcpPayloads: BeforeSendFn = (event) => {
   delete event.properties.$mcp_parameters
   delete event.properties.$mcp_response
   if (isCallerMisuseNoise(event)) return null
-  return stabilizeScanTimeoutFingerprint(event)
+  const stabilized = stabilizeScanTimeoutFingerprint(event)
+  // The payload deletes above only covered tool args and results. $exception
+  // carries the same material in its message text — a failed page.goto embeds
+  // the full target URL (query string included), and an auth failure carries
+  // the header value. Same scrubber the tool-error telemetry uses, so there is
+  // one definition of "sensitive" across both egress paths.
+  scrubExceptionText(stabilized.properties)
+  return stabilized
+}
+
+/**
+ * Scrub the message-bearing fields of a PostHog error event in place.
+ *
+ * Only text: `type` (grouping), `$exception_fingerprint` and stack frames stay
+ * as they are — PostHog needs them to group and symbolicate, and frames carry
+ * no request data. Scrubbing runs after the timeout fingerprint is computed, so
+ * the fingerprint still reflects the original text.
+ */
+function scrubExceptionText(properties: Record<string, unknown>): void {
+  const list = properties.$exception_list
+  if (Array.isArray(list)) {
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue
+      const entry = item as { value?: unknown }
+      if (typeof entry.value === 'string') entry.value = sanitizeTelemetryError(entry.value)
+    }
+  }
+  if (typeof properties.$mcp_error_message === 'string') {
+    properties.$mcp_error_message = sanitizeTelemetryError(properties.$mcp_error_message)
+  }
 }
 
 // Hosted scan_page / diff_scan deadline timeouts are one product signal, not
@@ -144,6 +174,19 @@ function hashedAuthToken(token: string): string {
   return createHash('sha256').update(token).digest('hex').slice(0, 32)
 }
 
+/**
+ * Who PostHog should attribute this session's events to.
+ *
+ * An operator caller holds the shared deploy secret: there is no account to
+ * name, so it gets one constant distinct id — never the secret itself, hashed
+ * or otherwise, because a shared key is not a person (#227).
+ */
+export function analyticsIdentity(opts: Pick<ServerOptions, 'authToken' | 'operator'>): { distinctId: string; properties: Record<string, unknown> } | null {
+  if (opts.operator) return { distinctId: 'webability-operator', properties: { auth_source: 'operator_token' } }
+  if (opts.authToken) return { distinctId: `webability-token:${hashedAuthToken(opts.authToken)}`, properties: { auth_source: 'webability_token' } }
+  return null
+}
+
 export function enablePostHogMcpAnalytics(server: Server, opts: ServerOptions): void {
   const mod = posthogMcpModule()
   const client = posthogClient()
@@ -154,12 +197,8 @@ export function enablePostHogMcpAnalytics(server: Server, opts: ServerOptions): 
     eventProperties: () => ({
       webability_transport: opts.remote ? 'streamable-http' : 'stdio',
       webability_posthog_payloads_redacted: true,
+      ...(opts.operator ? { webability_operator: true } : {}),
     }),
-    identify: opts.authToken
-      ? {
-          distinctId: `webability-token:${hashedAuthToken(opts.authToken)}`,
-          properties: { auth_source: 'webability_token' },
-        }
-      : null,
+    identify: analyticsIdentity(opts),
   })
 }

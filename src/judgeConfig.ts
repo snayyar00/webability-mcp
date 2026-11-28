@@ -18,6 +18,7 @@
  *   WEBABILITY_JUDGE_TEXT_MODEL   default deepseek/deepseek-v4-flash
  *   WEBABILITY_JUDGE_TIMEOUT_MS   total budget per scan, default 20000
  */
+import { createHash } from 'crypto'
 import type { JudgeOptions } from '@webability/core'
 
 export interface JudgeEnvContext {
@@ -38,6 +39,13 @@ export function judgeOptionsFromEnv(ctx: JudgeEnvContext, env: NodeJS.ProcessEnv
       ...(ctx.anonymous ? {} : ctx.authToken ? { apiToken: ctx.authToken } : {}),
       ...(internalSecret ? { internalSecret } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
+      // One process serves every hosted caller, so the verdict cache is keyed
+      // by account: without this, a second account scanning identical markup
+      // read the first account's verdict and the fix text quoted from its page.
+      // Anonymous scans get their own namespace (they have no account to leak
+      // into). The token itself never goes in the key.
+      cacheScope:
+        ctx.anonymous || !ctx.authToken ? 'anonymous' : `token:${createHash('sha256').update(ctx.authToken).digest('hex').slice(0, 16)}`,
     }
   }
   const apiKey = env.OPENROUTER_API_KEY || ''

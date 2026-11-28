@@ -1,7 +1,7 @@
 /**
  * Keep a tunnel up across relay restarts.
  *
- * The relay redeploys on every webability-platform merge. On shutdown it
+ * The relay redeploys on every platform release. On shutdown it
  * closes each agent with RELAY_RESTART_CODE; that code, and only that code,
  * means "reconnect". Every other close (expiry, revoked token, a network that
  * really died) stays final, so a CI job depending on the tunnel still fails.

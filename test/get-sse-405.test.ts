@@ -19,6 +19,21 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 const here = dirname(fileURLToPath(import.meta.url))
 const GOOD = 'good-token'
 
+/** An ephemeral port: a fixed range (26000-28000) collides with the same suite
+ * in another checkout, and the health poll then talks to that other server. */
+async function freePort(): Promise<number> {
+  const probe = createServer()
+  const listening = Promise.withResolvers<void>()
+  probe.listen(0, '127.0.0.1', listening.resolve)
+  await listening.promise
+  const address = probe.address()
+  assert.ok(address && typeof address === 'object')
+  const closed = Promise.withResolvers<void>()
+  probe.close(closed.resolve)
+  await closed.promise
+  return address.port
+}
+
 let api: Server
 let child: ChildProcess
 let BASE = ''
@@ -35,13 +50,18 @@ before(async () => {
   })
   await new Promise<void>((r) => api.listen(0, '127.0.0.1', r))
   const apiPort = (api.address() as { port: number }).port
-  const port = 26000 + Math.floor(Math.random() * 2000)
+  const port = await freePort()
   BASE = `http://127.0.0.1:${port}`
   child = spawn(join(here, '..', 'node_modules', '.bin', 'tsx'), [join(here, '..', 'src', 'http.ts')], {
     env: { ...process.env, PORT: String(port), WEBABILITY_API_URL: `http://127.0.0.1:${apiPort}`, MCP_PUBLIC_URL: BASE, OAUTH_SIGNING_SECRET: 'get-sse-test-secret-0123456789abcdef' },
     stdio: ['ignore', 'ignore', 'inherit'],
   })
-  for (let i = 0; i < 100; i++) {
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path; stderr is inherited,
+  // so a child that dies says why.
+  for (let i = 0; i < 300; i++) {
+    if (child.exitCode !== null) throw new Error(`server exited (${child.exitCode}) before listening`)
     try {
       await fetch(`${BASE}/health`)
       return
@@ -49,7 +69,7 @@ before(async () => {
       await new Promise((r) => setTimeout(r, 100))
     }
   }
-  throw new Error('server did not start')
+  throw new Error('server did not start within 30s')
 })
 
 after(() => {

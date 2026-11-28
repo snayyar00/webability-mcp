@@ -120,3 +120,21 @@ test('judgeOptionsFromEnv: internalSecret only in remote mode', () => {
   assert.equal(judgeOptionsFromEnv({ remote: true, apiUrl: 'https://api.webability.io' }, { MCP_TRIAL_INTERNAL_SECRET: '  ' } as NodeJS.ProcessEnv)?.internalSecret, undefined, 'blank secret = not configured')
   assert.equal(judgeOptionsFromEnv({ remote: true, apiUrl: 'https://api.webability.io' }, { WEBABILITY_JUDGE: 'off', MCP_TRIAL_INTERNAL_SECRET: SECRET } as NodeJS.ProcessEnv), undefined)
 })
+
+test('judgeOptionsFromEnv: hosted callers are judged under a per-account cache scope', () => {
+  const env = {} as NodeJS.ProcessEnv
+  const scopeFor = (authToken?: string, anonymous?: boolean) => judgeOptionsFromEnv({ remote: true, anonymous, authToken, apiUrl: 'https://api.webability.io' }, env)?.cacheScope
+  const a = scopeFor('token-a')
+  const b = scopeFor('token-b')
+  assert.ok(a, 'a hosted signed-in caller gets a scope')
+  assert.equal(a, scopeFor('token-a'), 'the same account shares one scope')
+  assert.notEqual(a, b, 'two accounts never share a scope')
+  assert.ok(!a.includes('token-a'), 'the raw token is not the scope (it lands in a cache key)')
+  assert.equal(scopeFor(undefined, true), 'anonymous', 'anonymous scans have their own namespace')
+  assert.notEqual(scopeFor(undefined, true), a, 'anonymous never reads an account scope')
+})
+
+test('judgeOptionsFromEnv: a local install keeps the unscoped cache', () => {
+  const local = judgeOptionsFromEnv({ remote: false, apiUrl: 'https://api.webability.io' }, { OPENROUTER_API_KEY: 'k' } as NodeJS.ProcessEnv)
+  assert.equal(local?.cacheScope, undefined, 'one operator, one machine: no scope needed')
+})

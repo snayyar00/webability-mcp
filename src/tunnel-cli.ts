@@ -10,9 +10,9 @@
  * already has the MCP installed, and a second package is a second thing to
  * version, publish and get wrong.
  */
-import { resolveAuthToken } from './authToken'
 import { openTunnel, type TunnelHandle } from './tunnel/client'
 import { keepTunnel } from './tunnel/reconnect'
+import { readStdinLine, resolveTunnelToken } from './tunnelToken'
 
 function arg(name: string, fallback = ''): string {
   const i = process.argv.indexOf(`--${name}`)
@@ -20,18 +20,28 @@ function arg(name: string, fallback = ''): string {
 }
 
 const port = Number(arg('port'))
-const token = arg('token') || resolveAuthToken()
+const { token, warning } = await resolveTunnelToken({
+  argv: process.argv,
+  // Only read stdin when it is a pipe: an interactive terminal would block on
+  // the operator's keyboard before the tunnel ever opened.
+  readStdin: process.stdin.isTTY ? undefined : () => readStdinLine(process.stdin),
+})
+// stderr, so a script capturing stdout for the tunnel URL does not get a
+// deprecation notice mixed into its parse.
+if (warning) console.error(`\n  ${warning}\n`)
 const relayUrl = arg('relay', process.env.WEBABILITY_TUNNEL_RELAY || 'wss://tunnel.webability.io')
 
 if (!port) {
-  console.error('usage: webability-tunnel --port 3000 [--token <t>] [--relay <url>]')
+  console.error('usage: webability-tunnel --port 3000 [--relay <url>]')
+  console.error('\nThe token comes from WEBABILITY_API_KEY, from a piped stdin, or from `webability login`.')
+  console.error('--token <t> still works but is deprecated: it is visible in ps and CI logs.')
   console.error('\nMost people do NOT need this. Running the MCP locally (npx -y @webability/mcp)')
   console.error('reaches localhost directly, with nothing exposed. Use a tunnel only when the')
   console.error('scan has to run on the hosted server: CI, a remote agent, a dashboard scan.')
   process.exit(1)
 }
 if (!token) {
-  console.error('No token. Run `webability login`, pass --token, or set WEBABILITY_API_KEY (free account at https://app.webability.io).')
+  console.error('No token. Run `webability login`, set WEBABILITY_API_KEY, or pipe the token on stdin (free account at https://app.webability.io).')
   process.exit(1)
 }
 

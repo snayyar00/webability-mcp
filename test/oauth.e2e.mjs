@@ -173,16 +173,36 @@ try {
   check('authorize rejects unregistered redirect_uri', badRedirect.status === 400, badRedirect.status)
 
   // 6. device-flow session under the hood
-  const startRes = await fetch(`${BASE}/authorize/start`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate',
-      code_challenge: challenge, code_challenge_method: 'S256',
-    }),
+  // A browser replays its cookie jar to every request on this origin, and each
+  // /authorize/start appends its binding to the one cookie (#228).
+  let jar = ''
+  const keepCookies = (setCookies) => {
+    for (const header of setCookies) {
+      const pair = header.split(';')[0]
+      const name = pair.split('=')[0]
+      jar = [...jar.split('; ').filter((p) => p && p.split('=')[0] !== name), pair].join('; ')
+    }
+  }
+  const startSignIn = async (body) => {
+    const res = await fetch(`${BASE}/authorize/start`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: jar }, body: JSON.stringify(body) })
+    const setCookies = res.headers.getSetCookie()
+    keepCookies(setCookies)
+    return { res, json: await res.json().catch(() => ({})) }
+  }
+
+  const startCall = await startSignIn({
+    client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate',
+    code_challenge: challenge, code_challenge_method: 'S256',
   })
-  const start = await startRes.json().catch(() => ({}))
+  const startRes = startCall.res
+  const start = startCall.json
   check('authorize/start → 200 with session + continue url', startRes.status === 200 && !!start.sid && !!start.continueUrl && !!start.userCode, JSON.stringify(start))
+  // The browser binding (#228): an HttpOnly cookie, never part of a URL.
+  const setCookie = startRes.headers.getSetCookie().join('; ')
+  check('authorize/start sets an HttpOnly SameSite=Lax binding cookie', setCookie.includes('HttpOnly') && setCookie.includes('SameSite=Lax') && setCookie.includes('Path=/authorize'), setCookie)
+  const binding = jar.split('=')[1].split('.')[1]
+  // The sid is a handle; the binding is the secret, and it stays in the cookie.
+  check('the binding secret never appears in the continue url', !start.continueUrl.includes(binding), start.continueUrl)
   const cont = new URL(start.continueUrl)
   const returnTo = cont.searchParams.get('return_to') || ''
   check('continue url is the platform consent page with the user code', cont.origin === 'https://app.webability.io' && cont.searchParams.get('code') === 'ABCD-1234', start.continueUrl)
@@ -190,7 +210,14 @@ try {
   check('continue url names the client for the consent screen', cont.searchParams.get('client') === 'Claude (claude.ai)', cont.searchParams.get('client'))
 
   // The platform page sends the user back to return_to after consent.
-  const complete = (sid) => fetch(`${BASE}/authorize/complete?sid=${encodeURIComponent(sid)}`, { redirect: 'manual' })
+  const complete = async (sid, withCookie = jar) => {
+    const res = await fetch(`${BASE}/authorize/complete?sid=${encodeURIComponent(sid)}`, { redirect: 'manual', headers: { cookie: withCookie } })
+    // Success and expiry both rewrite the cookie (a spent sid is dropped).
+    if (withCookie === jar) keepCookies(res.headers.getSetCookie())
+    return res
+  }
+  const stolen = await complete(start.sid, '')
+  check('a session link in another browser cannot collect the code', stolen.status === 400 && (await stolen.text()).includes('same browser'), stolen.status)
   const pending = await complete(start.sid)
   const pendingHtml = await pending.text()
   check('complete before approval → 200 page linking back to consent', pending.status === 200 && pendingHtml.includes('Not connected yet') && pendingHtml.includes('return_to='), `${pending.status} ${pendingHtml.slice(0, 200)}`)
@@ -236,10 +263,9 @@ try {
   check('wrong-verifier attempt burns the code', afterBad.status === 400, afterBad.status)
 
   // A fresh sign-in for the real exchange.
-  const start2 = await (await fetch(`${BASE}/authorize/start`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate2', code_challenge: challenge, code_challenge_method: 'S256' }),
-  })).json()
+  const start2 = (await startSignIn({
+    client_id: reg.client_id, redirect_uri: redirectUri, state: 'xyzstate2', code_challenge: challenge, code_challenge_method: 'S256',
+  })).json
   for (const d of devices.values()) d.approved = true
   const done2 = await complete(start2.sid)
   const code2 = new URL(done2.headers.get('location')).searchParams.get('code')
@@ -299,10 +325,7 @@ try {
   check('DCR returns a client_secret for a confidential client', typeof confReg.client_secret === 'string' && confReg.client_secret.length > 10, JSON.stringify(confReg))
   const confRedirect = 'https://studio.gohighlevel.com/mcp/oauth/callback'
   const basicHeader = (id, secret) => `Basic ${Buffer.from(`${id}:${secret}`).toString('base64')}`
-  const confStart = await (await fetch(`${BASE}/authorize/start`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ client_id: confReg.client_id, redirect_uri: confRedirect, state: 'conf', code_challenge: challenge, code_challenge_method: 'S256' }),
-  })).json()
+  const confStart = (await startSignIn({ client_id: confReg.client_id, redirect_uri: confRedirect, state: 'conf', code_challenge: challenge, code_challenge_method: 'S256' })).json
   for (const d of devices.values()) d.approved = true
   const confDone = await complete(confStart.sid)
   const confCode = new URL(confDone.headers.get('location')).searchParams.get('code')

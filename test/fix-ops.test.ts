@@ -47,6 +47,37 @@ test('needs AI for the value → same attribute op, but contextual and no value'
   assert.equal(fix.fixability, 'contextual')
 })
 
+test('a model-written name is contextual, never mechanical: the rule tier is a floor', () => {
+  // The AI judge writes alt/aria-label for these rules and sets
+  // needsManualReview:false (the judge already reviewed it). That flag alone
+  // must not promote a judgment call to "apply blind": the rule says the value
+  // needs context, so the tier stays contextual.
+  const judgeAlt = structuredFix({ ...base, type: 'missing_alt', fix: { attribute: 'alt', currentValue: '', suggestedValue: 'Red running shoe, side view', needsManualReview: false } })
+  assert.deepEqual(judgeAlt, { op: 'add-attribute', attribute: 'alt', value: 'Red running shoe, side view', fixability: 'contextual' })
+
+  const judgeAriaLabel = structuredFix({ ...base, type: 'background_image_unlabeled', fix: { attribute: 'aria-label', currentValue: '', suggestedValue: 'Watch the launch video', needsManualReview: false } })
+  assert.equal(judgeAriaLabel.fixability, 'contextual')
+
+  const judgeRemove = structuredFix({ ...base, type: 'nested_landmark', fix: { attribute: 'remove_attribute', currentValue: 'navigation', suggestedValue: 'role', needsManualReview: false } })
+  assert.deepEqual(judgeRemove, { op: 'remove-attribute', attribute: 'role', fixability: 'contextual' })
+
+  const axeAlt = structuredFix({ ...base, id: 'axe-image-alt', type: 'image-alt', fix: { attribute: 'alt', currentValue: '', suggestedValue: 'A dog on a beach', needsManualReview: false } })
+  assert.equal(axeAlt.fixability, 'contextual')
+})
+
+test('a rule whose value is fixed by the rule itself stays mechanical', () => {
+  for (const [type, fix] of [
+    ['missing_autocomplete', { attribute: 'autocomplete', currentValue: '', suggestedValue: 'email', needsManualReview: false }],
+    ['redundant_role', { attribute: 'tabindex', currentValue: '5', suggestedValue: '0', needsManualReview: false }],
+    ['missing_media_controls', { attribute: 'controls', currentValue: '', suggestedValue: 'controls', needsManualReview: false }],
+  ] as const) {
+    assert.equal(structuredFix({ ...base, type, fix }).fixability, 'mechanical', type)
+  }
+  // axe: the removal convention and the lang mirror are deterministic too.
+  assert.equal(structuredFix({ ...base, id: 'axe-aria-hidden-body', type: 'aria-hidden-body', fix: { attribute: 'remove_attribute', currentValue: 'true', suggestedValue: 'aria-hidden', needsManualReview: false } }).fixability, 'mechanical')
+  assert.equal(structuredFix({ ...base, id: 'axe-html-xml-lang-mismatch', type: 'html-xml-lang-mismatch', fix: { attribute: 'xml:lang', currentValue: 'en-GB', suggestedValue: 'en', needsManualReview: false } }).fixability, 'mechanical')
+})
+
 test('textContent → add-text-content', () => {
   const fix = structuredFix({ ...base, type: 'empty_link', fix: { attribute: 'textContent', currentValue: '', needsManualReview: true } })
   assert.equal(fix.op, 'add-text-content')

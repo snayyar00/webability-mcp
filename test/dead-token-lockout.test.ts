@@ -21,8 +21,23 @@ const REDIRECT = 'https://claude.ai/api/mcp/auth_callback'
 const VERIFIER = 'dead-token-lockout-verifier-0123456789abcdefghijklmnop'
 const CHALLENGE = createHash('sha256').update(VERIFIER).digest('base64url')
 
-const VALID = new Set(['good-after-burst', 'good-oauth', 'good-other', 'good-fallback', 'good-gateway', 'good-signed-in', 'good-refreshed'])
+const VALID = new Set(['good-a', 'good-after-burst', 'good-b', 'good-oauth', 'good-other', 'good-fallback', 'good-gateway', 'good-signed-in', 'good-refreshed'])
 const whoamiSeen: string[] = []
+
+/** An ephemeral port: a fixed range (24000-26000) collides with the same suite
+ * in another checkout, and the health poll then talks to that other server. */
+async function freePort(): Promise<number> {
+  const probe = createServer()
+  const listening = Promise.withResolvers<void>()
+  probe.listen(0, '127.0.0.1', listening.resolve)
+  await listening.promise
+  const address = probe.address()
+  assert.ok(address && typeof address === 'object')
+  const closed = Promise.withResolvers<void>()
+  probe.close(closed.resolve)
+  await closed.promise
+  return address.port
+}
 
 let api: Server
 let child: ChildProcess
@@ -57,7 +72,7 @@ before(async () => {
   })
   await new Promise<void>((r) => api.listen(0, '127.0.0.1', r))
   const apiPort = (api.address() as { port: number }).port
-  const port = 24000 + Math.floor(Math.random() * 2000)
+  const port = await freePort()
   BASE = `http://127.0.0.1:${port}`
   child = spawn(join(here, '..', 'node_modules', '.bin', 'tsx'), [join(here, '..', 'src', 'http.ts')], {
     env: {
@@ -68,10 +83,16 @@ before(async () => {
       OAUTH_SIGNING_SECRET: 'dead-token-test-secret-0123456789abcdef',
       TRUST_CF_CONNECTING_IP: 'true',
       BAD_TOKEN_PER_HOUR: String(LIMIT),
+      ANON_AUTH_START_PER_HOUR: String(LIMIT),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   })
-  for (let i = 0; i < 100; i++) {
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path; stderr is inherited,
+  // so a child that dies says why.
+  for (let i = 0; i < 300; i++) {
+    if (child.exitCode !== null) throw new Error(`server exited (${child.exitCode}) before listening`)
     try {
       await fetch(`${BASE}/health`)
       return
@@ -79,7 +100,7 @@ before(async () => {
       await new Promise((r) => setTimeout(r, 100))
     }
   }
-  throw new Error('server did not start')
+  throw new Error('server did not start within 30s')
 })
 
 after(() => {
@@ -116,7 +137,10 @@ async function signIn(ip: string): Promise<{ client_id: string; access_token: st
     body: JSON.stringify({ client_id, redirect_uri: REDIRECT, state: 's', code_challenge: CHALLENGE, code_challenge_method: 'S256' }),
   })
   const { sid } = (await start.json()) as { sid: string }
-  const done = await fetch(`${BASE}/authorize/complete?sid=${sid}`, { redirect: 'manual' })
+  // /authorize/complete demands the HttpOnly binding cookie /authorize/start
+  // just set (#228): a link alone cannot collect the code.
+  const cookie = start.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+  const done = await fetch(`${BASE}/authorize/complete?sid=${sid}`, { redirect: 'manual', headers: { cookie } })
   const code = new URL(done.headers.get('location')!).searchParams.get('code')!
   const tok = await tokenGrant({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, client_id, code_verifier: VERIFIER })
   return { client_id, ...tok }
@@ -214,4 +238,35 @@ test('a refreshed OAuth token works from a locked-out IP', async () => {
   const fresh = await tokenGrant({ grant_type: 'refresh_token', refresh_token, client_id })
   assert.equal(fresh.access_token, 'good-refreshed')
   assert.equal((await listTools(ip, bearer(fresh.access_token))).status, 200)
+})
+
+test('Authorization wins over another account\'s cached token in x-webability-token', async () => {
+  // B's token is cached by an earlier request, so the cache alone cannot tell
+  // whose request this is. A stale header pasted into a client config must not
+  // run the call as B for the next TOKEN_TTL_MS.
+  assert.equal((await listTools('198.51.100.12', bearer('good-b'))).status, 200)
+  const before = whoamiSeen.filter((t) => t === 'good-a').length
+  const r = await listTools('198.51.100.11', { ...bearer('good-a'), 'x-webability-token': 'good-b' })
+  assert.equal(r.status, 200)
+  assert.equal(whoamiSeen.filter((t) => t === 'good-a').length - before, 1, 'the Authorization token is the one verified, so the call runs on that account')
+})
+
+test('the /authorize/start flood limit carries a sign-in challenge, not just a bare 429', async () => {
+  // A client that only starts OAuth from a challenge (claude.ai, Cursor, VS
+  // Code) has nothing to act on in a bare 429, and the sign-in it is already
+  // trying to start is exactly what the limit refused.
+  const ip = '198.51.100.13'
+  const start = () =>
+    fetch(`${BASE}/authorize/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+      body: JSON.stringify({ client_id: 'x.y', redirect_uri: REDIRECT, code_challenge: CHALLENGE }),
+    })
+  for (let i = 0; i < LIMIT; i++) await start()
+  const r = await start()
+  assert.equal(r.status, 429)
+  assert.ok(r.headers.get('retry-after'))
+  const challenge = r.headers.get('www-authenticate') || ''
+  assert.match(challenge, /resource_metadata="[^"]+"/)
+  assert.doesNotMatch(challenge, /invalid_token/, 'this caller sent no token')
 })

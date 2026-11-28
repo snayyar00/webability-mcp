@@ -57,8 +57,19 @@ test('developer-local classification covers the real dev-server addresses', () =
   }
 })
 
+test('and the IPv6 forms the guard actually reports', () => {
+  // `new URL('http://[::ffff:127.0.0.1]/').hostname` is the HEX form, so the
+  // classifier has to decode it too — otherwise a developer on a dual-stack
+  // dev server gets the generic "Blocked URL" line and uninstalls.
+  for (const a of ['::ffff:7f00:1', '[::ffff:7f00:1]', '[::1]', 'fe80::1', 'fec0::1', 'FE80::1']) {
+    assert.equal(isDeveloperLocalAddress(a), true, a)
+  }
+  const msg = blockedUrlMessage('"localhost" resolves to blocked internal address ::ffff:7f00:1', '::ffff:7f00:1')
+  assert.match(msg, /npx -y @webability\/mcp/)
+})
+
 test('and excludes what is NOT a dev server', () => {
-  for (const a of ['169.254.169.254', '100.64.0.1', '100.127.0.1', '8.8.8.8', '172.32.0.1', '172.15.0.1', '', 'not-an-ip']) {
+  for (const a of ['169.254.169.254', '100.64.0.1', '100.127.0.1', '8.8.8.8', '172.32.0.1', '172.15.0.1', '', 'not-an-ip', 'ff02::1', '198.18.0.1', '192.0.0.170', '2606:4700::1111']) {
     assert.equal(isDeveloperLocalAddress(a), false, a)
   }
 })

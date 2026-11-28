@@ -16,33 +16,89 @@ import { connect, isIP, type AddressInfo, type Socket } from 'node:net'
 
 import { withDeadline } from './deadline.js'
 
-/** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT.
+/** Strip the brackets WHATWG URL keeps on an IPv6 hostname (`[::1]` -> `::1`). */
+export function normalizeHost(host: string): string {
+  const bracketed = host.match(/^\[(.+)\]$/)
+  return (bracketed ? bracketed[1] : host).toLowerCase()
+}
+
+/** What a destination address is, for the two classifiers that act on it. */
+type AddressClass = 'loopback' | 'private' | 'link-local' | 'metadata' | 'cgnat' | 'reserved' | 'other'
+
+/** 8 groups of an IPv6 literal, or null when it does not parse. Accepts a trailing dotted quad. */
+function ipv6Groups(addr: string): number[] | null {
+  let text = addr
+  const dotted = addr.match(/^(.+):(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (dotted) {
+    const octets = [dotted[2], dotted[3], dotted[4], dotted[5]].map(Number)
+    if (octets.some((o) => o > 255)) return null
+    text = `${dotted[1]}:${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`
+  }
+  const halves = text.split('::')
+  if (halves.length > 2) return null
+  const parts = halves.map((h) => (h === '' ? [] : h.split(':')))
+  const fill = 8 - parts[0].length - (parts[1]?.length ?? 0)
+  // `::` compresses at least one group; without it the literal must be exactly 8.
+  if (halves.length === 2 ? fill < 1 : fill !== 0) return null
+  const groups: number[] = []
+  for (const g of [...parts[0], ...Array<string>(fill).fill('0'), ...(parts[1] ?? [])]) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null
+    groups.push(parseInt(g, 16))
+  }
+  return groups
+}
+
+/** IPv4 bytes carried inside IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form. */
+function embeddedIpv4(g: number[]): number[] | null {
+  const mapped = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff
+  const nat64 = g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0
+  if (!mapped && !nat64) return null
+  return [g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255]
+}
+
+function classifyIpv4([o1, o2, o3]: number[]): AddressClass {
+  if (o1 === 0 || o1 === 127) return 'loopback'                 // this-host / loopback
+  if (o1 === 10) return 'private'
+  if (o1 === 172 && o2 >= 16 && o2 <= 31) return 'private'
+  if (o1 === 192 && o2 === 168) return 'private'
+  if (o1 === 169 && o2 === 254) return 'metadata'               // link-local + cloud metadata (169.254.169.254)
+  if (o1 === 100 && o2 >= 64 && o2 <= 127) return 'cgnat'       // CGNAT (often internal)
+  if (o1 === 192 && o2 === 0 && o3 === 0) return 'reserved'     // 192.0.0.0/24 (IETF protocol assignments)
+  if (o1 === 198 && (o2 === 18 || o2 === 19)) return 'reserved' // 198.18.0.0/15 (benchmarking)
+  if (o1 >= 240) return 'reserved'                              // 240.0.0.0/4 + broadcast
+  return 'other'
+}
+
+/** Classify an IP literal. One classifier for the guard, the proxy and the message. */
+export function classifyAddress(addr: string): AddressClass {
+  const a = normalizeHost(addr)
+  const version = isIP(a)
+  if (version === 4) return classifyIpv4(a.split('.').map(Number))
+  const g = version === 6 ? ipv6Groups(a) : null
+  if (!g) return 'other'
+  if (g.every((x) => x === 0)) return 'loopback'                                   // `::`
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return 'loopback'         // `::1`
+  const inner = embeddedIpv4(g)
+  if (inner) return classifyIpv4(inner)
+  if ((g[0] & 0xfe00) === 0xfc00) return 'private'                                 // fc00::/7 unique-local
+  if (g[0] >= 0xfe80 && g[0] <= 0xfeff) return 'link-local'                        // fe80::/10 + deprecated fec0::/10 site-local
+  if ((g[0] & 0xff00) === 0xff00) return 'reserved'                                // ff00::/8 multicast
+  return 'other'
+}
+
+/** True if an IP literal is loopback / private / link-local / cloud-metadata / CGNAT / reserved.
  *  Accepts a bracketed literal (`[::1]`) and both IPv4-mapped IPv6 forms. */
 export function isBlockedAddress(addr: string): boolean {
-  const bracketed = addr.match(/^\[(.+)\]$/)
-  const a = (bracketed ? bracketed[1] : addr).toLowerCase()
-  if (a === '::1' || a === '::' || a.startsWith('fe80') || a.startsWith('fc') || a.startsWith('fd')) return true
-  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
-  // Node normalises `new URL('http://[::ffff:127.0.0.1]/').hostname` to this hex form.
-  const hexMapped = a.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
-  let ipv4 = a
-  if (mapped) ipv4 = mapped[1]
-  else if (hexMapped) {
-    const hi = parseInt(hexMapped[1], 16)
-    const lo = parseInt(hexMapped[2], 16)
-    ipv4 = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`
-  }
-  const m = ipv4.match(/^(\d+)\.(\d+)\.\d+\.\d+$/)
-  if (m) {
-    const o1 = parseInt(m[1], 10)
-    const o2 = parseInt(m[2], 10)
-    if (o1 === 0 || o1 === 127 || o1 === 10) return true          // this-host / loopback / private
-    if (o1 === 169 && o2 === 254) return true                     // link-local + cloud metadata (169.254.169.254)
-    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true           // private
-    if (o1 === 192 && o2 === 168) return true                     // private
-    if (o1 === 100 && o2 >= 64 && o2 <= 127) return true          // CGNAT (often internal)
-  }
-  return false
+  return classifyAddress(addr) !== 'other'
+}
+
+/** The ports a hosted scan may reach. Without this the proxy is a general TCP
+ *  relay: any token holder could reach SMTP, Redis, Postgres or MySQL. */
+export const ALLOWED_PORTS: ReadonlySet<number> = new Set([80, 443, 8080, 8443])
+
+/** Default proxy check: a blocked address, or a port a browser has no business on. */
+export function isBlockedDestination(address: string, port: number): boolean {
+  return isBlockedAddress(address) || !ALLOWED_PORTS.has(port)
 }
 
 /** A DNS lookup that hangs would hold a hosted request past the caller's deadline. */
@@ -63,7 +119,7 @@ export interface EgressProxy {
 }
 
 export interface EgressProxyOptions {
-  /** Refuse this destination. Default: isBlockedAddress (the port is ignored). Tests inject a port check. */
+  /** Refuse this destination. Default: isBlockedDestination (address + web-port allowlist). Tests inject their own. */
   isBlocked?: (address: string, port: number) => boolean
 }
 
@@ -71,7 +127,7 @@ class BlockedDestination extends Error {}
 
 /** Resolve `host`, refuse if ANY address is blocked, return the address to connect to. */
 async function checkedAddress(rawHost: string, port: number, isBlocked: (address: string, port: number) => boolean): Promise<string> {
-  const host = rawHost.replace(/^\[(.*)\]$/, '$1')
+  const host = normalizeHost(rawHost)
   let addrs: string[]
   if (isIP(host)) {
     addrs = [host]
@@ -98,7 +154,7 @@ function parseAuthority(authority: string): { host: string; port: number } | nul
 const HOP_BY_HOP = new Set(['proxy-connection', 'proxy-authorization', 'connection', 'keep-alive'])
 
 export function startEgressProxy(opts: EgressProxyOptions = {}): Promise<EgressProxy> {
-  const isBlocked = opts.isBlocked ?? ((address: string) => isBlockedAddress(address))
+  const isBlocked = opts.isBlocked ?? isBlockedDestination
   const sockets = new Set<Socket>()
   const track = (s: Socket) => {
     sockets.add(s)

@@ -63,10 +63,18 @@ before(async () => {
       WEBABILITY_API_URL: `http://127.0.0.1:${apiPort}`,
       MCP_PUBLIC_URL: BASE,
       OAUTH_SIGNING_SECRET: 'confidential-client-secret-0123456789ab',
+      // The scope cases walk /authorize/start once per requested scope; the
+      // default 20/hr per IP would 429 this file mid-run.
+      ANON_AUTH_START_PER_HOUR: '500',
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   })
-  for (let i = 0; i < 100; i++) {
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path; stderr is inherited,
+  // so a child that dies says why.
+  for (let i = 0; i < 300; i++) {
+    if (child.exitCode !== null) throw new Error(`server exited (${child.exitCode}) before listening`)
     try {
       await fetch(`${BASE}/health`)
       return
@@ -74,7 +82,7 @@ before(async () => {
       await new Promise((r) => setTimeout(r, 100))
     }
   }
-  throw new Error('server did not start')
+  throw new Error('server did not start within 30s')
 })
 
 after(() => {
@@ -106,15 +114,17 @@ async function register(extra: Record<string, unknown> = {}): Promise<Registrati
 }
 
 /** Walk /authorize/start → complete and return the authorization code. */
-async function codeFor(clientId: string): Promise<string> {
+async function codeFor(clientId: string, extra: Record<string, string> = {}): Promise<string> {
   const start = await fetch(`${BASE}/authorize/start`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ client_id: clientId, redirect_uri: REDIRECT, state: 's', code_challenge: CHALLENGE, code_challenge_method: 'S256' }),
+    body: JSON.stringify({ client_id: clientId, redirect_uri: REDIRECT, state: 's', code_challenge: CHALLENGE, code_challenge_method: 'S256', ...extra }),
   })
   assert.equal(start.status, 200)
   const { sid } = (await start.json()) as { sid: string }
-  const done = await fetch(`${BASE}/authorize/complete?sid=${sid}`, { redirect: 'manual' })
+  // The binding cookie /authorize/start set is the browser proof (#228).
+  const cookie = start.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+  const done = await fetch(`${BASE}/authorize/complete?sid=${sid}`, { redirect: 'manual', headers: { cookie } })
   assert.equal(done.status, 302)
   return new URL(done.headers.get('location')!).searchParams.get('code')!
 }
@@ -272,4 +282,129 @@ test('a percent-encoded client_id in the Basic header decodes (RFC 6749 §2.3.1)
     { authorization: basic(encoded, pct(reg.client_secret!)) },
   )
   assert.equal(r.status, 200)
+})
+
+/** GET /authorize, which renders the sign-in page or a 400 error page. */
+function authorizeRequest(params: Record<string, string>) {
+  return fetch(`${BASE}/authorize?${new URLSearchParams(params).toString()}`)
+}
+
+/** The params the page echoes back to /authorize/start, and the GET query. */
+function authParams(clientId: string, extra: Record<string, string> = {}) {
+  return { response_type: 'code', client_id: clientId, redirect_uri: REDIRECT, state: 's', code_challenge: CHALLENGE, code_challenge_method: 'S256', ...extra }
+}
+
+function startSignIn(params: Record<string, string>) {
+  return fetch(`${BASE}/authorize/start`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+}
+
+// C2: /token used to answer `scope: "mcp"` on a token that IS the caller's
+// 30-day account JWT — every account tool, no narrower grant than the CLI's.
+// RFC 6749 §5.1 makes `scope` optional when it is the requested/default one,
+// and a scope claim the server never enforces is a false least-privilege
+// signal to the client and its user.
+test('code exchange claims no scope the access token does not have (RFC 6749 §5.1)', async () => {
+  const reg = await register({ token_endpoint_auth_method: 'client_secret_basic' })
+  const code = await codeFor(reg.client_id)
+  const r = await tokenRequest(
+    { grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: VERIFIER },
+    { authorization: basic(reg.client_id, reg.client_secret!) },
+  )
+  const body = await jsonObject(r)
+  assert.equal(r.status, 200, JSON.stringify(body))
+  assert.equal('scope' in body, false, `the access token is the account JWT, not a scoped mcp grant: ${JSON.stringify(body)}`)
+})
+
+test('refresh grant claims no scope either', async () => {
+  const reg = await register({ token_endpoint_auth_method: 'client_secret_basic' })
+  const first = await jsonObject(
+    await tokenRequest(
+      { grant_type: 'authorization_code', code: await codeFor(reg.client_id), redirect_uri: REDIRECT, code_verifier: VERIFIER },
+      { authorization: basic(reg.client_id, reg.client_secret!) },
+    ),
+  )
+  const r = await tokenRequest({ grant_type: 'refresh_token', refresh_token: String(first.refresh_token) }, { authorization: basic(reg.client_id, reg.client_secret!) })
+  const body = await jsonObject(r)
+  assert.equal(r.status, 200, JSON.stringify(body))
+  assert.equal('scope' in body, false, JSON.stringify(body))
+})
+
+// RFC 6749 §3.3 lets a server ignore scopes it does not issue, and the grant
+// here is the caller's whole account token — there is no narrower set to hand
+// out. Real clients (ChatGPT, Claude, Cursor, generic MCP clients) send
+// `openid offline_access`, `profile` and friends unconditionally, so refusing
+// sign-in over them locks those clients out of an otherwise valid grant.
+const REQUESTED_SCOPES = ['openid offline_access', 'mcp', 'profile email', 'admin']
+
+test('/authorize renders sign-in for any requested scope (RFC 6749 §3.3)', async () => {
+  const reg = await register()
+  for (const scope of REQUESTED_SCOPES) {
+    const r = await authorizeRequest(authParams(reg.client_id, { scope }))
+    const html = await r.text()
+    assert.equal(r.status, 200, `scope=${scope}: ${html.slice(0, 200)}`)
+  }
+})
+
+test('/authorize/start signs in for every requested scope, absent or foreign', async () => {
+  const reg = await register()
+  for (const scope of [undefined, ...REQUESTED_SCOPES]) {
+    const extra = scope === undefined ? {} : { scope }
+    const r = await startSignIn(authParams(reg.client_id, extra))
+    const body = await jsonObject(r)
+    assert.equal(r.status, 200, `scope=${String(scope)}: ${JSON.stringify(body)}`)
+    assert.equal(typeof body.sid, 'string')
+  }
+})
+
+test('a code exchange that asks for other scopes issues the token and claims no scope', async () => {
+  for (const scope of ['openid offline_access', 'mcp', 'profile']) {
+    const reg = await register({ token_endpoint_auth_method: 'client_secret_basic' })
+    // codeFor walks /authorize/start → /authorize/complete, so this is the
+    // whole sign-in, not just the token step.
+    const code = await codeFor(reg.client_id, { scope })
+    const r = await tokenRequest(
+      { grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: VERIFIER, scope },
+      { authorization: basic(reg.client_id, reg.client_secret!) },
+    )
+    const body = await jsonObject(r)
+    assert.equal(r.status, 200, `scope=${scope}: ${JSON.stringify(body)}`)
+    assert.equal(body.access_token, USER_TOKEN)
+    assert.equal('scope' in body, false, `scope=${scope}: ${JSON.stringify(body)}`)
+  }
+})
+
+test('a refresh grant that asks for other scopes rotates the token and claims no scope', async () => {
+  for (const scope of ['openid offline_access', 'mcp', 'admin']) {
+    const reg = await register({ token_endpoint_auth_method: 'client_secret_basic' })
+    const first = await jsonObject(
+      await tokenRequest(
+        { grant_type: 'authorization_code', code: await codeFor(reg.client_id, { scope }), redirect_uri: REDIRECT, code_verifier: VERIFIER, scope },
+        { authorization: basic(reg.client_id, reg.client_secret!) },
+      ),
+    )
+    const r = await tokenRequest(
+      { grant_type: 'refresh_token', refresh_token: String(first.refresh_token), scope },
+      { authorization: basic(reg.client_id, reg.client_secret!) },
+    )
+    const body = await jsonObject(r)
+    assert.equal(r.status, 200, `scope=${scope}: ${JSON.stringify(body)}`)
+    assert.equal(body.access_token, ROTATED_TOKEN)
+    assert.equal('scope' in body, false, `scope=${scope}: ${JSON.stringify(body)}`)
+  }
+})
+
+test('a sign-in with no scope at all completes and claims no scope', async () => {
+  const reg = await register({ token_endpoint_auth_method: 'client_secret_basic' })
+  const r = await tokenRequest(
+    { grant_type: 'authorization_code', code: await codeFor(reg.client_id), redirect_uri: REDIRECT, code_verifier: VERIFIER },
+    { authorization: basic(reg.client_id, reg.client_secret!) },
+  )
+  const body = await jsonObject(r)
+  assert.equal(r.status, 200, JSON.stringify(body))
+  assert.equal(body.access_token, USER_TOKEN)
+  assert.equal('scope' in body, false, JSON.stringify(body))
 })

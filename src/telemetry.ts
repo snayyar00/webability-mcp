@@ -217,7 +217,10 @@ export function extractToolTelemetry(tool: string, response: unknown): { summary
         return { summary: m ? { total: parseInt(m[1], 10) } : null, meta: null }
       }
       case 'find_source': {
-        if (/^No source files matched/.test(firstText)) return { summary: { total: 0 }, meta: null }
+        // server.ts answers a zero-match search with `No source files under
+        // ${rootDir} matched ...`; match the shared prefix, not a phrasing that
+        // never shipped. Keep in step with that message (test/telemetry-tool-summary).
+        if (/^No source files .*matched/.test(firstText)) return { summary: { total: 0 }, meta: null }
         const matches = (firstText.match(/^- /gm) || []).length
         return { summary: matches > 0 ? { total: matches } : null, meta: null }
       }

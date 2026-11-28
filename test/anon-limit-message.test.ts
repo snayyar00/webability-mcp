@@ -68,14 +68,22 @@ after(() => proc?.kill())
 test('hosted: the 429 carries the reset window, Retry-After, and structured data', async () => {
   const port = await freePort()
   proc = spawn('./node_modules/.bin/tsx', ['src/http.ts'], {
-    env: { ...process.env, PORT: String(port), ANON_HEAVY_PER_HOUR: '1', TRUSTED_PROXY_HOPS: '0', WEBABILITY_SCAN_TELEMETRY: 'off', POSTHOG_PROJECT_API_KEY: '', POSTHOG_API_KEY: '' },
-    stdio: ['ignore', 'ignore', 'ignore'],
+    env: { ...process.env, PORT: String(port), OAUTH_SIGNING_SECRET: 'anon-limit-test-secret-0123456789abcdef', ANON_HEAVY_PER_HOUR: '1', TRUSTED_PROXY_HOPS: '0', WEBABILITY_SCAN_TELEMETRY: 'off', POSTHOG_PROJECT_API_KEY: '', POSTHOG_API_KEY: '' },
+    stdio: ['ignore', 'ignore', 'pipe'],
   })
+  let stderr = ''
+  proc.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
   const base = `http://127.0.0.1:${port}`
-  for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(base + '/health')).ok) break } catch { /* not up */ }
-    await new Promise((r) => setTimeout(r, 100))
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path.
+  let up = false
+  for (let i = 0; i < 300 && !up; i++) {
+    if (proc.exitCode !== null) throw new Error(`server exited (${proc.exitCode}) before listening: ${stderr.trim() || 'no stderr'}`)
+    try { up = (await fetch(base + '/health')).ok } catch { /* not up yet */ }
+    if (!up) await new Promise((r) => setTimeout(r, 100))
   }
+  assert.ok(up, `server did not start: ${stderr.trim() || 'no stderr'}`)
   // detect_framework is heavy; a loopback url is refused by the SSRF guard
   // after the gate has counted it, so no browser launches.
   const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'detect_framework', arguments: { url: 'http://127.0.0.1:9/' } } }

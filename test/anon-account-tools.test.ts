@@ -191,6 +191,13 @@ test('X-Forwarded-For: the caller-written leftmost entry does not mint a fresh a
   assert.equal(statuses[2], 429, statuses.join(','))
 })
 
+test('anonymous AI gate charges by payload weight: one 2 MB call spends an hourly budget of 2', async () => {
+  const heavy = () => call('generate_ai_fix', { issue: { message: 'x' }, html: 'a'.repeat(2 * 1024 * 1024), framework: 'plain-css' })
+  const r = await post(heavy(), { 'x-forwarded-for': `10.0.0.${nextId++ % 200}, 198.51.100.55` })
+  assert.equal(r.status, 429, `a single 2 MB call must trip the cap, got ${r.status}`)
+  assert.ok(r.json?.error?.message?.includes(`${BASE}/mcp/auth`), r.text.slice(0, 400))
+})
+
 test('/mcp/auth: anonymous initialize → 401 + WWW-Authenticate naming the /mcp/auth metadata', async () => {
   const r = await post(
     { jsonrpc: '2.0', id: nextId++, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } },

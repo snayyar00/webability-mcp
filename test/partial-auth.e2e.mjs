@@ -23,18 +23,29 @@ function check(name, cond, detail = '') {
 
 // mock platform API: whoami + ai-fix
 const USER_TOKEN = 'wa_live_partial_auth_token'
+// A token the platform accepts at whoami but rejects on /cli/ai-fix (a key
+// from before AI fixes were metered, or one revoked in between).
+const STALE_TOKEN = 'wa_live_stale_ai_token'
+// What /cli/ai-fix saw, in order. '' = the request carried no credentials.
+const aiFixAuth = []
 const mockApi = createServer((req, res) => {
-  let body = ''
-  req.on('data', (c) => (body += c))
+  req.resume()
   req.on('end', () => {
     res.setHeader('Content-Type', 'application/json')
     if (req.url === '/cli/whoami') {
-      res.statusCode = (req.headers.authorization || '') === `Bearer ${USER_TOKEN}` ? 200 : 401
+      const token = String(req.headers.authorization || '').replace(/^Bearer /, '')
+      res.statusCode = token === USER_TOKEN || token === STALE_TOKEN ? 200 : 401
       res.end('{}')
       return
     }
     if (req.url === '/cli/ai-fix') {
-      res.end(JSON.stringify({ alternatives: [{ label: 'x', previewCss: 'color:#333' }] }))
+      aiFixAuth.push(String(req.headers.authorization || ''))
+      if (req.headers.authorization === `Bearer ${STALE_TOKEN}`) {
+        res.statusCode = 401
+        res.end('{}')
+        return
+      }
+      res.end(JSON.stringify({ alternatives: [{ label: 'x', attribute: 'color', value: '#333', explanation: 'darker text', previewCss: 'color:#333' }] }))
       return
     }
     res.statusCode = 404
@@ -91,18 +102,39 @@ try {
     check(`anonymous ${name} → 200 result (not an error), no WWW-Authenticate`, r.status === 200 && j?.result?.isError !== true && !r.headers.get('www-authenticate'), `${r.status} ${JSON.stringify(j).slice(0, 160)}`)
   }
 
-  // 4. anonymous AI tool is rate limited (cap 2/hour in this test)
+  // 4. anonymous AI tool is rate limited (cap 2/hour in this test), and the two
+  //    calls that do reach the platform carry no credentials (never the operator key).
+  aiFixAuth.length = 0
   let last
   for (let i = 0; i < 3; i++) {
     last = await post(rpc('tools/call', { name: 'generate_ai_fix', arguments: { issue: { message: 'x' }, html: '<p>x</p>', framework: 'plain-css' } }))
   }
   check('anonymous generate_ai_fix trips 429 after cap', last.status === 429 && !!last.headers.get('retry-after'), `${last.status} retry-after=${last.headers.get('retry-after')}`)
+  check('anonymous AI fixes relay no Authorization header', aiFixAuth.length === 2 && aiFixAuth.every((a) => a === ''), JSON.stringify(aiFixAuth))
 
-  // 5. an authenticated caller is not rate limited and can call paid tools
+  // 5. an authenticated caller is not rate limited, relays its own token, and
+  //    can call paid tools
+  aiFixAuth.length = 0
   const authed = await post(rpc('tools/call', { name: 'generate_ai_fix', arguments: { issue: { message: 'x' }, html: '<p>x</p>', framework: 'plain-css' } }), { authorization: `Bearer ${USER_TOKEN}` })
   check('authenticated generate_ai_fix bypasses anon cap', authed.status === 200, authed.status)
+  check('authenticated generate_ai_fix relays the caller\'s bearer token', aiFixAuth.length === 1 && aiFixAuth[0] === `Bearer ${USER_TOKEN}`, JSON.stringify(aiFixAuth))
 
-  // 6. the refusal tells a human how to sign in from their client
+  // 6. C2-02b: a token the platform rejects at /cli/ai-fix (401) falls back to
+  //    one header-free retry, and the caller still gets a tool result.
+  aiFixAuth.length = 0
+  const stale = await post(rpc('tools/call', { name: 'generate_ai_fix', arguments: { issue: { message: 'stale' }, html: '<p>x</p>', framework: 'plain-css' } }), { authorization: `Bearer ${STALE_TOKEN}` })
+  const staleBody = await stale.json().catch(() => ({}))
+  check('a 401 from /cli/ai-fix is retried once without the token', aiFixAuth.length === 2 && aiFixAuth[0] === `Bearer ${STALE_TOKEN}` && aiFixAuth[1] === '', JSON.stringify(aiFixAuth))
+  check('the 401 fallback still returns a 200 tool result (never an HTTP 401)', stale.status === 200 && staleBody?.result?.isError !== true, `${stale.status} ${JSON.stringify(staleBody).slice(0, 160)}`)
+
+  // 7. C2-02a: an oversized field is refused before it reaches the platform.
+  aiFixAuth.length = 0
+  const huge = await post(rpc('tools/call', { name: 'generate_ai_fix', arguments: { issue: { message: 'huge' }, html: 'a'.repeat(300 * 1024), framework: 'plain-css' } }), { authorization: `Bearer ${USER_TOKEN}` })
+  const hugeBody = await huge.json().catch(() => ({}))
+  const hugeText = JSON.stringify(hugeBody)
+  check('oversized html → isError naming the cap, nothing relayed', hugeBody?.result?.isError === true && /\b256\b/.test(hugeText) && aiFixAuth.length === 0, `${hugeText.slice(0, 200)} relayed=${aiFixAuth.length}`)
+
+  // 8. the refusal tells a human how to sign in from their client
   const paid = await post(rpc('tools/call', { name: 'start_audit', arguments: { url: 'https://webability.io' } }))
   const body = await paid.text()
   check('account-tool refusal names the sign-in paths', /claude mcp login/.test(body) && /\/mcp\/auth/.test(body), body.slice(0, 160))

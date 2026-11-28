@@ -26,9 +26,9 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createHash, timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
-import { handleOAuth, wwwAuthenticate } from './oauth.js'
-import { anonLimitClass, anonLimitMessage, appsAnonLimitMessage, calledTools, clientIp, createAnonLimiter } from './anonGate.js'
-import { APPS_MCP_PATH, MCP_PATH, MCP_PATHS, PUBLIC_URL, SIGN_IN_MCP_PATH, appsChallenge } from './signIn.js'
+import { assertSigningSecret, handleOAuth, type OAuthHooks, wwwAuthenticate } from './oauth.js'
+import { anonCallCost, anonLimitClass, anonLimitMessage, appsAnonLimitMessage, calledTools, clientIp, createAnonLimiter, describeClientIpPolicy, operatorLimitClass, operatorLimitMessage } from './anonGate.js'
+import { APPS_MCP_PATH, MCP_PATH, MCP_PATHS, PUBLIC_URL, SIGN_IN_MCP_PATH, appsChallenge, resourceMetadataUrl } from './signIn.js'
 import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
 import { BodyTooLargeError, MCP_MAX_BODY_BYTES, declaredTooLarge, readBodyCapped } from './bodyLimit.js'
 import { createTokenCache } from './tokenCache.js'
@@ -188,7 +188,24 @@ function appsLimitedResponse(body: unknown, text: string): unknown {
 // budget and a lockout cannot block a token the OAuth endpoints just issued.
 const ANON_AUTH_START_PER_HOUR = Number(process.env.ANON_AUTH_START_PER_HOUR || 20)
 const BAD_TOKEN_PER_HOUR = Number(process.env.BAD_TOKEN_PER_HOUR || 30)
+// A valid consent link is single-use, but a leaked sid + cookie pair could be
+// replayed until it expires, each replay costing a platform device-token call.
+// Generous enough for a shared office NAT: one sign-in is a handful of hits.
+const ANON_AUTH_COMPLETE_PER_HOUR = Number(process.env.ANON_AUTH_COMPLETE_PER_HOUR || 60)
 const signInLimiter = createAnonLimiter()
+
+// Operator calls run on the deploy's own WEBABILITY_API_KEY (no account
+// behind them), so they are budgeted per IP per class. Separate counters from
+// the anonymous ones: operator traffic must never consume a caller's budget,
+// and a busy operator must not be capped by anonymous traffic (#227).
+const OPERATOR_HEAVY_PER_HOUR = Number(process.env.OPERATOR_HEAVY_PER_HOUR || 600)
+const OPERATOR_AI_PER_HOUR = Number(process.env.OPERATOR_AI_PER_HOUR || 150)
+const OPERATOR_ACCOUNT_PER_HOUR = Number(process.env.OPERATOR_ACCOUNT_PER_HOUR || 300)
+const operatorLimiter = createAnonLimiter()
+
+function operatorLimit(cls: 'heavy' | 'ai' | 'account'): number {
+  return cls === 'ai' ? OPERATOR_AI_PER_HOUR : cls === 'account' ? OPERATOR_ACCOUNT_PER_HOUR : OPERATOR_HEAVY_PER_HOUR
+}
 
 class JsonParseError extends Error {}
 
@@ -217,6 +234,9 @@ function sendTooLarge(res: ServerResponse, limit: number, jsonRpc: boolean) {
 
 const httpServer = createHttpServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+  // The caller's address for every rate budget below (OAuth sign-in and the
+  // per-path gates); one read, so the proxies are only trusted once.
+  const ip = clientIp(req.headers, req.socket.remoteAddress)
 
   // CORS preflight — remote clients connect server-side, but stay permissive + safe.
   if (req.method === 'OPTIONS') {
@@ -230,17 +250,27 @@ const httpServer = createHttpServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/authorize/start') {
-    const gate = signInLimiter.allow(`${clientIp(req.headers, req.socket.remoteAddress)}:authstart`, ANON_AUTH_START_PER_HOUR)
+    const gate = signInLimiter.allow(`${ip}:authstart`, ANON_AUTH_START_PER_HOUR)
     if (!gate.ok) {
       res.setHeader('Retry-After', String(gate.retryAfterS))
+      // A client that treats 429 as a dead end has nowhere to go without a
+      // sign-in signal; the metadata URL names the OAuth server. No
+      // error="invalid_token": this caller never sent a token.
+      res.setHeader('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadataUrl(MCP_PATH)}"`)
       sendJson(res, 429, { error: 'rate_limited', error_description: `Too many sign-in attempts from this network. Try again in ${Math.ceil(gate.retryAfterS / 60)} min.` })
       return
     }
   }
 
   // OAuth front door (metadata, DCR, authorize, token) — see oauth.ts.
+  const oauthHooks: OAuthHooks = {
+    onTokenIssued: rememberIssued,
+    // oauth.ts charges this only after it has proven the session and the
+    // binding cookie, so junk sids cannot spend a real user's budget.
+    chargeComplete: () => signInLimiter.allow(`${ip}:authcomplete`, ANON_AUTH_COMPLETE_PER_HOUR),
+  }
   try {
-    if (await handleOAuth(req, res, url, rememberIssued)) return
+    if (await handleOAuth(req, res, url, oauthHooks)) return
   } catch (err) {
     if (err instanceof BodyTooLargeError) {
       sendTooLarge(res, err.limit, false)
@@ -317,14 +347,24 @@ const httpServer = createHttpServer(async (req, res) => {
   // to anonymous; the MCP spec requires 401 for an invalid token). The shared
   // operator token is accepted too.
   const candidates = bearerCandidates(req)
-  // A verified token comes before an unknown one, so an unknown token in the
-  // other header cannot pull a good caller into the lockout below.
-  const usable = candidates.filter((t) => !isRejected(t))
-  const token = candidates.find(matchesShared) ?? usable.find((t) => tokenCache.has(t)) ?? usable[0] ?? candidates[0] ?? ''
-  const ip = clientIp(req.headers, req.socket.remoteAddress)
   const badTokenKey = `${ip}:badtoken`
+  // A rejected token is never selected. Otherwise the FIRST candidate wins:
+  // Authorization is the caller's own token, and a stale x-webability-token
+  // left in a client config must not run the call on another account just
+  // because that account's token is still cached (#229).
+  const usable = candidates.filter((t) => !isRejected(t))
+  const first = usable[0]
+  const cached = usable.find((t) => tokenCache.has(t))
+  // One exception: under an active lockout an unknown first token would be
+  // refused without a platform call, so a sibling the server already verified
+  // wins. That is the Smithery case, where Authorization carries a gateway's
+  // own hop and the user's token rides in x-webability-token.
+  const locked = !first || tokenCache.has(first) ? false : !signInLimiter.full(badTokenKey, BAD_TOKEN_PER_HOUR).ok
+  const token =
+    candidates.find(matchesShared) ?? (locked && cached !== undefined ? cached : first) ?? candidates[0] ?? ''
   let authToken: string | undefined
   let anonymous = false
+  let operator = false
   let tokenCheck: TokenCheck = { state: 'invalid' }
   const sendInvalidToken = () => {
     res.setHeader('WWW-Authenticate', wwwAuthenticate(mcpPath))
@@ -358,7 +398,11 @@ const httpServer = createHttpServer(async (req, res) => {
   } else if (!token) {
     anonymous = true
   } else if (matchesShared(token)) {
-    authToken = undefined // operator mode: account tools use the deploy's WEBABILITY_API_KEY
+    // Operator mode: no account, so account tools fall back to the deploy's own
+    // WEBABILITY_API_KEY. That spend is ours, so the calls are budgeted per IP
+    // and attributed to a constant operator distinct id (#227).
+    authToken = undefined
+    operator = true
   } else if (isRejected(token)) {
     // Known dead: a 401, not the 429 below, so the client re-runs sign-in.
     sendInvalidToken()
@@ -419,7 +463,7 @@ const httpServer = createHttpServer(async (req, res) => {
         const cls = anonLimitClass(tool)
         if (!cls) continue
         const limit = cls === 'ai' ? ANON_AI_PER_HOUR : ANON_HEAVY_PER_HOUR
-        const gate = anonLimiter.allow(`${ip}:${cls}`, limit)
+        const gate = anonLimiter.allow(`${ip}:${cls}`, limit, anonCallCost(tool))
         if (!gate.ok) {
           res.setHeader('Retry-After', String(gate.retryAfterS))
           if (mcpPath === APPS_MCP_PATH) {
@@ -444,9 +488,36 @@ const httpServer = createHttpServer(async (req, res) => {
       }
     }
 
+    if (operator) {
+      // The operator token is one shared string, so a single leak or a runaway
+      // script spends OUR account's API key with no account to bill. Budget it
+      // per IP per class, per tool call in the body (a batch can hold many).
+      for (const tool of calledTools(body)) {
+        const cls = operatorLimitClass(tool)
+        if (!cls) continue
+        const limit = operatorLimit(cls)
+        const gate = operatorLimiter.allow(`${ip}:operator:${cls}`, limit)
+        if (!gate.ok) {
+          res.setHeader('Retry-After', String(gate.retryAfterS))
+          // Server-to-server callers read JSON, never a sign-in page: no
+          // appsLimitedResponse here.
+          sendJson(res, 429, {
+            jsonrpc: '2.0',
+            error: {
+              code: -32001,
+              message: operatorLimitMessage({ cls, limit, retryAfterS: gate.retryAfterS, resetAt: gate.resetAt }),
+              data: { limit, perHours: 1, retryAfterSeconds: gate.retryAfterS, resetAt: new Date(gate.resetAt).toISOString() },
+            },
+            id: null,
+          })
+          return
+        }
+      }
+    }
+
     // /mcp/apps (ChatGPT) declares per-tool securitySchemes and answers an
     // anonymous account-tool call with an isError + www_authenticate challenge.
-    const server = createServer({ remote: true, authToken, anonymous, appsAuth: mcpPath === APPS_MCP_PATH })
+    const server = createServer({ remote: true, authToken, anonymous, operator, appsAuth: mcpPath === APPS_MCP_PATH })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     res.on('close', () => {
       transport.close().catch(() => {})
@@ -470,6 +541,20 @@ const httpServer = createHttpServer(async (req, res) => {
   }
 })
 
+// The OAuth server cannot issue a client_id or a bound refresh token without
+// a signing key, and the old fallbacks (MCP_AUTH_TOKEN, then a random key per
+// boot) either handed the shared operator secret a signing role or silently
+// invalidated every client on restart. Refuse to start instead (#227).
+try {
+  assertSigningSecret()
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err))
+  process.exit(1)
+}
+
 httpServer.listen(PORT, () => {
   console.error(`WebAbility MCP (Streamable HTTP) listening on :${PORT}${MCP_PATH}`)
+  // Stated once, because a wrong TRUSTED_PROXY_HOPS / TRUST_CF_CONNECTING_IP
+  // silently merges every caller into one bucket or lets one caller mint many.
+  console.error(`[mcp-http] client ip: ${describeClientIpPolicy()}`)
 })

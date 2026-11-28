@@ -35,7 +35,7 @@ import { collectSourcePointers, findSourceCandidates, type SourcePointer } from 
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote, widgetViewNote } from './scanShaping.js'
 import { SCAN_HTML_DEADLINE_MS, ScanHtmlBusyError, ScanHtmlLimitError, assertScanHtmlWithinCaps, fastScanHtml } from './fastScan.js'
 import { openSession, schemeForBareUrl } from './browser.js'
-import { isBlockedAddress } from './egressProxy.js'
+import { isBlockedAddress, normalizeHost } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
 import { ACCOUNT_TOOLS, appsAuthChallenge, appsSignInRequired, signInRequired } from './signIn.js'
 import { ToolRefusal, assertSelectorMatches, readElementColors, scopeAxeRules } from './pageChecks.js'
@@ -112,6 +112,29 @@ function toolError(text: string, hint?: Partial<ErrorHint>): { content: Array<{ 
 
 const AUDIT_POLL_SECONDS = 15
 
+// generate_ai_fix relays to the platform `/cli/ai-fix`; the only size guard on the way in
+// is the 5 MB MCP body cap. Cap the three fields the AI prompt actually consumes, before
+// the fetch — a whole-page html is a large prompt bill and a slow generation.
+const AI_FIX_FIELD_CAPS = [
+  ['html', 256 * 1024, "Pass the element's outerHTML, not the whole page — or use scan_page on the URL."],
+  ['context', 8 * 1024, 'Pass only the surrounding markup the fix depends on.'],
+  ['issue', 8 * 1024, 'Pass the scanner issue object, not the whole scan report.'],
+] as const
+
+/** Refusal text when a generate_ai_fix field is over its cap, else null. */
+function aiFixOverCap(issue: unknown, html: string, context: string): string | null {
+  const value: Record<string, unknown> = { html, context, issue }
+  for (const [field, maxBytes, hint] of AI_FIX_FIELD_CAPS) {
+    const v = value[field]
+    if (v === undefined || v === null) continue
+    const bytes = Buffer.byteLength(typeof v === 'string' ? v : JSON.stringify(v) ?? '', 'utf8')
+    if (bytes <= maxBytes) continue
+    const kb = (n: number) => Math.round(n / 1024).toLocaleString('en-US')
+    return `ai_fix ${field} is ${kb(bytes)} KB; the relay caps it at ${kb(maxBytes)} KB. ${hint}`
+  }
+  return null
+}
+
 // A diff_scan runs 2 Chromiums at once. Two calls together ran 4 on the hosted
 // box and both timed out. Module scope: the hosted server builds one server per request.
 let hostedDiffRunning = false
@@ -161,6 +184,10 @@ export interface ServerOptions {
    *  `securitySchemes`, and an account tool called without an account returns
    *  isError + `_meta["mcp/www_authenticate"]` so ChatGPT starts sign-in. */
   appsAuth?: boolean
+  /** Hosted request authenticated with the shared operator token (MCP_AUTH_TOKEN):
+   *  no account behind it, so its calls are throttled per IP and attributed to a
+   *  constant distinct id instead of an account hash (#227). */
+  operator?: boolean
   /** Hosted scan_page / diff_scan time budget. Tests set it low; production uses HOSTED_CALL_DEADLINE_MS. */
   scanPageDeadlineMs?: number
   /** scan_html (in-process) time budget. Tests set it low; production uses SCAN_HTML_DEADLINE_MS. */
@@ -220,7 +247,7 @@ const DNS_LOOKUP_DEADLINE_MS = 5_000
  *  Checks one URL. Redirect hops never reach a route handler, so hosted
  *  contexts also send every connection through the egress proxy
  *  (egressProxy.ts, wired in browser.ts openSession), which checks each hop. */
-async function assertSafeUrl(raw: string): Promise<void> {
+export async function assertSafeUrl(raw: string): Promise<void> {
   let u: URL
   try {
     u = new URL(raw)
@@ -228,18 +255,22 @@ async function assertSafeUrl(raw: string): Promise<void> {
     throw new Error(`invalid URL "${raw}"`)
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`scheme "${u.protocol}" not allowed`)
+  // WHATWG URL keeps the brackets on an IPv6 hostname (`[::1]`), and isIP
+  // rejects that form, so a bracketed literal fell through to DNS and was
+  // reported as unresolvable instead of blocked.
+  const host = normalizeHost(u.hostname)
   let addrs: string[]
-  if (isIP(u.hostname)) {
-    addrs = [u.hostname]
+  if (isIP(host)) {
+    addrs = [host]
   } else {
     try {
-      addrs = (await withDeadline(() => dnsPromises.lookup(u.hostname, { all: true }), DNS_LOOKUP_DEADLINE_MS, 'dns lookup')).map((r) => r.address)
+      addrs = (await withDeadline(() => dnsPromises.lookup(host, { all: true }), DNS_LOOKUP_DEADLINE_MS, 'dns lookup')).map((r) => r.address)
     } catch {
-      throw new Error(`cannot resolve host "${u.hostname}"`)
+      throw new Error(`cannot resolve host "${host}"`)
     }
   }
-  if (addrs.length === 0) throw new Error(`no addresses for "${u.hostname}"`)
-  for (const a of addrs) if (isBlockedAddress(a)) throw new Error(`"${u.hostname}" resolves to blocked internal address ${a}`)
+  if (addrs.length === 0) throw new Error(`no addresses for "${host}"`)
+  for (const a of addrs) if (isBlockedAddress(a)) throw new Error(`"${host}" resolves to blocked internal address ${a}`)
 }
 
 /** Install an SSRF guard on a Playwright context: every request the page makes — top-level
@@ -2331,7 +2362,13 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     // object shape it expects.
     const issue = (typeof args?.issue === 'string' ? { message: args.issue } : args?.issue) as any
     const html = args?.html as string
+    const context = (args?.context as string | undefined) || ''
     if (!issue || !html) return toolError('Error: issue and html required')
+
+    // Refuse an over-cap field before the relay and the palette scanner run: the
+    // caller retries with a smaller snippet, and nothing large reaches the AI bill.
+    const overCap = aiFixOverCap(issue, html, context)
+    if (overCap) return toolError(overCap)
 
     let brandColors = (args?.brandColors as string[] | undefined) || []
     let brandSource = brandColors.length > 0 ? 'arg' : 'none'
@@ -2360,17 +2397,27 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     const framework = (args?.framework as string) || 'plain-css'
 
     try {
-      const res = await fetch(`${API_URL}/cli/ai-fix`, {
+      const token = opts.anonymous ? '' : (opts.authToken || resolveAuthToken())
+      const relayBody = JSON.stringify({ issue, html, context, url, framework, brandColors })
+      // Relay the caller's own token so /cli/ai-fix bills and scopes the right account.
+      // Anonymous means "no credential": never fall back to the operator key here.
+      let res = await fetch(`${API_URL}/cli/ai-fix`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          issue, html,
-          context: args?.context || '',
-          url,
-          framework,
-          brandColors,
-        }),
+        headers: token
+          ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+          : { 'Content-Type': 'application/json' },
+        body: relayBody,
       })
+      if (res.status === 401 && token) {
+        // A held token can be stale (revoked or rotated). Retry once header-free so a fix
+        // the platform would still serve is not lost; the caller gets a tool result either
+        // way, never an HTTP 401 out of this relay.
+        res = await fetch(`${API_URL}/cli/ai-fix`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: relayBody,
+        })
+      }
 
       if (!res.ok) {
         const attr = issue.fix?.attribute as string | undefined

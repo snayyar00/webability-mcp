@@ -93,6 +93,7 @@ CI, a remote agent, or a dashboard-triggered scan cannot run Lite, because there
 WEBABILITY_API_KEY=<your-token> npx -y -p @webability/mcp webability-tunnel --port 3000
 ```
 
+The token comes from `WEBABILITY_API_KEY` in the environment, or from a piped stdin (`echo "$TOKEN" | webability-tunnel --port 3000`), or from `webability login`. `--token <t>` still works but is deprecated: command-line arguments are readable by every process on the machine and end up in CI logs.
 It prints a `https://tunnel.webability.io/t/<id>/` URL and a secret. Pass the URL as `url` and the secret as `tunnel_secret`:
 
 > "Scan https://tunnel.webability.io/t/abc123.../ with tunnel_secret &lt;secret&gt;"
@@ -117,6 +118,11 @@ Optional env:
 - `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` to enable PostHog MCP Analytics for MCP initialize, tools/list, and tool-call usage events.
 - `POSTHOG_HOST` (default `https://us.i.posthog.com`) for EU or self-hosted PostHog ingestion.
 - `WEBABILITY_POSTHOG_MCP_ANALYTICS=off` to force-disable PostHog MCP Analytics even when a PostHog key is present.
+- `TRUST_CF_CONNECTING_IP=true` when a self-hosted server sits behind Cloudflare and the origin accepts Cloudflare traffic alone: the anonymous trial and rate limit key on `CF-Connecting-IP`. Leave it unset if anything can reach the origin directly.
+- `TRUSTED_PROXY_HOPS` (default `1`) — how many of your own proxies append to `X-Forwarded-For` in front of the process. `1` for a single reverse proxy, `2` for Cloudflare then a reverse proxy, `0` if nothing proxies it. Only the rightmost N entries were written by your infrastructure; the leftmost is whatever the caller sent.
+
+Both are read once at boot and the effective choice is logged:
+`[mcp-http] client ip: the rightmost 1 entry of X-Forwarded-For (TRUSTED_PROXY_HOPS=1), falling back to the socket address`.
 
 ## Scan engines
 

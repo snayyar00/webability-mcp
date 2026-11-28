@@ -22,18 +22,24 @@ async function freePort(): Promise<number> {
 
 async function start(env: Record<string, string>): Promise<{ proc: ChildProcess; base: string }> {
   const port = await freePort()
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), ...env }
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), OAUTH_SIGNING_SECRET: 'openai-challenge-test-secret-0123456789', ...env }
   if (!('OPENAI_APPS_CHALLENGE_TOKEN' in env)) delete childEnv.OPENAI_APPS_CHALLENGE_TOKEN
   const proc = spawn('./node_modules/.bin/tsx', ['src/http.ts'], { env: childEnv, stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  proc.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
   const base = `http://127.0.0.1:${port}`
-  for (let i = 0; i < 100; i++) {
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path.
+  for (let i = 0; i < 300; i++) {
+    if (proc.exitCode !== null) break
     try {
       if ((await fetch(base + '/health')).ok) return { proc, base }
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 100))
   }
   proc.kill()
-  throw new Error('server did not start')
+  throw new Error(`server did not start: ${stderr.trim() || 'no stderr'}`)
 }
 
 let withTok: { proc: ChildProcess; base: string }

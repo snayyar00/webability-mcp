@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { anonLimitClass, calledTools, clientIp, createAnonLimiter } from '../src/anonGate.ts'
+import { anonCallCost, anonLimitClass, calledTools, clientIp, createAnonLimiter } from '../src/anonGate.ts'
 
 const call = (name: string, id = 1) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: {} } })
 
@@ -66,4 +66,59 @@ test('limiter.full() reports a spent bucket without counting (#201 bad-token gat
   assert.equal(l.full('other-ip:badtoken', 2).ok, true)
   t += 60 * 60 * 1000 + 1
   assert.equal(l.full('ip:badtoken', 2).ok, true, 'the window resets')
+})
+
+// --- byte-weighted anonymous AI gate (issue #225 C2-02c) -------------------
+// A call-count cap let one caller spend a whole hour's budget in a single
+// request by sending a huge html/context payload. The AI bucket now charges
+// for the payload, so a 2 MB call costs more than a small one.
+
+const SIZE_UNIT = 16 * 1024
+const aiCall = (args: unknown) => ({ name: 'generate_ai_fix', args })
+
+test('a small AI fix call costs one unit', () => {
+  assert.equal(anonCallCost(aiCall({ issue: { message: 'x' }, html: '<p>x</p>' })), 1)
+  assert.equal(anonCallCost(aiCall(undefined)), 1)
+})
+
+test('cost grows with payload weight: one unit is 16 KB, rounded up', () => {
+  const html = (n: number) => aiCall({ issue: { message: 'x' }, html: 'a'.repeat(n) })
+  assert.equal(anonCallCost(html(SIZE_UNIT - 32)), 1, 'under one unit still costs one')
+  assert.equal(anonCallCost(html(SIZE_UNIT * 4)), 5, 'four clean units plus the issue round up')
+  assert.equal(anonCallCost(html(SIZE_UNIT * 10)), 11)
+})
+
+test('one 2 MB AI fix call costs ~129 units, not one', () => {
+  const l = createAnonLimiter(() => 1_000)
+  const heavy = anonCallCost(aiCall({ issue: { message: 'x' }, html: 'a'.repeat(2 * 1024 * 1024) }))
+  assert.equal(heavy, 129, `2 MB plus a tiny issue rounds up to 129 units, got ${heavy}`)
+  assert.equal(l.allow('ip:ai', 10, heavy).ok, false, 'a single 2 MB call blows a 10-call budget')
+})
+
+test('html, context and issue all count toward the cost', () => {
+  const half = 'a'.repeat(SIZE_UNIT)
+  const split = anonCallCost(aiCall({ issue: { message: 'x' }, html: half, context: half + half }))
+  const together = anonCallCost(aiCall({ issue: { message: 'x' }, html: half + half + half }))
+  assert.equal(split, together, 'the same payload weight costs the same wherever it sits')
+  assert.ok(split > 1, 'a 48 KB payload costs more than one unit')
+})
+
+test('a non-AI tool costs one, whatever its arguments', () => {
+  const args = { url: 'https://a.test', html: 'a'.repeat(SIZE_UNIT * 8) }
+  assert.equal(anonCallCost({ name: 'scan_page', args }), 1)
+  assert.equal(anonCallCost({ name: 'get_rules', args }), 1)
+})
+
+test('allow() charges the cost, so one heavy call can spend the whole budget', () => {
+  const l = createAnonLimiter(() => 1_000)
+  const g = l.allow('ip:ai', 2, 3)
+  assert.equal(g.ok, false, 'cost 3 exceeds a limit of 2')
+  assert.equal(l.full('ip:ai', 2).ok, false, 'the refused request still counts what it tried to spend')
+})
+
+test('allow() defaults to a cost of one (existing callers unchanged)', () => {
+  const l = createAnonLimiter(() => 1_000)
+  assert.equal(l.allow('ip:ai', 2).ok, true)
+  assert.equal(l.allow('ip:ai', 2).ok, true)
+  assert.equal(l.allow('ip:ai', 2).ok, false)
 })

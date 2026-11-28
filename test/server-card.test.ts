@@ -31,14 +31,20 @@ let proc: ChildProcess
 let base: string
 before(async () => {
   const port = await freePort()
-  proc = spawn('./node_modules/.bin/tsx', ['src/http.ts'], { env: { ...process.env, PORT: String(port) }, stdio: ['ignore', 'ignore', 'pipe'] })
+  proc = spawn('./node_modules/.bin/tsx', ['src/http.ts'], { env: { ...process.env, PORT: String(port), OAUTH_SIGNING_SECRET: 'server-card-test-secret-0123456789abcdef' }, stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  proc.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
   base = `http://127.0.0.1:${port}`
-  for (let i = 0; i < 100; i++) {
+  // 30 s, not 10: a tsx cold start on a loaded machine (parallel worktrees, CI)
+  // can take many seconds before the child binds. A ready server answers on the
+  // first poll, so the ceiling only bounds the failure path.
+  for (let i = 0; i < 300; i++) {
+    if (proc.exitCode !== null) break
     try { if ((await fetch(base + '/health')).ok) return } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 100))
   }
   proc.kill()
-  throw new Error('server did not start')
+  throw new Error(`server did not start: ${stderr.trim() || 'no stderr'}`)
 })
 after(() => proc?.kill())
 

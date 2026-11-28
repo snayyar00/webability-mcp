@@ -42,7 +42,7 @@ This is used for WebAbility's own product usage visibility (an internal admin da
 
 ## PostHog MCP Analytics (optional)
 
-When `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` is set, the server instruments MCP protocol usage with `@posthog/mcp`. It sends usage metadata to PostHog, including initialize events, tools/list events, tool-call events, tool name, duration, client name/version, protocol version, and whether the call errored. For hosted HTTP mode, the caller is identified by a one-way SHA-256 hash of the WebAbility token; the token itself is never sent.
+When `POSTHOG_PROJECT_API_KEY` or `POSTHOG_API_KEY` is set, the server instruments MCP protocol usage with `@posthog/mcp`. It sends usage metadata to PostHog, including initialize events, tools/list events, tool-call events, tool name, duration, client name/version, protocol version, and whether the call errored. For hosted HTTP mode, the caller is identified by a one-way SHA-256 hash of the WebAbility token; the token itself is never sent. Calls made with the shared operator `MCP_AUTH_TOKEN` are identified by the constant string `webability-operator` — that token has no account behind it, and hashing or sending the token itself would let one holder's traffic be singled out.
 
 WebAbility applies a `beforeSend` redaction layer that deletes PostHog's `$mcp_parameters` and `$mcp_response` fields. This prevents raw tool arguments and responses from being sent to PostHog, including HTML snippets, issue HTML, screenshots, full scan results, generated code, local file paths, and `scan_history` responses.
 

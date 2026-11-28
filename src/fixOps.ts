@@ -275,8 +275,12 @@ type IssueLike = Pick<ScanIssue, 'type'> & Partial<Pick<ScanIssue, 'fix' | 'conf
  * attribute exists, whether removal was meant, whether it is a text/element
  * insertion); the rule table is the fallback. The tier is the stricter of the
  * rule tier and what the payload admits: a visual rule stays visual even with
- * a proposed value, and a value the engine could not compute (needsManualReview)
- * can never be mechanical.
+ * a proposed value, a rule whose value needs context (alt text, an aria-label,
+ * a landmark role) can never be mechanical just because a value arrived, and
+ * a value the engine could not compute (needsManualReview) is contextual too.
+ * That last part is not redundant with the flag: a model-written name can
+ * arrive with needsManualReview:false — the flag reports who reviewed it, not
+ * whether the value is deterministic — and the rule tier holds either way.
  */
 export function structuredFix(issue: IssueLike): StructuredFix {
   const type = String(issue.type ?? '')
@@ -315,9 +319,9 @@ export function structuredFix(issue: IssueLike): StructuredFix {
 
   let fixability: Fixability
   if (rule.fixability === 'visual' || VISUAL_RULES.has(type)) fixability = 'visual'
-  else if (op === 'suggest') fixability = 'contextual'
+  else if (rule.fixability === 'contextual' || op === 'suggest' || valueUnknown) fixability = 'contextual'
   else if (op === 'remove-attribute') fixability = attr ? 'mechanical' : 'contextual'
-  else fixability = valueUnknown ? 'contextual' : 'mechanical'
+  else fixability = 'mechanical'
 
   return {
     op,

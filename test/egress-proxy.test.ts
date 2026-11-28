@@ -9,7 +9,7 @@ import { createServer, request, Server } from 'node:http'
 import { AddressInfo, connect } from 'node:net'
 import { test } from 'node:test'
 
-import { isBlockedAddress, startEgressProxy } from '../src/egressProxy'
+import { isBlockedAddress, isBlockedDestination, startEgressProxy } from '../src/egressProxy'
 
 function listen(): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
@@ -46,11 +46,28 @@ function connectVia(proxyPort: number, authority: string): Promise<string> {
   })
 }
 
-test('isBlockedAddress: loopback, private, link-local/metadata, CGNAT, v6 local are blocked; public is not', () => {
-  for (const a of ['127.0.0.1', '10.0.0.5', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:169.254.169.254']) {
+test('isBlockedAddress: loopback, private, link-local/metadata, CGNAT, reserved, v6 local are blocked; public is not', () => {
+  for (const a of [
+    '127.0.0.1', '10.0.0.5', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0',
+    '192.0.0.170', '192.0.0.192', '198.18.0.1', '198.19.255.254', '240.0.0.1', '255.255.255.255',
+    '::1', '::', 'fe80::1', 'fe90::1', 'febf::1', 'fec0::1', 'fd00::1', 'ff02::1',
+    '::ffff:127.0.0.1', '::ffff:169.254.169.254', '64:ff9b::7f00:1',
+  ]) {
     assert.equal(isBlockedAddress(a), true, a)
   }
-  for (const a of ['93.184.215.14', '8.8.8.8', '172.32.0.1', '2606:4700::1111']) assert.equal(isBlockedAddress(a), false, a)
+  for (const a of ['93.184.215.14', '8.8.8.8', '172.32.0.1', '2606:4700::1111', '2001:db8::1', '192.0.2.10', '64:ff9b::808:808', '::ffff:808:808']) {
+    assert.equal(isBlockedAddress(a), false, a)
+  }
+})
+
+test('isBlockedDestination: only the web ports are reachable through the proxy', () => {
+  // Without a port allowlist the proxy is a general TCP relay: a token holder
+  // could reach SMTP, Redis, Postgres or MySQL on any public host.
+  for (const p of [25, 22, 6379, 3306, 5432, 11211, 8081, 0]) assert.equal(isBlockedDestination('8.8.8.8', p), true, String(p))
+  for (const p of [80, 443, 8080, 8443]) assert.equal(isBlockedDestination('8.8.8.8', p), false, String(p))
+  // A blocked address stays blocked whatever the port.
+  assert.equal(isBlockedDestination('169.254.169.254', 443), true)
+  assert.equal(isBlockedDestination('127.0.0.1', 80), true)
 })
 
 test('isBlockedAddress: hex-form IPv4-mapped IPv6 and bracketed literals are blocked', () => {

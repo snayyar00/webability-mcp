@@ -1,5 +1,5 @@
 /**
- * The relay redeploys on every webability-platform merge (5 times on
+ * The relay redeploys on every platform release (5 times on
  * 2026-09-26/27) and the CLI exited on each one. The relay now closes agents
  * with RELAY_RESTART_CODE on shutdown; the CLI reconnects on that code only,
  * with backoff, and prints the NEW url + secret (the registry is in memory,

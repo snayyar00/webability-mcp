@@ -24,15 +24,30 @@
 import type { IncomingMessage, ServerResponse } from 'http'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
 import { APPS_MCP_PATH, MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
+import type { AnonGateResult } from './anonGate.js'
 import { OAUTH_MAX_BODY_BYTES, readBodyCapped } from './bodyLimit.js'
 
 const ISSUER = PUBLIC_URL
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
 
-// HMAC key for client_id blobs. Losing it only forces clients through one
-// re-registration (DCR is automatic), so a per-boot fallback is acceptable —
-// but set OAUTH_SIGNING_SECRET in the deploy so restarts are seamless.
-const SIGNING_SECRET = process.env.OAUTH_SIGNING_SECRET || process.env.MCP_AUTH_TOKEN || randomBytes(32).toString('hex')
+// HMAC key for client_id and refresh-token-binding blobs. It is REQUIRED: a
+// per-boot random silently invalidates every issued client_id and bound
+// refresh token on restart, and falling back to MCP_AUTH_TOKEN made the shared
+// operator secret a signing key — whoever held it could mint a client_id
+// naming any redirect_uri (#227, #229-3).
+export const SIGNING_SECRET_ENV = 'OAUTH_SIGNING_SECRET'
+const SIGNING_SECRET = (process.env[SIGNING_SECRET_ENV] || '').trim()
+
+/** Fatal at boot (http.ts). A function, not a module-load throw, so
+ * authorizePage() stays importable (and testable) without any env. */
+export function assertSigningSecret(): void {
+  if (SIGNING_SECRET) return
+  throw new Error(
+    `[oauth] ${SIGNING_SECRET_ENV} is required: it signs OAuth client_ids and refresh-token bindings. ` +
+      'Set it to a long random value (openssl rand -hex 32) in the deploy environment; ' +
+      'rotating it forces every connected client to register and sign in again.',
+  )
+}
 
 const SESSION_TTL_MS = 10 * 60 * 1000
 const CODE_TTL_MS = 5 * 60 * 1000
@@ -49,6 +64,9 @@ interface Session extends AuthParams {
   deviceCode: string
   /** platform consent page, with the return_to that brings the user back */
   continueUrl: string
+  /** random browser binding, stored only in this session and in the caller's
+   * HttpOnly cookie — it never appears in a URL (#228) */
+  binding: string
   exp: number
 }
 interface IssuedCode {
@@ -74,6 +92,10 @@ function b64url(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 function sign(payload: string): string {
+  // Never HMAC with an empty key: that is a public constant, so anyone could
+  // forge a client_id. http.ts refuses to boot without the env; this guards
+  // every other entry point (tests, a future embedder).
+  assertSigningSecret()
   return b64url(createHmac('sha256', SIGNING_SECRET).update(payload).digest())
 }
 
@@ -139,6 +161,105 @@ function validRedirectUri(uri: string): boolean {
   } catch {
     return false
   }
+}
+
+// --- browser binding (#228) -------------------------------------------------
+// /authorize/complete used to be the only thing tying an approval to a
+// browser, and the sid in return_to was the whole of it — so whoever minted
+// the sid could collect the code for a client of their choosing (the consent
+// screen names the client, but the victim is already clicking "allow"). The
+// session now also gets a random binding that travels ONLY in an HttpOnly
+// cookie set by this origin: the platform page and the browser history never
+// see it, and a complete without the matching cookie cannot hand out a code.
+const BINDING_COOKIE = 'wa_oauth'
+const BINDING_PATH = '/authorize'
+// Tabs: one cookie per origin, so concurrent sign-ins on this origin each
+// append an entry and the newest few are kept. Older ones fall off.
+const BINDING_MAX_ENTRIES = 4
+const BINDING_ENTRY_RE = /^([0-9a-f]{32})\.([0-9a-f]{32})$/
+const COOKIE_SECURE = ISSUER.startsWith('https://') ? '; Secure' : ''
+
+/** One cookie by name, first match. Manual split: `req.cookies` needs a dep. */
+function readCookie(req: IncomingMessage, name: string): string {
+  const header = req.headers.cookie
+  if (!header) return ''
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq < 0) continue
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim()
+  }
+  return ''
+}
+
+/** {{sid, binding}} pairs from the cookie, malformed entries dropped. */
+function bindingEntries(req: IncomingMessage): Array<{ sid: string; binding: string }> {
+  const raw = readCookie(req, BINDING_COOKIE)
+  if (!raw) return []
+  const entries: Array<{ sid: string; binding: string }> = []
+  for (const part of raw.split('~')) {
+    const m = BINDING_ENTRY_RE.exec(part)
+    if (m) entries.push({ sid: m[1], binding: m[2] })
+  }
+  return entries
+}
+
+/** Set-Cookie value for this list; an empty list clears the cookie. */
+function bindingCookieHeader(entries: Array<{ sid: string; binding: string }>): string {
+  const kept = entries.slice(-BINDING_MAX_ENTRIES)
+  const value = kept.map((e) => `${e.sid}.${e.binding}`).join('~')
+  const maxAge = kept.length ? SESSION_TTL_MS / 1000 : 0
+  return `${BINDING_COOKIE}=${value}; Path=${BINDING_PATH}; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${COOKIE_SECURE}`
+}
+
+/** Constant-time compare of two hex bindings (length-checked: timingSafeEqual throws on a mismatch). */
+function sameBinding(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b))
+}
+
+/** Drop one session's cookie entry; other tabs' entries survive. */
+function forgetBinding(req: IncomingMessage, res: ServerResponse, sid: string): void {
+  res.setHeader('Set-Cookie', bindingCookieHeader(bindingEntries(req).filter((e) => e.sid !== sid)))
+}
+
+interface TokenPayload {
+  token?: string
+  refreshToken?: string
+  error?: string
+}
+
+// Platform output is unvalidated: keep only the fields we use, as strings.
+// `in` narrows to `unknown` without a cast, so a non-string stays rejected.
+
+interface DeviceCode {
+  deviceCode?: string
+  userCode?: string
+  verificationUrl?: string
+}
+
+async function readDeviceCode(res: Response): Promise<DeviceCode> {
+  const body: unknown = await res.json().catch(() => null)
+  if (!body || typeof body !== 'object') return {}
+  return {
+    deviceCode: stringOrUndefined('deviceCode' in body ? body.deviceCode : undefined),
+    userCode: stringOrUndefined('userCode' in body ? body.userCode : undefined),
+    verificationUrl: stringOrUndefined('verificationUrl' in body ? body.verificationUrl : undefined),
+  }
+}
+
+async function readTokenPayload(res: Response): Promise<TokenPayload> {
+  const body: unknown = await res.json().catch(() => null)
+  if (!body || typeof body !== 'object') return {}
+  return {
+    token: stringOrUndefined('token' in body ? body.token : undefined),
+    refreshToken: stringOrUndefined('refreshToken' in body ? body.refreshToken : undefined),
+    error: stringOrUndefined('error' in body ? body.error : undefined),
+  }
+}
+
+/** A non-empty string, or undefined. Empty is absence for every field here. */
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined
 }
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -224,15 +345,28 @@ function redirectUriMatches(registered: string[], uri: string): boolean {
   })
 }
 
-function validateAuthRequest(q: Record<string, unknown>): { ok: true; params: AuthParams } | { ok: false; error: string } {
+/** The only scope this server issues. The access token is the caller's own
+ * WebAbility token, so `mcp` names the grant rather than a narrower privilege
+ * set, and it is advertised in metadata only: RFC 6749 §3.3 lets a server
+ * ignore scopes it does not issue, so a requested `openid offline_access`,
+ * `profile`, `mcp` or anything else is ignored and the default grant is
+ * issued. Refusing would lock out real clients (ChatGPT, Claude, Cursor) that
+ * send those scopes unconditionally. */
+const SUPPORTED_SCOPE = 'mcp'
+
+/** A validation failure in OAuth wire terms: `code` is the RFC 6749 §4.1.2.1
+ * error, `error` the human-readable description of the same. */
+type AuthError = { ok: false; code: string; error: string }
+
+function validateAuthRequest(q: Record<string, unknown>): { ok: true; params: AuthParams } | AuthError {
   const clientId = typeof q.client_id === 'string' ? q.client_id : ''
   const client = parseClientId(clientId)
-  if (!client) return { ok: false, error: 'unknown client_id — register at /register first' }
+  if (!client) return { ok: false, code: 'invalid_request', error: 'unknown client_id — register at /register first' }
   const redirectUri = typeof q.redirect_uri === 'string' ? q.redirect_uri : ''
-  if (!redirectUriMatches(client.redirectUris, redirectUri)) return { ok: false, error: 'redirect_uri is not registered for this client' }
-  if (q.response_type !== 'code') return { ok: false, error: 'response_type must be "code"' }
+  if (!redirectUriMatches(client.redirectUris, redirectUri)) return { ok: false, code: 'invalid_request', error: 'redirect_uri is not registered for this client' }
+  if (q.response_type !== 'code') return { ok: false, code: 'unsupported_response_type', error: 'response_type must be "code"' }
   const codeChallenge = typeof q.code_challenge === 'string' ? q.code_challenge : ''
-  if (!codeChallenge || q.code_challenge_method !== 'S256') return { ok: false, error: 'PKCE with S256 is required' }
+  if (!codeChallenge || q.code_challenge_method !== 'S256') return { ok: false, code: 'invalid_request', error: 'PKCE with S256 is required' }
   const host = (() => {
     try {
       return new URL(redirectUri).host
@@ -261,7 +395,7 @@ const AS_METADATA = {
   grant_types_supported: ['authorization_code', 'refresh_token'],
   code_challenge_methods_supported: ['S256'],
   token_endpoint_auth_methods_supported: ['none', 'client_secret_basic', 'client_secret_post'],
-  scopes_supported: ['mcp'],
+  scopes_supported: [SUPPORTED_SCOPE],
   service_documentation: 'https://www.webability.io/docs/mcp',
 }
 
@@ -275,7 +409,7 @@ const resourceMetadata = (mcpPath: string) => ({
   resource: `${ISSUER}${mcpPath}`,
   authorization_servers: [ISSUER],
   bearer_methods_supported: ['header'],
-  scopes_supported: ['mcp'],
+  scopes_supported: [SUPPORTED_SCOPE],
   resource_documentation: 'https://www.webability.io/docs/mcp',
 })
 
@@ -329,7 +463,9 @@ document.getElementById('intro').textContent =
   ' scan and audit for accessibility on your behalf.';
 const statusEl = () => document.getElementById('status');
 async function post(path, body) {
-  const res = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  // same-origin is the default; stated because the response's Set-Cookie IS the
+  // browser binding that /authorize/complete later demands back.
+  const res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   return res.json();
 }
 (async () => {
@@ -379,28 +515,37 @@ async function refreshGrant(boundToken: string | undefined, clientId: string | u
     json(res, 503, { error: 'temporarily_unavailable', error_description: 'Could not reach the WebAbility sign-in service.' })
     return
   }
-  const payload = (await apiRes.json().catch(() => ({}))) as any
+  const payload = await readTokenPayload(apiRes)
   if (apiRes.status === 400 || apiRes.status === 401) {
     json(res, 400, { error: 'invalid_grant', error_description: 'refresh_token is invalid, expired or revoked' })
     return
   }
-  if (!apiRes.ok || typeof payload.token !== 'string' || !payload.token) {
+  if (!apiRes.ok || !payload.token) {
     console.error(`[oauth] refresh-token returned ${apiRes.status}`)
     json(res, 503, { error: 'temporarily_unavailable', error_description: 'The WebAbility sign-in service returned an error.' })
     return
   }
   onTokenIssued?.(payload.token)
+  // No `scope` (RFC 6749 §5.1 makes it optional when it is the requested one):
+  // the access token is the caller's WebAbility account token, so naming a
+  // scope here would promise a narrower grant than the token actually is.
   json(res, 200, {
     access_token: payload.token,
     token_type: 'Bearer',
-    scope: 'mcp',
-    ...(typeof payload.refreshToken === 'string' && payload.refreshToken ? { refresh_token: bindRefreshToken(payload.refreshToken, clientId!) } : {}),
+    ...(payload.refreshToken ? { refresh_token: bindRefreshToken(payload.refreshToken, clientId!) } : {}),
   })
 }
 
-/** Route OAuth endpoints. Returns true when the request was handled here. */
+/** Callbacks the HTTP layer owns: token bookkeeping and the sign-in rate budget. */
+export interface OAuthHooks {
+  onTokenIssued?: (token: string) => void
+  /** Charged only after a valid session AND cookie match, so junk probes against
+   * /authorize/complete cannot burn a shared egress IP's budget (#228). */
+  chargeComplete?: () => AnonGateResult
+}
 
-export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL, onTokenIssued?: (token: string) => void): Promise<boolean> {
+/** Route OAuth endpoints. Returns true when the request was handled here. */
+export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL, hooks: OAuthHooks = {}): Promise<boolean> {
   sweep()
   const path = url.pathname
 
@@ -466,7 +611,8 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     // show the error on our own page instead.
     if (!checked.ok) {
       res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(`<!doctype html><meta charset="utf-8"><title>Invalid request</title><p style="font-family:sans-serif">Invalid authorization request: ${checked.error.replace(/</g, '&lt;')}</p>`)
+      const detail = `${checked.code}: ${checked.error}`.replace(/</g, '&lt;')
+      res.end(`<!doctype html><meta charset="utf-8"><title>Invalid request</title><p style="font-family:sans-serif">Invalid authorization request: ${detail}</p>`)
       return true
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -481,19 +627,23 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     const body = await readParams(req)
     const checked = validateAuthRequest({ ...body, response_type: 'code', code_challenge_method: 'S256' })
     if (!checked.ok) {
-      json(res, 400, { error: checked.error })
+      json(res, 400, { error: checked.code, error_description: checked.error })
       return true
     }
     try {
       const apiRes = await fetch(`${API_URL}/cli/device-code`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
       if (!apiRes.ok) throw new Error(`device-code returned ${apiRes.status}`)
-      const { deviceCode, userCode, verificationUrl } = (await apiRes.json()) as any
+      const { deviceCode, userCode, verificationUrl } = await readDeviceCode(apiRes)
       if (!deviceCode || !verificationUrl) throw new Error('device-code response incomplete')
       const sid = randomBytes(16).toString('hex')
+      const binding = randomBytes(16).toString('hex')
       const continueUrl = new URL(verificationUrl)
+      // The sid is a handle, not a capability: /authorize/complete also demands
+      // the HttpOnly cookie below, so this link is useless in another browser.
       continueUrl.searchParams.set('return_to', `${ISSUER}/authorize/complete?sid=${sid}`)
       continueUrl.searchParams.set('client', checked.params.client_label)
-      sessions.set(sid, { ...checked.params, deviceCode, continueUrl: continueUrl.toString(), exp: Date.now() + SESSION_TTL_MS })
+      sessions.set(sid, { ...checked.params, deviceCode, continueUrl: continueUrl.toString(), binding, exp: Date.now() + SESSION_TTL_MS })
+      res.setHeader('Set-Cookie', bindingCookieHeader([...bindingEntries(req), { sid, binding }]))
       json(res, 200, { sid, continueUrl: continueUrl.toString(), userCode })
     } catch (err) {
       console.error('[oauth] device-code start failed:', err)
@@ -507,11 +657,34 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     const session = sessions.get(sid)
     if (!session || session.exp < Date.now()) {
       if (session) sessions.delete(sid)
+      forgetBinding(req, res, sid)
       messagePage(res, 400, 'Sign-in expired', 'This sign-in link has expired. Go back to the app and connect WebAbility again.')
       return true
     }
-    let payload: any = {}
-    let approved = false
+    // The cookie is the browser check: without a matching entry this request
+    // did not start the sign-in, so it must not collect the code (#228). The
+    // session survives — the real browser can still finish, and a wrong guess
+    // neither reveals nor destroys it.
+    const bound = bindingEntries(req).find((e) => e.sid === sid)
+    if (!bound || !sameBinding(bound.binding, session.binding)) {
+      messagePage(
+        res,
+        400,
+        'Finish signing in from the same browser',
+        'This sign-in was started in another browser or tab. Go back to the app that opened it and connect WebAbility there.',
+      )
+      return true
+    }
+    // Charged after the session and cookie are proven, so random sids from a
+    // shared IP cannot lock a real user out of finishing.
+    const budget = hooks.chargeComplete?.()
+    if (budget && !budget.ok) {
+      res.setHeader('Retry-After', String(budget.retryAfterS))
+      messagePage(res, 429, 'Too many sign-in attempts', `Too many sign-in attempts from this network. Try again in ${Math.ceil(budget.retryAfterS / 60)} min.`)
+      return true
+    }
+    let deviceToken: TokenPayload = {}
+    let deviceTokenOk = false
     try {
       const apiRes = await fetch(`${API_URL}/cli/device-token`, {
         method: 'POST',
@@ -524,19 +697,20 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       // Approval is "2xx AND a token in the body": the platform answers
       // pending with HTTP 202 + {error: "authorization_pending"}, and 202 is
       // ok:true to fetch — status alone says nothing.
-      payload = (await apiRes.json().catch(() => ({}))) as any
-      approved = apiRes.ok && typeof payload.token === 'string' && !!payload.token
+      deviceTokenOk = apiRes.ok
+      deviceToken = await readTokenPayload(apiRes)
     } catch (err) {
       console.error('[oauth] device-token request failed:', err)
       messagePage(res, 503, 'Sign-in service unavailable', 'Could not reach the WebAbility sign-in service. Reload this page in a moment.')
       return true
     }
-    if (approved) {
+    if (deviceTokenOk && deviceToken.token) {
       sessions.delete(sid)
+      forgetBinding(req, res, sid)
       const code = b64url(randomBytes(32))
       codes.set(code, {
-        token: payload.token,
-        refresh_token: typeof payload.refreshToken === 'string' && payload.refreshToken ? payload.refreshToken : undefined,
+        token: deviceToken.token,
+        refresh_token: deviceToken.refreshToken,
         code_challenge: session.code_challenge,
         redirect_uri: session.redirect_uri,
         client_id: session.client_id,
@@ -549,8 +723,9 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       res.end()
       return true
     }
-    if (payload?.error === 'expired') {
+    if (deviceToken.error === 'expired') {
       sessions.delete(sid)
+      forgetBinding(req, res, sid)
       messagePage(res, 400, 'Sign-in expired', 'This sign-in link has expired. Go back to the app and connect WebAbility again.')
       return true
     }
@@ -567,13 +742,16 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
       return true
     }
     if (p.grant_type === 'refresh_token') {
-      await refreshGrant(p.refresh_token, clientId, res, onTokenIssued)
+      await refreshGrant(p.refresh_token, clientId, res, hooks.onTokenIssued)
       return true
     }
     if (p.grant_type !== 'authorization_code') {
       json(res, 400, { error: 'unsupported_grant_type' })
       return true
     }
+    // A requested `scope` is ignored (RFC 6749 §3.3): absent, `mcp`,
+    // `openid offline_access` and anything else all redeem the code and get the
+    // default grant.
     const issued = p.code ? codes.get(p.code) : undefined
     if (!issued || issued.exp < Date.now()) {
       if (p.code) codes.delete(p.code)
@@ -595,8 +773,11 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     }
     // The access token is a 30-day WebAbility JWT. No expires_in: the client
     // learns it expired from a 401 on /mcp/auth, then uses refresh_token.
-    onTokenIssued?.(issued.token)
-    json(res, 200, { access_token: issued.token, token_type: 'Bearer', scope: 'mcp', ...(issued.refresh_token ? { refresh_token: bindRefreshToken(issued.refresh_token, issued.client_id) } : {}) })
+    // No `scope` either: RFC 6749 §5.1 makes it optional when it is the
+    // requested one, and this token carries the caller's whole account — a
+    // `scope: "mcp"` here would read as a narrower grant than it is (C2).
+    hooks.onTokenIssued?.(issued.token)
+    json(res, 200, { access_token: issued.token, token_type: 'Bearer', ...(issued.refresh_token ? { refresh_token: bindRefreshToken(issued.refresh_token, issued.client_id) } : {}) })
     return true
   }
 
