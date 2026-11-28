@@ -26,6 +26,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
 import { APPS_MCP_PATH, MCP_PATH, PUBLIC_URL, SIGN_IN_MCP_PATH, resourceMetadataUrl } from './signIn.js'
 import type { AnonGateResult } from './anonGate.js'
 import { OAUTH_MAX_BODY_BYTES, readBodyCapped } from './bodyLimit.js'
+import { setSecurityHeaders } from './securityHeaders.js'
 
 const ISSUER = PUBLIC_URL
 const API_URL = process.env.WEBABILITY_API_URL || process.env.ABILYO_API_URL || 'https://api.webability.io'
@@ -423,6 +424,7 @@ function escapeHtml(value: string): string {
 
 /** A plain status page for /authorize/complete outcomes that do not redirect. */
 function messagePage(res: ServerResponse, status: number, title: string, message: string, link?: { href: string; label: string }) {
+  setSecurityHeaders(res, { html: true })
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
   res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>
 <style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1115;color:#e8eaed;display:grid;place-items:center;min-height:100vh}main{max-width:26rem;padding:2rem;text-align:center}p{color:#9aa0a6;line-height:1.5}a{display:inline-block;margin-top:1rem;padding:.6rem 1.4rem;border-radius:.5rem;background:#2563eb;color:#fff;text-decoration:none;font-weight:600}</style></head>
@@ -610,11 +612,13 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     // Invalid client or redirect_uri must never redirect (open-redirect risk) —
     // show the error on our own page instead.
     if (!checked.ok) {
+      setSecurityHeaders(res, { html: true })
       res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' })
       const detail = `${checked.code}: ${checked.error}`.replace(/</g, '&lt;')
       res.end(`<!doctype html><meta charset="utf-8"><title>Invalid request</title><p style="font-family:sans-serif">Invalid authorization request: ${detail}</p>`)
       return true
     }
+    setSecurityHeaders(res, { html: true })
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
     res.end(authorizePage(checked.params))
     return true

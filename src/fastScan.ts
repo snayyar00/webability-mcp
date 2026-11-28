@@ -14,31 +14,36 @@
  * the `visual` fixability tier (contrast, target size, focus ring, reflow…)
  * is dropped and counted in `skippedVisual`. Use engine:"browser" for those.
  *
- * The engine is process-wide (one jsdom document, one scan at a time, on the
- * main thread), so a scan is an event-loop block for everything else this
- * server answers. Three guards keep it from becoming a freeze: a pre-scan cap
- * on bytes / element count / nesting depth, a hard deadline per call
- * (withDeadline), and a bounded queue that answers "busy, retry in Ns" rather
- * than chaining callers behind an unbounded backlog.
+ * The engine runs in a worker thread (scanWorker.ts), never on this one: a
+ * scan is one synchronous block of 0.7-33 s, and on the main thread that block
+ * is the whole process — /health, OAuth and every other tenant's tool call wait
+ * behind it, and a deadline cannot preempt it (a timer only fires when the loop
+ * yields). Four guards keep it from becoming a freeze, in this order: a
+ * pre-scan cap on bytes / element count / nesting depth, a bounded queue that
+ * answers "busy, retry in Ns" instead of chaining callers, a wall-clock
+ * deadline per call (withDeadline), and terminate() on the thread when that
+ * deadline passes — which is what makes the deadline real.
+ *
+ * This module owns the policy (caps, queue, deadline, thread lifecycle) and
+ * the document decision; the worker owns jsdom and the scan itself.
  */
-import { defaultTreeAdapter, parse as parse5Parse } from 'parse5'
-import { createRequire } from 'module'
-import type { InternalBug, JudgeOptions, JudgedEntry } from '@webability/core'
-import { withDeadline } from './deadline.js'
-import { enrichIssue, type Fixability } from './fixOps.js'
+import { Worker } from 'node:worker_threads'
 
-const require = createRequire(import.meta.url)
+import { defaultTreeAdapter, parse as parse5Parse } from 'parse5'
+import type { InternalBug, JudgeOptions, JudgedEntry } from '@webability/core'
+import { DeadlineError, withDeadline } from './deadline.js'
+import type { Fixability } from './fixOps.js'
 
 /**
  * Caps, deadline and queue for the in-process engine.
  *
- * This engine is process-wide: ONE jsdom document, one scan at a time, and the
- * detector kernel runs on the main thread — a scan IS an event-loop block, so
- * /health and every other tool stall behind it. Measured on origin/main:
- * 12 KB of markup blocked the loop 5.9 s, 24 KB 33 s, a depth-800 nest 10 s.
- * The cost is superlinear in element count and nesting depth, not in bytes, so
- * the snippet gets a ceiling in all three dimensions. Anything bigger belongs
- * on scan_page or on engine:"browser", where each scan is its own page.
+ * ONE jsdom document per worker thread, one scan at a time, started on demand.
+ * Measured on origin/main: 12 KB of markup cost 5.9 s, 24 KB 33 s, a
+ * depth-800 nest 10 s. The cost is superlinear in element count and nesting
+ * depth, not in bytes, so the snippet gets a ceiling in all three dimensions.
+ * A 33 s scan no longer freezes the server, but it still burns a thread and a
+ * caller's 24 s budget: anything bigger belongs on scan_page or on
+ * engine:"browser", where each scan is its own page.
  */
 export const SCAN_HTML_MAX_BYTES = 256 * 1024
 /** Measured: 300 flat elements ≈ 9 s worst case, 500 ≈ 38 s. A component snippet, not a page. */
@@ -240,6 +245,18 @@ let queueDepth = 0
 /** EWMA of completed in-process scans, the basis of the "retry in Ns" hint. */
 let recentScanMs = 750
 
+/**
+ * Queue state as seen from outside the engine, for the two places that answer
+ * a caller before a scan could start: the hosted edge (503 + `Retry-After`
+ * when `full`) and the handler (the header on a scan that timed out, where the
+ * honest wait is the pace of the scans ahead).
+ */
+export function scanHtmlQueue(): { depth: number; limit: number; full: boolean; retryAfterSeconds: number } {
+  const limit = scanQueueLimit()
+  const depth = queueDepth
+  return { depth, limit, full: depth >= limit, retryAfterSeconds: retryAfterSeconds(Math.max(1, depth)) }
+}
+
 export interface FastScanIssue {
   id: string
   type: string
@@ -268,98 +285,161 @@ export interface FastScanResult {
 
 const looksLikeDocument = (html: string) => /<html[\s>]|<!doctype/i.test(html)
 
-function installLayoutShims(win: any) {
-  const Element = win.Element
-  // jsdom's getComputedStyle reads the element's inline style and throws on
-  // elements that have none (a MathML root: <math lang="en">). Such an element
-  // gets an empty declaration, as an unstyled element would.
-  const computed = win.getComputedStyle.bind(win)
-  win.getComputedStyle = (el: any, pseudo?: string) => (el && el.style === undefined ? win.document.createElement('div').style : computed(el, pseudo))
-  const rect = (el: any) => {
-    const style = win.getComputedStyle(el)
-    if (style && style.display === 'none') return null
-    let p = el.parentElement
-    while (p) {
-      if (win.getComputedStyle(p).display === 'none') return null
-      p = p.parentElement
-    }
-    return { x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 20, width: 100, height: 20, toJSON() { return this } }
-  }
-  Element.prototype.getBoundingClientRect = function () {
-    return rect(this) ?? { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON() { return this } }
-  }
-  Element.prototype.getClientRects = function () {
-    const r = rect(this)
-    const list: any = r ? [r] : []
-    list.item = (i: number) => list[i] ?? null
-    return list
-  }
-  if (win.HTMLMediaElement) {
-    Object.defineProperty(win.HTMLMediaElement.prototype, 'readyState', { configurable: true, get: () => 4 })
-  }
-  // Canvas is used only by the colour kernel (contrast) — visual tier, dropped anyway.
-  if (win.HTMLCanvasElement) {
-    win.HTMLCanvasElement.prototype.getContext = () => null
-  }
-  // No layout means no hit testing: nothing is at any point.
-  win.Document.prototype.elementFromPoint = () => null
-  win.Document.prototype.elementsFromPoint = () => []
-  // jsdom has no CSS namespace; the kernel builds selectors with CSS.escape.
-  if (!win.CSS) win.CSS = { escape: cssEscape }
+/**
+ * The scan result without the two fields the parent owns: the worker never
+ * learns whether its document came from a snippet, and `durationMs` is the
+ * scan's own time on its own thread.
+ */
+export type ScanWorkerResult = Omit<FastScanResult, 'fragment'>
+
+/** One unit of work for the worker. Plain JSON — structured clone, no functions. */
+export interface ScanWorkerJob {
+  id: number
+  /** The finished document to write: the snippet wrapper is already applied. */
+  doc: string
+  wcagTags?: string[]
+  level?: 'A' | 'AA' | 'AAA'
+  judge?: Omit<JudgeOptions, 'transport'>
+  /** Absolute epoch ms the judge must end by; the worker caps its own judge with it. */
+  judgeEndsAt?: number
 }
 
-/** CSS.escape per CSSOM §2.1.1 (serialize an identifier). */
-function cssEscape(value: unknown): string {
-  const s = String(value)
-  let out = ''
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i)
-    if (c === 0) out += '\uFFFD'
-    else if ((c >= 0x1 && c <= 0x1f) || c === 0x7f || (i === 0 && c >= 0x30 && c <= 0x39) || (i === 1 && c >= 0x30 && c <= 0x39 && s.charCodeAt(0) === 0x2d)) out += '\\' + c.toString(16) + ' '
-    else if (i === 0 && c === 0x2d && s.length === 1) out += '\\' + s[i]
-    else if (c >= 0x80 || c === 0x2d || c === 0x5f || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) out += s[i]
-    else out += '\\' + s[i]
-  }
-  return out
-}
+/** What a worker posts back: the result, or the error with its name restored. */
+type ScanWorkerReply = { id: number; ok: true; result: ScanWorkerResult } | { id: number; ok: false; error: { name: string; message: string; stack?: string } }
+
+/**
+ * The warm-up signal. A thread posts `ready` once jsdom, axe and the detector
+ * kernel are loaded, i.e. once a job posted to it can be scanned at all; before
+ * that a job sits in the thread's port queue while the cold start runs. A
+ * failed warm-up is final — that thread can never scan, so the parent kills it.
+ */
+type ScanWorkerReady = { ready: true } | { ready: false; error: { name: string; message: string; stack?: string } }
+type ScanWorkerMessage = ScanWorkerReply | ScanWorkerReady
 
 let scanning: Promise<void> = Promise.resolve()
 
 /**
- * ONE jsdom window for the life of the process. axe-core (and the detector
- * kernel) bind to the ambient `window`/`document` when first loaded, so a
- * fresh JSDOM per call scans the FIRST document forever — the second call
- * returned nothing. Instead the document is rewritten in place per scan
- * (`document.open/write/close`), which keeps every engine pointed at the
- * live content.
+ * ONE warm engine thread, spawned on the first scan and reused. Two reasons,
+ * both measured: a cold thread costs 1-4 s before jsdom is even loaded, and
+ * axe-core plus the detector kernel bind to the ambient `window`/`document`
+ * when first loaded — which is why the worker rewrites one document in place
+ * instead of building a fresh JSDOM per call.
+ *
+ * `ready` and `running` are the deadline's two questions: a deadline may kill a
+ * thread only when it is warm AND the job that blew its budget is the one it is
+ * working on. Killing a warming thread throws away the 1-4 s it already paid, so
+ * the replacement pays it again, and a loaded machine can lose that race every
+ * call — the thread never finishes warming and the engine never recovers.
  */
-let shared: { dom: import('jsdom').JSDOM; win: any } | null = null
+interface EngineThread {
+  readonly worker: Worker
+  /** Warm-up finished: a job posted now is scanned, not queued behind imports. */
+  ready: boolean
+  /** The job posted to this thread whose reply has not been seen yet, if any. */
+  running: number | null
+}
 
-function sharedWindow() {
-  if (shared) return shared
-  const { JSDOM, VirtualConsole } = require('jsdom') as typeof import('jsdom')
-  // jsdom logs "Not implemented" (canvas etc.) to the console by default — keep stderr clean.
-  const virtualConsole = new VirtualConsole()
-  const dom = new JSDOM('<!doctype html><html><head><title></title></head><body></body></html>', { pretendToBeVisual: true, virtualConsole })
-  const win = dom.window as any
-  installLayoutShims(win)
-  const g = globalThis as any
-  // Detectors run in Node's realm and read DOM globals (NodeFilter, CSS,
-  // HTMLInputElement...) as free identifiers: expose every jsdom global Node
-  // lacks. Lazy getters, so a throwing accessor (localStorage on an opaque
-  // origin) throws only if a detector reads it.
-  for (const k of Object.getOwnPropertyNames(win)) {
-    if (k in g) continue
-    Object.defineProperty(g, k, { configurable: true, get: () => win[k] })
+let engineThread: EngineThread | null = null
+let nextJobId = 1
+const pending = new Map<number, { resolve: (r: ScanWorkerResult) => void; reject: (e: Error) => void }>()
+
+/**
+ * The thread's loader. tsx registers its module hooks on the MAIN thread only
+ * (its preflight and ESM entry both check `isMainThread`), so a worker started
+ * from source resolves none of this package's relative `.js` specifiers and
+ * dies with ERR_MODULE_NOT_FOUND. `workerTsx.mjs` registers the same hooks in
+ * the thread before the entry module loads. In dist the worker is emitted
+ * beside its imports, so it needs no loader and inherits this process's argv.
+ */
+function workerExecArgv(): string[] | undefined {
+  if (!import.meta.url.endsWith('.ts')) return undefined
+  return ['--import', new URL('./workerTsx.mjs', import.meta.url).href]
+}
+
+function spawnEngineThread(): EngineThread {
+  // By extension, not by module resolution: under `tsx` the source is what must
+  // run, in dist it is the emitted sibling.
+  const url = new URL(import.meta.url.endsWith('.ts') ? './scanWorker.ts' : './scanWorker.js', import.meta.url)
+  const thread: EngineThread = { worker: new Worker(url, { execArgv: workerExecArgv() }), ready: false, running: null }
+  const { worker: w } = thread
+  // Listeners first, then unref: attaching a `message` listener re-refs the
+  // thread's port (node:internal/worker/io), so unref-ing before the `on` calls
+  // is silently undone and an idle warm thread pins the event loop forever. An
+  // idle warm thread must not keep the process alive (tests, the CLI); a thread
+  // with a job in flight is ref'd in dispatch, and its reply unrefs again.
+  w.on('message', (msg: ScanWorkerMessage) => {
+    // Only the current thread's readiness matters: a terminated thread can still
+    // deliver a message in the tick before `exit`.
+    if ('ready' in msg) {
+      if (engineThread !== thread) return
+      if (msg.ready) {
+        thread.ready = true
+        return
+      }
+      // A thread whose warm-up threw can never scan. Its jobs (and the callers
+      // waiting on them) are failed here rather than at each deadline.
+      const err = new Error(msg.error.message)
+      err.name = msg.error.name
+      if (msg.error.stack) err.stack = msg.error.stack
+      killEngineThread(err)
+      return
+    }
+    const entry = pending.get(msg.id)
+    if (!entry) return
+    pending.delete(msg.id)
+    if (thread.running === msg.id) thread.running = null
+    if (pending.size === 0) w.unref()
+    if (msg.ok) {
+      entry.resolve(msg.result)
+      return
+    }
+    // Rebuild the error the worker threw, name and stack intact: callers branch
+    // on `instanceof`/`name` (the handler maps DeadlineError, ScanHtmlLimitError
+    // and friends), and a bare Error would hide which one happened.
+    const err = new Error(msg.error.message)
+    err.name = msg.error.name
+    if (msg.error.stack) err.stack = msg.error.stack
+    entry.reject(err)
+  })
+  const died = (err: Error) => {
+    // A terminate() we caused fires 'exit' after the replacement may exist:
+    // only the CURRENT thread's death may clear the handle and its jobs.
+    if (engineThread !== thread) return
+    killEngineThread(err)
   }
-  shared = { dom, win }
-  return shared
+  w.on('error', died)
+  w.on('exit', (code) => died(new Error(`scan_html engine thread exited with code ${code}`)))
+  w.unref()
+  return thread
+}
+
+/**
+ * Stop the thread and fail everything it owed. Jobs are rejected BEFORE the
+ * handle is cleared and the thread terminated: a cleared map with an unsettled
+ * job would leave `work` pending forever, and the serial chain releases only
+ * when `work` settles.
+ */
+function killEngineThread(reason: Error) {
+  const thread = engineThread
+  engineThread = null
+  for (const [id, entry] of pending) {
+    pending.delete(id)
+    entry.reject(reason)
+  }
+  thread?.worker.terminate().catch(() => {})
 }
 
 export interface FastScanOptions {
   wcagTags?: string[]
   level?: 'A' | 'AA' | 'AAA'
   judge?: JudgeOptions
+  /**
+   * Absolute epoch ms the judge must end by (the call's own deadline, minus a
+   * margin to build the reply). Applied in the worker, not here: capping it
+   * here would freeze the budget at dispatch time and give the judge the whole
+   * scan's duration on top.
+   */
+  judgeEndsAt?: number
   /** Hard budget for one scan. Defaults to SCAN_HTML_DEADLINE_MS. */
   deadlineMs?: number
 }
@@ -368,15 +448,23 @@ export async function fastScanHtml(html: string, opts: FastScanOptions = {}): Pr
   // The caps run here as well as in the handler: this is a public entry point
   // (tests, the CLI), and a cap the caller can forget is not a cap.
   assertScanHtmlWithinCaps(html)
+  // A judge transport is a function; structured clone refuses it, and the
+  // refusal would arrive as a DataCloneError after the caller spent a queue
+  // slot. Refuse it here, before either.
+  if (opts.judge && typeof (opts.judge as { transport?: unknown }).transport === 'function') {
+    throw new Error(
+      'scan_html judge options carry a `transport` function, which cannot cross to the worker thread that runs the scan. ' +
+        'Call scanDocument from @webability/core/dom directly to supply a transport.',
+    )
+  }
 
   const limit = scanQueueLimit()
   if (queueDepth >= limit) throw new ScanHtmlBusyError(queueDepth, retryAfterSeconds(queueDepth))
   queueDepth += 1
 
-  // Serialise on a module-level chain: the detector kernel and axe read the
-  // ambient `window`/`document`, so scans must not interleave. The chain is
-  // released by the WORK, never by the caller's deadline — see
-  // fastScanHtmlSerial.
+  // Serialise on a module-level chain: the thread has ONE document, so scans
+  // must not interleave. The chain is released by the WORK, never by the
+  // caller's deadline — see fastScanHtmlSerial.
   const previous = scanning
   let releaseChain!: () => void
   scanning = new Promise<void>((resolve) => (releaseChain = resolve))
@@ -401,75 +489,87 @@ export async function fastScanHtml(html: string, opts: FastScanOptions = {}): Pr
  *
  * The deadline covers the QUEUE WAIT as well as the scan (it starts at call
  * entry, in fastScanHtml), so a call cannot outlive its budget however long the
- * queue is. It releases the CALLER; `onSettled` fires when the scan itself
- * ends. They are deliberately not the same moment: a scan that blew its
- * deadline may still own the one shared jsdom document, and the next scan
- * writing into that document would corrupt both results.
+ * queue is. What it now also does is stop the WORK: the scan is a synchronous
+ * block on another thread, so `terminate()` is real preemption — the reply is
+ * no longer bounded by how long the block runs, and the thread's half-written
+ * document dies with it.
  *
- * What the deadline cannot do is preempt the detector kernel: those seconds are
- * one synchronous block, and a timer only fires when the loop yields. That part
- * is bounded by the caps — which is why both guards exist.
+ * Only a deadline kills the thread, and only one that is warm AND working on
+ * this job. A job still queued never touched the document; an error the worker
+ * reported is that scan's problem, not the thread's; and a thread still paying
+ * its 1-4 s cold start is the one case where killing makes the next call pay it
+ * again. On a loaded machine that next call loses the same race to its own
+ * deadline, the replacement never finishes warming, and the engine never
+ * recovers — so a warming thread is kept: this caller is answered at its
+ * deadline (the work continues abandoned), and the next one inherits the
+ * warm-up instead of restarting it.
  */
 function fastScanHtmlSerial(html: string, opts: FastScanOptions, previous: Promise<void>, onSettled: (scanMs?: number) => void): Promise<FastScanResult> {
   const abort = new AbortController()
-  // The scan starts only when its turn comes; until then it is a waiter the
-  // deadline can still cut, and one that never touches the shared document.
-  const work = previous.then(() => scanHtmlInSharedWindow(html, opts, abort.signal))
-  // `scanHtmlInSharedWindow` is async, so it cannot throw before returning a
+  const { doc, fragment } = engineDocument(html)
+  const job: ScanWorkerJob = { id: nextJobId++, doc, wcagTags: opts.wcagTags, level: opts.level, judge: opts.judge, judgeEndsAt: opts.judgeEndsAt }
+  const work: Promise<FastScanResult> = previous.then(() => {
+    // A caller who gave up while queued must not reach the thread at all.
+    abort.signal.throwIfAborted()
+    return dispatchToEngine(job)
+  }).then((r) => ({ ...r, fragment }))
+  // `work` is async from the start, so it cannot throw before returning a
   // promise: the slot and the chain are always released exactly once.
   work.then(
     (r) => onSettled(r.durationMs),
     () => onSettled(undefined),
   )
   return withDeadline(() => work, opts.deadlineMs ?? SCAN_HTML_DEADLINE_MS, 'scan_html').catch((err) => {
-    // The caller gave up. A scan that already started stops at its next
-    // checkpoint; one still queued aborts before it rewrites the document.
     abort.abort()
+    if (err instanceof DeadlineError) {
+      const thread = engineThread
+      if (thread?.ready && thread.running === job.id) {
+        killEngineThread(new DeadlineError('scan_html', err.ms))
+        // The replacement costs a cold start, so the next caller's "retry in Ns"
+        // hint must not be the warm pace. Spawned here, synchronously, and not
+        // on the next dispatch: the warm-up is the cost, so it must start now,
+        // while this caller waits out Retry-After anyway.
+        engineThread = spawnEngineThread()
+        recentScanMs = Math.max(recentScanMs, 3_000)
+      } else if (thread && !thread.ready && thread.running === job.id) {
+        // This job is on a thread still paying its cold start. The work is
+        // abandoned but owns the thread, the queue slot and the serial chain:
+        // release them now so the next caller can queue, and let the abandoned
+        // job land on a thread nothing else waits for. `onSettled` is
+        // idempotent, so its eventual reply finds the entry already released.
+        onSettled(undefined)
+      }
+      // Still queued: leave the chain alone. Once `previous` settles,
+      // `throwIfAborted` rejects `work` and its own handler releases it, with
+      // `thread.running` still naming the job the thread is really running. An
+      // early release here would let a later dispatch shadow that job, and its
+      // deadline would then kill a scan still inside its own budget.
+    }
     throw err
   })
 }
 
-async function scanHtmlInSharedWindow(html: string, opts: FastScanOptions, signal: AbortSignal): Promise<FastScanResult> {
-  const started = Date.now()
-  const { doc, fragment } = engineDocument(html)
-  const { win } = sharedWindow()
-  // A scan whose deadline already fired must not rewrite the document: the
-  // next scan may be writing its own content by now.
-  signal.throwIfAborted()
-  win.document.open()
-  win.document.write(doc)
-  win.document.close()
-
-  const { scanDocument, installDomKernel } = await import('@webability/core/dom')
-  // Detector functions run in Node's realm and read the kernel helpers
-  // (isVisible, uniqueSel, isHiddenFromAT...) as free identifiers: install them
-  // on Node's globalThis (scanDocument installs them on the jsdom window only),
-  // or every detector throws and scan_html runs axe alone. Idempotent.
-  installDomKernel(globalThis)
-  signal.throwIfAborted()
-  const result = await scanDocument({ window: win, includeAxe: true, wcagTags: opts.wcagTags, level: opts.level, judge: opts.judge })
-  let skippedVisual = 0
-  const project = (list: any[]) => {
-    const out: FastScanIssue[] = []
-    for (const i of list) {
-      const e = enrichIssue({ id: i.id, type: i.type, wcag: i.wcag, level: i.level, impact: i.impact, message: i.message, selector: i.selector, html: i.html?.slice(0, 400), fix: i.fix }) as any
-      if (e.fixability === 'visual') { skippedVisual++; continue }
-      out.push(e)
+function dispatchToEngine(job: ScanWorkerJob): Promise<ScanWorkerResult> {
+  const thread = (engineThread ??= spawnEngineThread())
+  const w = thread.worker
+  return new Promise<ScanWorkerResult>((resolve, reject) => {
+    pending.set(job.id, { resolve, reject })
+    // Set before the post, in the same synchronous block: no timer can fire
+    // between the two, so a deadline never sees `running` pointing at a job
+    // whose message the thread has not received.
+    thread.running = job.id
+    // A job in flight must hold the loop open; the reply unrefs again.
+    w.ref()
+    try {
+      w.postMessage(job)
+    } catch (err) {
+      // A structured-clone refusal throws here, after the promise was already
+      // given a resolver. Without this the entry is never claimed and the ref
+      // is never dropped: the map leaks and the process can never exit.
+      pending.delete(job.id)
+      if (thread.running === job.id) thread.running = null
+      if (pending.size === 0) w.unref()
+      reject(err instanceof Error ? err : new Error(String(err)))
     }
-    return out
-  }
-  const issues = project(result.issues)
-  const count = (lvl: string) => issues.filter((i) => i.impact === lvl).length
-  const warnings = (result.engineWarnings ?? []).filter((w) => !w.startsWith('focus:'))
-  return {
-    engine: 'in-process',
-    fragment,
-    issues,
-    summary: { total: issues.length, critical: count('critical'), serious: count('serious'), moderate: count('moderate'), minor: count('minor') },
-    skippedVisual,
-    ...(result.judged?.length ? { judged: result.judged } : {}),
-    ...(warnings.length ? { engineWarnings: warnings } : {}),
-    internal_bugs: result.internal_bugs ?? [],
-    durationMs: Date.now() - started,
-  }
+  })
 }

@@ -14,7 +14,7 @@ import { scan, verifyFixRefusal, REASON_TEXT, getContrastRatio, extractSiteTheme
 import { contrastLaunchesBrowser, contrastPalette } from './contrastPalette.js'
 
 import { isTunnelUrl, parseTunnelTarget, type TunnelTarget, tunnelBlockHint, tunnelHeadersFor } from './tunnelAuth'
-import { DeadlineError, withDeadline } from './deadline'
+import { DeadlineError, judgeWithin, withDeadline } from './deadline'
 import { pageStratified, stratifiedCap } from './capStratified'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -33,7 +33,7 @@ import { axeRuleFixMeta, enrichIssue, webabilityRuleFixMeta, FIXABILITY_TIERS, t
 import { IMPACT_RANK, INLINE_BUDGET, OFFSET_PROPERTY, OUTPUT_CONTROL_PROPERTIES, controlsList, describeControls, filterIssues, isFiltered, parseOutputControls, renderFindingsBlock, scanLevel, type OutputControls } from './outputControls.js'
 import { collectSourcePointers, findSourceCandidates, type SourcePointer } from './sourcePointers.js'
 import { collapseRepeats, dropObsoleteParsing, mergeSameElement, nameFamilyKey, recountSummary, scanHeadline, truncationNote, widgetViewNote } from './scanShaping.js'
-import { SCAN_HTML_DEADLINE_MS, ScanHtmlBusyError, ScanHtmlLimitError, assertScanHtmlWithinCaps, fastScanHtml } from './fastScan.js'
+import { SCAN_HTML_DEADLINE_MS, ScanHtmlBusyError, ScanHtmlLimitError, assertScanHtmlWithinCaps, fastScanHtml, scanHtmlQueue } from './fastScan.js'
 import { openSession, schemeForBareUrl } from './browser.js'
 import { isBlockedAddress, normalizeHost } from './egressProxy.js'
 import { AccountError, addSite, createUpgradeLink, describeSite, findSite, INSTALL_SNIPPET, listSites } from './account.js'
@@ -192,28 +192,19 @@ export interface ServerOptions {
   scanPageDeadlineMs?: number
   /** scan_html (in-process) time budget. Tests set it low; production uses SCAN_HTML_DEADLINE_MS. */
   scanHtmlDeadlineMs?: number
+  /**
+   * How long the caller should wait before the next scan_html, for answers that
+   * carry a `Retry-After` on the wire: a full queue and a scan cut at its
+   * deadline. Only the hosted HTTP transport can send a header; stdio ignores
+   * it, and the tool text already states the same number.
+   */
+  onScanHtmlRetry?: (seconds: number) => void
   /** Tests only: opens the browser for diff_scan's live scans. Lets a hosted-mode test reach a local page. */
   openSession?: typeof openSession
 }
 
 /** The judge stops this long before the hosted deadline, leaving time to build the reply. */
 const JUDGE_DEADLINE_MARGIN_MS = 2_000
-
-/**
- * Cap the AI judge so it ends by `endsAt`. scan() spreads opts.judge when the
- * judge starts (after the engines), so timeoutMs is a getter: the judge gets
- * the time left at that moment. Without this the scan deadline fires mid-judge
- * and discards engine findings already made. There is no fixed judge budget on
- * top: a fast page leaves the judge more time, a slow page less. Only an
- * operator budget (WEBABILITY_JUDGE_TIMEOUT_MS) caps it further.
- */
-export function judgeWithin(judge: JudgeOptions | undefined, endsAt: number): JudgeOptions | undefined {
-  if (!judge) return undefined
-  const budget = judge.timeoutMs ?? Infinity
-  const capped = { ...judge }
-  Object.defineProperty(capped, 'timeoutMs', { enumerable: true, get: () => Math.max(1, Math.min(budget, endsAt - Date.now())) })
-  return capped
-}
 
 /** Hosted flow_scan: pages scanned per call (maxPages is clamped to this) and
  *  URLs accepted per call (startUrl + autoNavigate). One call is one unit of
@@ -2606,9 +2597,9 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
     if (tags.includes('wcag2aaa') && !htmlControls.level) htmlControls = { ...htmlControls, level: 'AAA' }
 
     if (engine === 'in-process') {
-      // Cheap pre-scan caps before a byte reaches jsdom: the in-process engine
-      // shares one document and one event loop with every other tool, and its
-      // cost grows superlinearly in element count and nesting depth.
+      // Cheap pre-scan caps before a byte reaches the engine thread: its cost
+      // grows superlinearly in element count and nesting depth, and a scan that
+      // large takes the thread down with it.
       try {
         assertScanHtmlWithinCaps(html)
       } catch (err) {
@@ -2620,11 +2611,13 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
         const r = await fastScanHtml(html, {
           wcagTags: tags,
           level: scanLevel(htmlControls, tags),
+          judge: judgeFor(opts),
           // The judge must end inside the same budget as the scan (scan_page
-          // caps it the same way): after the deadline the caller is gone, and a
-          // judge still running would hold the one shared jsdom document — the
-          // queue slot and the chain with it.
-          judge: opts.remote ? judgeWithin(judgeFor(opts), startedAt + htmlDeadlineMs - JUDGE_DEADLINE_MARGIN_MS) : judgeFor(opts),
+          // caps it the same way): after the deadline the caller is gone. The
+          // deadline is passed as an absolute instant because the judge runs on
+          // the engine thread, where a getter would have been evaluated too
+          // early to mean anything.
+          ...(opts.remote ? { judgeEndsAt: startedAt + htmlDeadlineMs - JUDGE_DEADLINE_MARGIN_MS } : {}),
           deadlineMs: scanBudgetLeft(htmlDeadlineMs),
         })
         const issues = filterIssues(r.issues, htmlControls)
@@ -2654,11 +2647,30 @@ const dispatchTool = async (request: CallToolRequest, opts: ServerOptions = {}):
           ],
         }
       } catch (err) {
-        if (err instanceof ScanHtmlBusyError || err instanceof ScanHtmlLimitError) return toolError(err.message)
+        if (err instanceof ScanHtmlBusyError) {
+          opts.onScanHtmlRetry?.(err.retryAfterSeconds)
+          return toolError(err.message, {
+            code: 'rate_limited',
+            retriable: true,
+            next: { tool: 'scan_html', args: args as Record<string, unknown>, action: `wait ${err.retryAfterSeconds} seconds, then repeat this call` },
+          })
+        }
+        if (err instanceof ScanHtmlLimitError) return toolError(err.message, { code: 'invalid_args', retriable: false })
         if (err instanceof DeadlineError) {
+          // The queue is empty of our work and the engine thread is being
+          // replaced, so the wait a caller should observe is the pace of a
+          // fresh scan, not "retry immediately": a caller that retries at once
+          // lands on the cold start its own call just paid for.
+          const { retryAfterSeconds } = scanHtmlQueue()
+          opts.onScanHtmlRetry?.(retryAfterSeconds)
           return toolError(
             `scan_html did not finish within ${Math.round(htmlDeadlineMs / 1000)}s (in-process jsdom engine), so the call was stopped. ` +
-              'Split the markup into smaller snippets, or use scan_page on the URL (or scan_html with engine:"browser") for a whole page.',
+              `Retry in ${retryAfterSeconds}s, split the markup into smaller snippets, or use scan_page on the URL (or scan_html with engine:"browser") for a whole page.`,
+            {
+              code: 'timeout',
+              retriable: true,
+              next: { tool: 'scan_html', args: args as Record<string, unknown>, action: `wait ${retryAfterSeconds} seconds with a smaller snippet, then repeat this call` },
+            },
           )
         }
         return toolError(`scan_html failed: ${(err as Error).message}`)

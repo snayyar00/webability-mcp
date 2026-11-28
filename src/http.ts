@@ -26,11 +26,13 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createHash, timingSafeEqual } from 'crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createServer } from './server.js'
+import { scanHtmlBusyRefusal } from './scanHtmlGate.js'
 import { assertSigningSecret, handleOAuth, type OAuthHooks, wwwAuthenticate } from './oauth.js'
 import { anonCallCost, anonLimitClass, anonLimitMessage, appsAnonLimitMessage, calledTools, clientIp, createAnonLimiter, describeClientIpPolicy, operatorLimitClass, operatorLimitMessage } from './anonGate.js'
 import { APPS_MCP_PATH, MCP_PATH, MCP_PATHS, PUBLIC_URL, SIGN_IN_MCP_PATH, appsChallenge, resourceMetadataUrl } from './signIn.js'
 import { SERVER_CARD_PATH, getServerCard } from './serverCard.js'
 import { BodyTooLargeError, MCP_MAX_BODY_BYTES, declaredTooLarge, readBodyCapped } from './bodyLimit.js'
+import { setSecurityHeaders } from './securityHeaders.js'
 import { createTokenCache } from './tokenCache.js'
 
 const PORT = Number(process.env.PORT || 8080)
@@ -46,6 +48,11 @@ const SHARED_TOKEN = process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.le
 // entry for the life of the process.
 const tokenCache = createTokenCache({ max: 10_000 })
 const TOKEN_TTL_MS = 5 * 60 * 1000
+
+// scan_html's per-call budget, when an operator needs to lower it below the
+// 24 s default (a smaller box, or a proxy with a shorter read timeout than the
+// scan takes). Unset = fastScan's SCAN_HTML_DEADLINE_MS.
+const scanHtmlDeadlineOverrideMs = Number(process.env.MCP_SCAN_HTML_DEADLINE_MS)
 
 // Tokens the platform refused, by hash. A client retrying one dead token gets
 // the same 401 without a platform call and without spending the IP's bad-token
@@ -233,6 +240,10 @@ function sendTooLarge(res: ServerResponse, limit: number, jsonRpc: boolean) {
 }
 
 const httpServer = createHttpServer(async (req, res) => {
+  // Every response from this origin gets them (#1457). Set before any branch
+  // writes a status line, so a route added later cannot miss them; the OAuth
+  // HTML pages override just the CSP (securityHeaders.ts).
+  setSecurityHeaders(res)
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
   // The caller's address for every rate budget below (OAuth sign-in and the
   // per-path gates); one read, so the proxies are only trusted once.
@@ -515,9 +526,37 @@ const httpServer = createHttpServer(async (req, res) => {
       }
     }
 
+    // scan_html's in-process engine is ONE jsdom document per process. Past its
+    // queue depth a call would wait behind an unknown number of multi-second
+    // scans, so it is refused here, before the SDK sees the body — the caller
+    // learns the wait from the protocol (503 + Retry-After), not only from
+    // prose. The tool handler applies the same cap for stdio. See scanHtmlGate.
+    const appsPath = mcpPath === APPS_MCP_PATH
+    const refusal = scanHtmlBusyRefusal(body, appsPath)
+    if (refusal) {
+      res.setHeader('Retry-After', String(refusal.retryAfterSeconds))
+      sendJson(res, refusal.status, refusal.body)
+      return
+    }
+
     // /mcp/apps (ChatGPT) declares per-tool securitySchemes and answers an
     // anonymous account-tool call with an isError + www_authenticate challenge.
-    const server = createServer({ remote: true, authToken, anonymous, operator, appsAuth: mcpPath === APPS_MCP_PATH })
+    const server = createServer({
+      remote: true,
+      authToken,
+      anonymous,
+      operator,
+      appsAuth: appsPath,
+      // A scan_html cut at its deadline is a tool error in a 200 response — the
+      // right status for a tool that failed, and no place for a header that
+      // tells the caller when to come back. Set it here, while the response is
+      // still ours: Node merges headers set this way into the writeHead() the
+      // transport issues at flush time.
+      onScanHtmlRetry: (seconds) => {
+        if (!res.headersSent) res.setHeader('Retry-After', String(seconds))
+      },
+      ...(scanHtmlDeadlineOverrideMs > 0 ? { scanHtmlDeadlineMs: scanHtmlDeadlineOverrideMs } : {}),
+    })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     res.on('close', () => {
       transport.close().catch(() => {})

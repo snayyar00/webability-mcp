@@ -17,7 +17,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol.js'
 
 import * as serverModule from '../src/server.ts'
-import { createServer, HOSTED_CALL_DEADLINE_MS, judgeWithin } from '../src/server.ts'
+import { judgeWithin } from '../src/deadline.ts'
+import { createServer, HOSTED_CALL_DEADLINE_MS } from '../src/server.ts'
 
 const textOf = (res: any) => res.content.map((c: any) => c.text).join('\n')
 

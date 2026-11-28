@@ -18,8 +18,12 @@
  * (depth), and a normal component snippet that must keep working.
  */
 import assert from 'node:assert/strict'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { createServer as createNetServer } from 'node:net'
 import { test } from 'node:test'
+import { Worker } from 'node:worker_threads'
+
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -36,7 +40,9 @@ import {
   engineDocument,
   estimateMarkupSize,
   fastScanHtml,
+  scanHtmlQueue,
 } from '../src/fastScan.ts'
+import { scanHtmlBusyRefusal } from '../src/scanHtmlGate.ts'
 import { HOSTED_CALL_DEADLINE_MS, createServer } from '../src/server.ts'
 
 const require = createRequire(import.meta.url)
@@ -256,26 +262,28 @@ test('deadline: a call waiting behind a slow scan is answered at its deadline, n
   assert.ok(first.issues.length >= 1, 'the first scan must still complete normally')
 })
 
-test('deadline: a queued call whose caller gave up never scans the shared document', async () => {
-  // The skip path is `abort.abort()` + `signal.throwIfAborted()` before
-  // `document.write`. Without it every expired waiter still rewrites the one
-  // shared document after its caller was answered.
-  await fastScanHtml(SMALL) // warms the shared window
-  const doc = (globalThis as any).document
-  assert.ok(doc && typeof doc.write === 'function', 'premise: the shared jsdom window is installed')
-  const original = doc.write.bind(doc)
-  let writes = 0
-  doc.write = (...args: unknown[]) => {
-    writes += 1
-    return (original as any)(...args)
+test('deadline: a queued call whose caller gave up never reaches the engine thread', async () => {
+  // The skip path is `abort.abort()` + `signal.throwIfAborted()` before the job
+  // is posted. Without it every expired waiter still occupies the one engine
+  // thread for seconds after its caller was answered — the same wedge the cap
+  // and the queue exist to prevent, one layer down.
+  await fastScanHtml(SMALL) // warms the engine thread
+  // The dispatch boundary is the Worker object itself: count posts instead of
+  // reaching into the module (there is no shared window to watch any more).
+  const original = Worker.prototype.postMessage
+  let posts = 0
+  const count = function (this: Worker, ...args: Parameters<typeof original>) {
+    posts += 1
+    return original.apply(this, args)
   }
+  Worker.prototype.postMessage = count
   try {
     const slow = fastScanHtml(spans(120))
     await assert.rejects(fastScanHtml(SMALL, { deadlineMs: 100 }), /did not finish within/)
     await slow
-    assert.equal(writes, 1, `only the running scan may write the shared document, saw ${writes} writes`)
+    assert.equal(posts, 1, `only the running scan may reach the engine thread, saw ${posts} dispatches`)
   } finally {
-    doc.write = original
+    Worker.prototype.postMessage = original
   }
 })
 
@@ -361,6 +369,38 @@ test('queue: the busy state reaches the caller as a tool result, not a hang', as
   }
 })
 
+test('the scan runs off the main thread: jsdom is never bridged into this realm', async () => {
+  // The bug this module exists for: jsdom + the detectors are ONE synchronous
+  // block, so on the main thread a 24 KB snippet froze /health for 33 s. The
+  // engine now lives on a worker thread.
+  //
+  // The old in-process engine had to install the jsdom window's globals on
+  // `globalThis` (the detectors read `document`, `NodeFilter`, `CSS` as free
+  // identifiers), so a scan that ran in this realm leaves `globalThis.document`
+  // set. It must now stay absent: a worker's globals are its own. (Responsiveness
+  // under a real scan is measured end-to-end over HTTP: /health answered 399
+  // times during a 21.9 s scan, worst 26 ms.)
+  const r = await fastScanHtml(spans(200), { deadlineMs: 24_000 })
+  assert.ok(r.issues.length >= 1, 'the scan must produce findings')
+  assert.ok(r.durationMs > 0, 'the worker reports its own scan duration')
+  assert.equal((globalThis as { document?: unknown }).document, undefined, 'the engine thread owns the document; this realm must not be given one')
+})
+
+test('a job the thread cannot clone fails the call and leaves the engine usable', async () => {
+  // Anything non-cloneable that gets past the entry check (a stray function on
+  // the judge) throws from postMessage — after the promise already has a
+  // resolver and the thread is ref'd. Unhandled, the pending entry is never
+  // claimed and the ref never dropped: every later call still works, but the
+  // process can never exit.
+  await fastScanHtml(SMALL) // warm the thread
+  await assert.rejects(
+    fastScanHtml(SMALL, { judge: { textModel: 'x', onDone: () => 1 } as never }),
+    /could not be cloned/,
+  )
+  const after = await fastScanHtml(SMALL)
+  assert.ok(after.issues.length >= 2, 'the engine must still answer after a clone refusal')
+})
+
 test('the default queue is bounded', () => {
   assert.ok(Number.isInteger(DEFAULT_SCAN_HTML_QUEUE) && DEFAULT_SCAN_HTML_QUEUE >= 2 && DEFAULT_SCAN_HTML_QUEUE <= 32)
 })
@@ -432,4 +472,243 @@ function jsdomSize(doc: any, html: string): { elements: number; depth: number } 
   }
   walk(doc.documentElement, 0)
   return { elements, depth }
+}
+
+// ---- the hosted edge: 503 + Retry-After, and the header on a timed-out call --
+
+const QUEUE_FULL = { depth: 2, limit: 2, full: true, retryAfterSeconds: 7 }
+
+/** The fields of a JSON-RPC reply these tests read, or a failure naming what was missing. */
+function asReply(value: unknown): Record<string, unknown> {
+  assert.ok(value && typeof value === 'object', `expected a JSON-RPC reply object, got ${JSON.stringify(value)}`)
+  return value as Record<string, unknown>
+}
+
+const scanCall = (id: number, args: Record<string, unknown> = { html: SMALL }) => ({
+  jsonrpc: '2.0',
+  id,
+  method: 'tools/call',
+  params: { name: 'scan_html', arguments: args },
+})
+
+test('edge gate: a full engine answers 503 with the wait, one reply per message', () => {
+  const refusal = scanHtmlBusyRefusal(scanCall(1), false, QUEUE_FULL)
+  assert.ok(refusal, 'a scan_html call on a full engine must be refused before the SDK sees it')
+  assert.equal(refusal.status, 503, '503 is what a client library retries on by itself')
+  assert.equal(refusal.retryAfterSeconds, 7, 'the header value is the queue snapshot, not a guess')
+  const single = asReply(refusal.body)
+  assert.equal(single.id, 1, 'the reply carries the request id')
+  const error = asReply(single.error)
+  assert.match(String(error.message), /scan_html is at capacity/)
+  assert.match(String(error.message), /retry in 7s/)
+  assert.match(String(error.message), /engine:"browser"/, 'the refusal names the way out')
+  assert.equal(asReply(error.data).retryAfterSeconds, 7)
+
+  // A batch stays a batch: a pipelined pair must not come back half-answered.
+  const batch = scanHtmlBusyRefusal([scanCall(1), scanCall(2)], false, QUEUE_FULL)?.body
+  assert.ok(Array.isArray(batch), 'a batch body must be answered with a batch')
+  assert.deepEqual(batch.map((r) => asReply(r).id), [1, 2])
+})
+
+test('edge gate: engine:"browser" and other tools are never refused by it', () => {
+  assert.equal(
+    scanHtmlBusyRefusal(scanCall(1, { html: SMALL, engine: 'browser' }), false, QUEUE_FULL),
+    null,
+    'a browser scan runs its own page, not the shared engine',
+  )
+  const other = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'scan_page', arguments: { url: 'https://example.com' } } }
+  assert.equal(scanHtmlBusyRefusal(other, false, QUEUE_FULL), null)
+  assert.equal(
+    scanHtmlBusyRefusal(scanCall(3), false, { depth: 1, limit: 8, full: false, retryAfterSeconds: 1 }),
+    null,
+    'room in the queue means no refusal',
+  )
+})
+
+test('edge gate: /mcp/apps gets a readable tool result, not a dead connector', () => {
+  // The Apps SDK has no retry-on-status behavior: a non-200 is a dead connector.
+  const refusal = scanHtmlBusyRefusal(scanCall(9), true, QUEUE_FULL)
+  assert.equal(refusal?.status, 200)
+  const result = asReply(asReply(refusal?.body).result)
+  assert.equal(result.isError, true)
+  const content = result.content
+  assert.ok(Array.isArray(content) && content.length > 0, 'a tool result carries content')
+  assert.match(String(asReply(content[0]).text), /retry in 7s/)
+  assert.equal(result._meta, undefined, 'busy is not a sign-in problem: no auth challenge')
+})
+
+test('queue: the snapshot the edge reads reports full at the cap, with a bounded wait', async () => {
+  const previous = process.env.MCP_SCAN_HTML_MAX_QUEUE
+  process.env.MCP_SCAN_HTML_MAX_QUEUE = '1'
+  try {
+    assert.equal(scanHtmlQueue().full, false, 'an idle engine is not full')
+    const slow = fastScanHtml(spans(200))
+    try {
+      const busy = scanHtmlQueue()
+      assert.equal(busy.depth, 1)
+      assert.equal(busy.limit, 1)
+      assert.equal(busy.full, true)
+      assert.ok(busy.retryAfterSeconds >= 1 && busy.retryAfterSeconds <= 30, `bounded wait, got ${busy.retryAfterSeconds}`)
+    } finally {
+      await slow
+    }
+    assert.equal(scanHtmlQueue().full, false, 'the slot is released with the work')
+  } finally {
+    if (previous === undefined) delete process.env.MCP_SCAN_HTML_MAX_QUEUE
+    else process.env.MCP_SCAN_HTML_MAX_QUEUE = previous
+  }
+})
+
+test('retry hint: a busy call and a timed-out call both report when to come back', async () => {
+  // The header is the transport's job (http.ts); this pins that the handler
+  // hands it a number at all, for the two failures that are worth retrying.
+  const previous = process.env.MCP_SCAN_HTML_MAX_QUEUE
+  process.env.MCP_SCAN_HTML_MAX_QUEUE = '1'
+  const busyWaits: number[] = []
+  try {
+    const client = await connect(createServer({ remote: true, onScanHtmlRetry: (s) => busyWaits.push(s) }))
+    const occupying = fastScanHtml(spans(200))
+    const busy = await client.callTool({ name: 'scan_html', arguments: { html: SMALL } })
+    assert.equal(asReply(busy).isError, true)
+    assert.match(text(busy), /busy/i)
+    await occupying
+    await client.close()
+    assert.equal(busyWaits.length, 1, `one retry hint for one refused call, got ${busyWaits.length}`)
+    assert.ok(busyWaits[0] >= 1)
+  } finally {
+    if (previous === undefined) delete process.env.MCP_SCAN_HTML_MAX_QUEUE
+    else process.env.MCP_SCAN_HTML_MAX_QUEUE = previous
+  }
+
+  const timeoutWaits: number[] = []
+  const client = await connect(createServer({ remote: true, scanHtmlDeadlineMs: 250, onScanHtmlRetry: (s) => timeoutWaits.push(s) }))
+  const timedOut = await client.callTool({ name: 'scan_html', arguments: { html: spans(200) } })
+  await client.close()
+  assert.equal(asReply(timedOut).isError, true, 'a stopped scan is an error, never a partial result')
+  assert.match(text(timedOut), /did not finish within/)
+  assert.match(text(timedOut), /Retry in \d+s/)
+  assert.equal(timeoutWaits.length, 1, 'the deadline reports the same wait the text states')
+  assert.ok(timeoutWaits[0] >= 1)
+})
+
+/**
+ * The two signals only exist on the wire: a status and a header. Everything
+ * above pins the body; this pins that a proxy or client library actually sees
+ * `Retry-After` — on the 503 for a refused call, and on the 200 that carries a
+ * timed-out tool result, where a header is the only transport-level place for it
+ * (the SDK owns that response and never clears headers set before it flushes).
+ *
+ * No timers: readiness is the server's own listen line, and the probe loop ends
+ * on a real outcome (a refusal, or the occupying call settling).
+ */
+test('hosted: Retry-After on the 503 when the engine is full, and on a timed-out scan', async () => {
+  const port = await freePort()
+  const proc = spawn('./node_modules/.bin/tsx', ['src/http.ts'], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OAUTH_SIGNING_SECRET: 'scan-html-caps-test-secret-0123456789',
+      MCP_SCAN_HTML_MAX_QUEUE: '1',
+      // Room for a busy probe loop: the gate under test is depth, not the anon cap.
+      ANON_HEAVY_PER_HOUR: '2000',
+      MCP_SCAN_HTML_DEADLINE_MS: '1500',
+      TRUSTED_PROXY_HOPS: '0',
+      WEBABILITY_SCAN_TELEMETRY: 'off',
+      POSTHOG_PROJECT_API_KEY: '',
+      POSTHOG_API_KEY: '',
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  const base = `http://127.0.0.1:${port}`
+  const post = (html: string) =>
+    fetch(base + '/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'scan_html', arguments: { html } } }),
+    })
+  try {
+    await waitForListen(proc)
+
+    // ~4 s of work under a 1.5 s deadline: the slot is held, then the call is stopped.
+    let settled = false
+    const occupying = post(spans(240)).finally(() => { settled = true })
+    const refused = await probeUntilRefused(post, () => settled)
+    assert.ok(refused, 'a scan_html call on a full engine must be answered 503, not queued behind it')
+    assert.equal(refused.status, 503, '503 is the status a client library retries on by itself')
+    const wait = Number(refused.headers.get('retry-after'))
+    assert.ok(wait >= 1 && wait <= 30, `Retry-After must be a bounded wait, got ${refused.headers.get('retry-after')}`)
+    const refusedBody = asReply(await refused.json())
+    const refusedError = asReply(refusedBody.error)
+    assert.equal(refusedError.code, -32002)
+    assert.match(String(refusedError.message), /scan_html is at capacity/)
+    assert.equal(asReply(refusedError.data).retryAfterSeconds, wait, 'the body and the header state the same wait')
+
+    // The call that held the slot was stopped, and says when to come back.
+    const stopped = await occupying
+    assert.equal(stopped.status, 200, 'a tool that failed is not a failed request')
+    const stoppedWait = Number(stopped.headers.get('retry-after'))
+    assert.ok(stoppedWait >= 1 && stoppedWait <= 30, `the deadline header must be a bounded wait, got ${stopped.headers.get('retry-after')}`)
+    const stoppedText = String(asReply(asReply(await stopped.json()).result).content.map((c) => asReply(c).text).join('\n'))
+    assert.match(stoppedText, /did not finish within/)
+    assert.match(stoppedText, new RegExp(`Retry in ${stoppedWait}s`), 'the text and the header agree')
+
+    // ...and the engine is healthy again, so the refusal was about depth, not damage.
+    // The stopped call's engine thread is replaced; on a loaded runner the
+    // fresh thread's cold start can eat this test's 1.5 s budget, so allow a
+    // few attempts. What must hold is that the engine comes back at all.
+    let recovered: Response | undefined
+    let lastText = ''
+    for (let attempt = 0; attempt < 5; attempt++) {
+      recovered = await post(SMALL)
+      assert.equal(recovered.status, 200)
+      if (recovered.headers.get('retry-after') === null) break
+      lastText = JSON.stringify(await recovered.json())
+      recovered = undefined
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    assert.ok(recovered, `a call that finishes has nothing to wait for; last reply: ${lastText.slice(0, 400)}`)
+    await recovered.body?.cancel()
+  } finally {
+    proc.kill()
+  }
+})
+
+function freePort(): Promise<number> {
+  const { promise, resolve } = Promise.withResolvers<number>()
+  const s = createNetServer().listen(0, () => {
+    const { port } = s.address() as { port: number }
+    s.close(() => resolve(port))
+  })
+  return promise
+}
+
+/**
+ * Resolves when the server prints its listen line, so no request races the
+ * socket. A listener, not `for await`: breaking out of an async iterator
+ * destroys the pipe, and the server's later writes then kill it.
+ */
+async function waitForListen(proc: ChildProcess): Promise<void> {
+  const stderr = proc.stderr
+  assert.ok(stderr, 'the server must be spawned with a readable stderr')
+  const { promise, resolve } = Promise.withResolvers<string>()
+  let seen = ''
+  stderr.setEncoding('utf8')
+  stderr.on('data', (chunk: string) => {
+    seen += chunk
+    if (seen.includes('listening on')) resolve(seen)
+  })
+  const exited = Promise.withResolvers<never>()
+  proc.once('exit', (code) => exited.reject(new Error(`the server exited with ${code} without listening: ${seen}`)))
+  exited.promise.catch(() => { /* failure surfaces through the race below */ })
+  await Promise.race([promise, exited.promise])
+}
+
+/** The first refusal, or undefined once the call holding the slot has settled. */
+async function probeUntilRefused(post: (html: string) => Promise<Response>, settled: () => boolean) {
+  for (let i = 0; i < 50 && !settled(); i++) {
+    const r = await post(SMALL)
+    if (r.status === 503) return r
+    await r.body?.cancel()
+  }
+  return undefined
 }
